@@ -30,8 +30,13 @@ _STAGE_MODULE_OVERRIDES = {
 }
 
 # Payload widths per channel (PC[XLEN-1:0] + insn[31:0])
-_CHANNEL_WIDTH = 64   # conservative: always use 64 bits
+# Actual width is resolved at lower() time from meta.config.xlen.
+_CHANNEL_WIDTH_DEFAULT = 64   # fallback when xlen is not available
 _CHANNEL_DEPTH = 2
+_CHANNEL_DEPTH_DEEP = 4        # depth used for stages with variable-latency ops
+# Stages whose downstream channel should use the deep-buffered skid buffer
+# (variable-latency units like multiply/divide/FP stall for multiple cycles)
+_DEEP_CHANNEL_AFTER = {"EXECUTE", "MEM_ACCESS"}
 
 
 def _stage_module_name(key: str) -> str:
@@ -57,6 +62,18 @@ class Lowerer:
         module_name: str,
     ) -> PipelineIR:
         """Return a ``PipelineIR`` for the given stage count."""
+        # Derive channel width from config.xlen (fall back to 64 if unavailable).
+        # meta.config may be a dict (from dataclass-style elaborator) or an object.
+        xlen = _CHANNEL_WIDTH_DEFAULT
+        if meta is not None and meta.config is not None:
+            cfg = meta.config
+            if isinstance(cfg, dict):
+                xlen = cfg.get("xlen", _CHANNEL_WIDTH_DEFAULT)
+            else:
+                xlen = getattr(cfg, "xlen", _CHANNEL_WIDTH_DEFAULT)
+        # Payload = PC (xlen bits) + insn (32 bits), but keep as xlen for simplicity
+        channel_width = xlen
+
         stage_keys = _STAGE_NAMES.get(
             pipeline_stages,
             [f"S{i}" for i in range(pipeline_stages)],
@@ -69,10 +86,15 @@ class Lowerer:
 
         channels: List[ChannelDecl] = []
         for i in range(len(stages) - 1):
+            # Use a deeper channel after variable-latency stages so the
+            # skid buffer template is selected in the emitter.
+            src_key = stage_keys[i]
+            is_deep = src_key in _DEEP_CHANNEL_AFTER
+            depth = _CHANNEL_DEPTH_DEEP if is_deep else _CHANNEL_DEPTH
             ch = ChannelDecl(
                 name=_channel_name(stage_keys[i], stage_keys[i + 1]),
-                width=_CHANNEL_WIDTH,
-                depth=_CHANNEL_DEPTH,
+                width=channel_width,
+                depth=depth,
                 src_stage=stages[i].name,
                 dst_stage=stages[i + 1].name,
             )

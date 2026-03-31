@@ -223,7 +223,7 @@ def schedule(
             log.info(
                 "[mls] schedule: built graph with %d ops; scheduled %d ops",
                 len(graph.operations),
-                len(sched.operations),
+                len(sched.operation_times),
             )
         except Exception as exc:
             log.warning("[mls] schedule: scheduler raised (%s) — continuing", exc)
@@ -428,6 +428,15 @@ def _read_fifo_template() -> str:
         return fh.read()
 
 
+def _read_skid_template() -> str:
+    path = _os.path.join(_TEMPLATE_DIR, 'skid_buffer.v')
+    with open(path) as fh:
+        return fh.read()
+
+
+# Channels with depth > this threshold use skid_buffer instead of fifo_sync.
+_SKID_DEPTH_THRESHOLD = 2
+
 def _gen_stage_module(stage: Any) -> List[str]:
     """Generate Verilog 2005 for one pipeline stage module."""
     name = stage.name
@@ -525,39 +534,61 @@ def _gen_toplevel(pipeline_ir: Any) -> List[str]:
     for ch in pipeline_ir.channels:
         cn = ch.name
         W  = ch.width
-        lines.append(f'  // Channel: {cn}')
+        use_skid = ch.depth > _SKID_DEPTH_THRESHOLD
+        lines.append(f'  // Channel: {cn}  ({"skid_buffer" if use_skid else "fifo_sync"}, depth={ch.depth})')
         lines.append(f'  wire [{W-1}:0] {cn}_raw;')
         lines.append(f'  wire            {cn}_raw_vld;')
         lines.append(f'  wire            {cn}_full;')
-        lines.append(f'  wire            {cn}_wr_en;')
         lines.append(f'  wire [{W-1}:0] {cn}_data;')
-        lines.append(f'  wire            {cn}_empty;')
         lines.append(f'  wire            {cn}_vld;')
         lines.append(f'  wire            {cn}_rdy;')
+        if use_skid:
+            lines.append(f'  wire            {cn}_s_ready;')
+        else:
+            lines.append(f'  wire            {cn}_wr_en;')
+            lines.append(f'  wire            {cn}_empty;')
         lines.append('')
 
     # Assign derived signals
     for ch in pipeline_ir.channels:
         cn = ch.name
-        lines.append(f'  assign {cn}_wr_en = {cn}_raw_vld & ~{cn}_full;')
-        lines.append(f'  assign {cn}_vld   = ~{cn}_empty;')
+        use_skid = ch.depth > _SKID_DEPTH_THRESHOLD
+        if use_skid:
+            lines.append(f'  assign {cn}_full = ~{cn}_s_ready;')
+            lines.append(f'  // {cn}_vld driven by skid_buffer m_valid directly')
+        else:
+            lines.append(f'  assign {cn}_wr_en = {cn}_raw_vld & ~{cn}_full;')
+            lines.append(f'  assign {cn}_vld   = ~{cn}_empty;')
     if pipeline_ir.channels:
         lines.append('')
 
-    # FIFO instances
+    # Buffer instances
     for ch in pipeline_ir.channels:
         cn = ch.name
         W  = ch.width
-        lines.append(f'  fifo_sync #(.WIDTH({W}), .DEPTH({ch.depth})) u_{cn}_fifo (')
-        lines.append(f'    .clk   (clk),')
-        lines.append(f'    .rst_n (rst_n),')
-        lines.append(f'    .wr_en ({cn}_wr_en),')
-        lines.append(f'    .din   ({cn}_raw),')
-        lines.append(f'    .dout  ({cn}_data),')
-        lines.append(f'    .full  ({cn}_full),')
-        lines.append(f'    .empty ({cn}_empty),')
-        lines.append(f'    .rd_en ({cn}_rdy)')
-        lines.append(f'  );')
+        use_skid = ch.depth > _SKID_DEPTH_THRESHOLD
+        if use_skid:
+            lines.append(f'  skid_buffer #(.WIDTH({W})) u_{cn}_buf (')
+            lines.append(f'    .clk      (clk),')
+            lines.append(f'    .rst_n    (rst_n),')
+            lines.append(f'    .s_valid  ({cn}_raw_vld),')
+            lines.append(f'    .s_data   ({cn}_raw),')
+            lines.append(f'    .s_ready  ({cn}_s_ready),')
+            lines.append(f'    .m_valid  ({cn}_vld),')
+            lines.append(f'    .m_data   ({cn}_data),')
+            lines.append(f'    .m_ready  ({cn}_rdy)')
+            lines.append(f'  );')
+        else:
+            lines.append(f'  fifo_sync #(.WIDTH({W}), .DEPTH({ch.depth})) u_{cn}_fifo (')
+            lines.append(f'    .clk   (clk),')
+            lines.append(f'    .rst_n (rst_n),')
+            lines.append(f'    .wr_en ({cn}_wr_en),')
+            lines.append(f'    .din   ({cn}_raw),')
+            lines.append(f'    .dout  ({cn}_data),')
+            lines.append(f'    .full  ({cn}_full),')
+            lines.append(f'    .empty ({cn}_empty),')
+            lines.append(f'    .rd_en ({cn}_rdy)')
+            lines.append(f'  );')
         lines.append('')
 
     # Stage instances
@@ -597,11 +628,19 @@ def _generate_pipeline_sv(ir: ComponentIR) -> str:
                + ', '.join(s.name for s in pip.stages))
     out.append('')
 
-    # Embed the fifo_sync template
+    # Embed the fifo_sync template (always needed for shallow channels)
     try:
         out.append(_read_fifo_template())
     except OSError as exc:
         log.warning("[mls] could not read fifo_sync.v: %s", exc)
+
+    # Embed skid_buffer template only when at least one channel is deep
+    has_deep = any(ch.depth > _SKID_DEPTH_THRESHOLD for ch in pip.channels)
+    if has_deep:
+        try:
+            out.append(_read_skid_template())
+        except OSError as exc:
+            log.warning("[mls] could not read skid_buffer.v: %s", exc)
 
     # One module per stage
     for stage in pip.stages:
