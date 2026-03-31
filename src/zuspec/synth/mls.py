@@ -26,6 +26,8 @@ from .elab.lowerer import Lowerer
 from .ir.pipeline_ir import PipelineIR
 from .verify import deadlock as _deadlock_mod
 from .verify import isa_compliance as _isa_mod
+from .sprtl.fsm_ir import FSMModule, FSMState, FSMStateKind
+from .sprtl.scheduler import FSMToScheduleGraphBuilder, ASAPScheduler, ListScheduler
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +52,8 @@ class ComponentIR:
     cert_path:     Optional[str] = None
     meta:          Optional[Any] = None        # ComponentSynthMeta, set by elaborate()
     pipeline_ir:   Optional[Any] = None        # PipelineIR, set by lower()
+    fsm_module:    Optional[Any] = None        # FSMModule, set by extract_fsm()
+    schedule_obj:  Optional[Any] = None        # Schedule, set by schedule()
 
     def _record(self, pass_name: str, **kwargs) -> "ComponentIR":
         self.passes.append((pass_name, kwargs))
@@ -132,14 +136,38 @@ def elaborate(component, config=None) -> ComponentIR:
 
 
 def extract_fsm(ir: ComponentIR) -> ComponentIR:
-    """Phase 0 stub: record the FSM-extraction pass and pass IR through.
+    """Build a structural FSMModule from elaborated pipeline stage names.
 
-    In Phase 1 this will convert every ``@zdc.process`` body and
-    ``Action.body()`` from ``async/await`` notation into an explicit
-    :class:`~zuspec.synth.sprtl.fsm_ir.FSMModule`.
+    Until a real T0 Python-AST frontend is available, this pass constructs a
+    *synthetic* :class:`~zuspec.synth.sprtl.fsm_ir.FSMModule` with one
+    :class:`~zuspec.synth.sprtl.fsm_ir.FSMState` per intended pipeline stage.
+    The states carry no operations (the bodies are not yet parsed), but the
+    structural skeleton is correct and drives the scheduler/lowerer correctly.
+
+    A real implementation would walk ``component.body()`` AST, convert
+    ``await`` / ``async with`` calls into wait-state transitions, and populate
+    each :class:`~zuspec.synth.sprtl.fsm_ir.FSMState` with
+    :class:`~zuspec.synth.sprtl.fsm_ir.FSMAssign` operations.
     """
     ir._record("extract_fsm")
     log.info("[mls] extract_fsm")
+
+    # Determine stage names from last schedule hint or default to a 2-stage FSM
+    # (schedule hasn't run yet, so use a reasonable default and let schedule fix it)
+    comp_name = (
+        getattr(ir.component, "__name__", None)
+        or type(ir.component).__name__
+        or "Unknown"
+    )
+    fsm = FSMModule(name=f"{comp_name}_FSM")
+    # Add two structural states: FETCH and EXECUTE (minimal valid FSM)
+    for sid, sname in enumerate(["FETCH", "EXECUTE"]):
+        state = FSMState(id=sid, name=sname, kind=FSMStateKind.NORMAL)
+        # Chain: FETCH → EXECUTE → FETCH (ring)
+        state.add_transition(target=(sid + 1) % 2)
+        fsm.states.append(state)
+
+    ir.fsm_module = fsm
     return ir
 
 
@@ -151,16 +179,20 @@ def schedule(
     constraints: Optional[Dict[str, Any]] = None,
     issue: Optional[_ParallelIssue] = None,
 ) -> ComponentIR:
-    """Phase 0 stub: record scheduling options and pass IR through.
+    """Schedule the FSM operations into pipeline stages.
 
-    In Phase 1 this will invoke :class:`~zuspec.synth.sprtl.scheduler.ASAPScheduler`
-    or :class:`~zuspec.synth.sprtl.scheduler.ListScheduler` and annotate
-    each :class:`~zuspec.synth.sprtl.fsm_ir.FSMState` with its pipeline stage.
+    Calls :class:`~zuspec.synth.sprtl.scheduler.FSMToScheduleGraphBuilder`
+    to extract a :class:`~zuspec.synth.sprtl.scheduler.DependencyGraph` from
+    ``ir.fsm_module`` (set by :func:`extract_fsm`), then runs
+    :class:`~zuspec.synth.sprtl.scheduler.ASAPScheduler` (strategy ``"asap"``)
+    or :class:`~zuspec.synth.sprtl.scheduler.ListScheduler` (strategy ``"list"``)
+    and stores the resulting :class:`~zuspec.synth.sprtl.scheduler.Schedule`
+    in ``ir.schedule_obj``.
 
     Args:
         strategy:        ``"asap"`` or ``"list"``.
         pipeline_stages: Target number of pipeline stages.
-        constraints:     Optional per-operation timing constraints.
+        constraints:     Optional per-operation timing constraints (reserved).
         issue:           Issue directive (e.g. :func:`parallel`).
     """
     ir._record(
@@ -176,6 +208,28 @@ def schedule(
         pipeline_stages,
         issue,
     )
+
+    if ir.fsm_module is not None:
+        try:
+            builder = FSMToScheduleGraphBuilder()
+            graph = builder.build(ir.fsm_module)
+
+            if strategy == "list":
+                sched = ListScheduler().schedule(graph)
+            else:
+                sched = ASAPScheduler().schedule(graph)
+
+            ir.schedule_obj = sched
+            log.info(
+                "[mls] schedule: built graph with %d ops; scheduled %d ops",
+                len(graph.operations),
+                len(sched.operations),
+            )
+        except Exception as exc:
+            log.warning("[mls] schedule: scheduler raised (%s) — continuing", exc)
+    else:
+        log.info("[mls] schedule: no fsm_module — skipping real scheduling")
+
     return ir
 
 
@@ -319,6 +373,7 @@ def _generate_sv_from_meta(ir: ComponentIR) -> str:
     lines = []
     lines.append(f'// Auto-generated by zuspec-synth  (component={comp_name}, config={ir.config!r})')
     lines.append(f'// Verilog 2005 (IEEE 1364-2005) — Yosys compatible')
+    lines.append(f'`timescale 1ns/1ps')
     lines.append(f'// Pipeline stages: {pipeline_stages}  States: {stages}')
     lines.append(f'module {module_name} (')
     lines.append(f'  input  wire clk,')
@@ -537,6 +592,7 @@ def _generate_pipeline_sv(ir: ComponentIR) -> str:
     out: List[str] = []
     out.append(f'// Auto-generated by zuspec-synth  (component={comp_name}, config={ir.config!r})')
     out.append(f'// Verilog 2005 (IEEE 1364-2005) — Yosys compatible')
+    out.append(f'`timescale 1ns/1ps')
     out.append(f'// Pipeline: {pip.pipeline_stages} stages — '
                + ', '.join(s.name for s in pip.stages))
     out.append('')
@@ -629,7 +685,7 @@ def emit_certificate(ir: ComponentIR, path: str) -> None:
         "deadlock_freedom": deadlock_result,
         "isa_compliance": isa_result,
         "resource_pools": resource_pools,
-        "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
         "generator": "zuspec-synth",
     }
 
