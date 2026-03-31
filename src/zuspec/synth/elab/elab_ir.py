@@ -7,6 +7,23 @@ from typing import Any, Dict, List, Optional, Type
 
 
 @dataclass
+class PortDecl:
+    """A flat RTL port signal expanded from a Component port bundle field.
+
+    ``direction`` is from the component's perspective:
+    ``'output'`` means the component drives the signal (top-level output);
+    ``'input'``  means the component receives the signal (top-level input).
+
+    ``bundle`` is the field name on the component (e.g. ``'icache'``).
+    ``name``   is the flattened RTL port name (e.g. ``'icache_addr'``).
+    """
+    name:      str    # flattened RTL signal name, e.g. "icache_addr"
+    direction: str    # "input" or "output" (from component perspective)
+    width:     int    # bit width (1 = single bit)
+    bundle:    str    # source bundle field name, e.g. "icache"
+
+
+@dataclass
 class ResourcePoolDecl:
     """A ClaimPool field on a Component."""
     resource_type: type        # e.g. ALUUnit (type param of ClaimPool[T])
@@ -38,3 +55,4 @@ class ComponentSynthMeta:
     resource_pools: List[ResourcePoolDecl] = field(default_factory=list)
     arbiters: List[ArbiterDecl] = field(default_factory=list)
     actions: List[type] = field(default_factory=list)  # Action subclasses in scope
+    ports: List[PortDecl] = field(default_factory=list)  # flat RTL port declarations

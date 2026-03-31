@@ -6,7 +6,7 @@ import dataclasses as dc
 import typing
 from typing import Any, Dict, Optional, Type, get_args, get_origin
 
-from .elab_ir import ComponentSynthMeta, ResourcePoolDecl, ArbiterDecl, InstanceDecl
+from .elab_ir import ComponentSynthMeta, ResourcePoolDecl, ArbiterDecl, InstanceDecl, PortDecl
 
 
 def _get_pool_element_type(hint) -> Optional[type]:
@@ -15,6 +15,61 @@ def _get_pool_element_type(hint) -> Optional[type]:
     if args:
         return args[0]
     return None
+
+
+def _expand_bundle_ports(bundle_field_name: str, bundle_type: type) -> list[PortDecl]:
+    """Expand a zdc.Bundle subclass into a flat list of PortDecl.
+
+    Each field of the bundle contributes one PortDecl.  Direction is read from
+    the field's ``default_factory``:
+    - ``Output`` (or subclass with 'Output' in name) → direction='output'
+    - ``Input``  (or subclass with 'Input' in name)  → direction='input'
+
+    Bit width is read from the ``U.width`` (or ``S.width``) annotation on the
+    field's type hint (via ``typing.get_args``); falls back to 1.
+    """
+    try:
+        fields = dc.fields(bundle_type)
+    except TypeError:
+        return []
+
+    try:
+        hints = typing.get_type_hints(bundle_type, include_extras=True)
+    except Exception:
+        hints = {}
+
+    ports: list[PortDecl] = []
+    for f in fields:
+        # Determine direction from default_factory class name
+        factory = f.default_factory  # type: ignore[misc]
+        if factory is dc.MISSING:
+            continue
+        fname = getattr(factory, '__name__', '')
+        if 'Output' in fname:
+            direction = 'output'
+        elif 'Input' in fname:
+            direction = 'input'
+        else:
+            continue  # unknown direction — skip
+
+        # Determine bit width from annotated type
+        width = 1
+        hint = hints.get(f.name)
+        if hint is not None:
+            args = typing.get_args(hint)
+            if len(args) >= 2:
+                ann = args[1]
+                w = getattr(ann, 'width', None)
+                if w is not None:
+                    width = int(w)
+
+        ports.append(PortDecl(
+            name=f'{bundle_field_name}_{f.name}',
+            direction=direction,
+            width=width,
+            bundle=bundle_field_name,
+        ))
+    return ports
 
 
 class Elaborator:
@@ -52,6 +107,7 @@ class Elaborator:
         instances: list[InstanceDecl] = []
         pools: list[ResourcePoolDecl] = []
         arbiters: list[ArbiterDecl] = []
+        port_decls: list[PortDecl] = []
 
         pipeline_width = config_dict.get('pipeline_width', 1)
 
@@ -82,10 +138,17 @@ class Elaborator:
                     pool=pool,
                 ))
 
+            elif kind == 'port':
+                # Bundle port field — expand into flat PortDecl list
+                bundle_type = hint if isinstance(hint, type) else None
+                if bundle_type is not None:
+                    port_decls.extend(_expand_bundle_ports(f.name, bundle_type))
+
         return ComponentSynthMeta(
             component_class=component_cls,
             config=config_dict,
             instances=instances,
             resource_pools=pools,
             arbiters=arbiters,
+            ports=port_decls,
         )

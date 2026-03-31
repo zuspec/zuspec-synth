@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..elab.elab_ir import ComponentSynthMeta
+    from ..elab.elab_ir import ComponentSynthMeta, PortDecl
 
 
 @dataclass
@@ -31,6 +31,7 @@ class StageIR:
     index: int                                         # 0-based
     inputs:  List[ChannelDecl] = field(default_factory=list)
     outputs: List[ChannelDecl] = field(default_factory=list)
+    ports:   List["PortDecl"]  = field(default_factory=list)  # memory / external ports
 
 
 @dataclass

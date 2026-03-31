@@ -38,6 +38,14 @@ _CHANNEL_DEPTH_DEEP = 4        # depth used for stages with variable-latency ops
 # (variable-latency units like multiply/divide/FP stall for multiple cycles)
 _DEEP_CHANNEL_AFTER = {"EXECUTE", "MEM_ACCESS"}
 
+# Maps bundle field name → preferred stage key; first match in the stage_keys
+# list wins.  For dcache, MEM_ACCESS is preferred over EXECUTE so that the
+# data-cache interface is exposed on the right stage in 6/7-stage pipelines.
+_BUNDLE_STAGE_PREFERENCE = {
+    "icache": ["FETCH"],
+    "dcache": ["MEM_ACCESS", "EXECUTE"],
+}
+
 
 def _stage_module_name(key: str) -> str:
     """Convert a stage key ('REG_READ') to a Verilog module name ('RegReadStage')."""
@@ -101,6 +109,28 @@ class Lowerer:
             channels.append(ch)
             stages[i].outputs.append(ch)
             stages[i + 1].inputs.append(ch)
+
+        # Assign bundle ports (icache, dcache, …) from meta to the appropriate
+        # stage based on _BUNDLE_STAGE_PREFERENCE.
+        meta_ports = getattr(meta, 'ports', None) if meta is not None else None
+        if meta_ports:
+            # Build lookup: stage_key → StageIR
+            key_to_stage = {k: stages[i] for i, k in enumerate(stage_keys)}
+            # Group PortDecls by bundle name
+            bundles: dict[str, list] = {}
+            for pd in meta_ports:
+                bundles.setdefault(pd.bundle, []).append(pd)
+            for bundle_name, port_list in bundles.items():
+                preferred_keys = _BUNDLE_STAGE_PREFERENCE.get(bundle_name, [stage_keys[0]])
+                target_stage = None
+                for key in preferred_keys:
+                    if key in key_to_stage:
+                        target_stage = key_to_stage[key]
+                        break
+                if target_stage is None:
+                    # Fall back to first stage
+                    target_stage = stages[0]
+                target_stage.ports.extend(port_list)
 
         return PipelineIR(
             module_name=module_name,

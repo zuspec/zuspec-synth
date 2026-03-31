@@ -446,8 +446,8 @@ def _gen_stage_module(stage: Any) -> List[str]:
     lines.append(f'// {"=" * 60}')
     lines.append(f'module {name} (')
 
-    # Build ordered port list
-    ports: List[Tuple[str, str, str, str]] = []  # (dir, type, width_or_empty, pname)
+    # Build ordered port list: (dir, type, width_spec, pname)
+    ports: List[Tuple[str, str, str, str]] = []
     ports.append(('input',  'wire', '',  'clk'))
     ports.append(('input',  'wire', '',  'rst_n'))
     for ch in stage.inputs:
@@ -460,6 +460,12 @@ def _gen_stage_module(stage: Any) -> List[str]:
         ports.append(('output', 'reg',  f'[{W-1}:0]', f'{ch.name}_raw'))
         ports.append(('output', 'reg',  '',            f'{ch.name}_raw_vld'))
         ports.append(('input',  'wire', '',            f'{ch.name}_full'))
+    # Memory / external bundle ports
+    for pd in stage.ports:
+        W = pd.width
+        vtype = 'reg'  if pd.direction == 'output' else 'wire'
+        wspec = f'[{W-1}:0]' if W > 1 else ''
+        ports.append((pd.direction, vtype, wspec, pd.name))
 
     for i, (pdir, ptype, pwidth, pname) in enumerate(ports):
         comma = '' if i == len(ports) - 1 else ','
@@ -467,6 +473,9 @@ def _gen_stage_module(stage: Any) -> List[str]:
         lines.append(f'  {pdir:<6} {ptype:<4} {w} {pname}{comma}')
     lines.append(');')
     lines.append('')
+
+    # Collect output port names for reset block
+    out_port_names = [(pd.name, pd.width) for pd in stage.ports if pd.direction == 'output']
 
     # Sequential always block
     lines.append('  always @(posedge clk or negedge rst_n) begin')
@@ -477,7 +486,9 @@ def _gen_stage_module(stage: Any) -> List[str]:
         W = ch.width
         lines.append(f"      {ch.name}_raw     <= {W}'b0;")
         lines.append(f"      {ch.name}_raw_vld <= 1'b0;")
-    if not stage.inputs and not stage.outputs:
+    for pname, pw in out_port_names:
+        lines.append(f"      {pname} <= {pw}'b0;")
+    if not stage.inputs and not stage.outputs and not out_port_names:
         lines.append("      // single-stage: nothing to reset")
     lines.append("    end else begin")
 
@@ -490,8 +501,17 @@ def _gen_stage_module(stage: Any) -> List[str]:
         lines.append(f"      if (!{out_ch.name}_full) begin")
         lines.append(f"        {out_ch.name}_raw     <= {out_ch.name}_raw + {out_ch.width}'d4;")
         lines.append(f"        {out_ch.name}_raw_vld <= 1'b1;")
+        # Drive icache address from the outgoing PC counter (sliced to port width)
+        for pname, pw in out_port_names:
+            if 'addr' in pname:
+                lines.append(f"        {pname} <= {out_ch.name}_raw[{pw-1}:0] + {pw}'d4;")
+            elif 'valid' in pname or 'vld' in pname:
+                lines.append(f"        {pname} <= 1'b1;")
         lines.append(f"      end else begin")
         lines.append(f"        {out_ch.name}_raw_vld <= 1'b0;")
+        for pname, pw in out_port_names:
+            if 'valid' in pname or 'vld' in pname:
+                lines.append(f"        {pname} <= 1'b0;")
         lines.append(f"      end")
     elif not stage.outputs:
         # Last stage: always accept
@@ -524,9 +544,22 @@ def _gen_toplevel(pipeline_ir: Any) -> List[str]:
     lines.append(f'// {"=" * 60}')
     lines.append(f'// {mod} — top-level pipeline wrapper')
     lines.append(f'// {"=" * 60}')
+
+    # Collect all external ports from all stages
+    all_ext_ports = [pd for stage in pipeline_ir.stages for pd in stage.ports]
+
+    # Build top-level port declarations
+    top_ports = ['  input wire clk', '  input wire rst_n']
+    for pd in all_ext_ports:
+        W = pd.width
+        wspec = f'[{W-1}:0] ' if W > 1 else ''
+        vdir = 'output wire' if pd.direction == 'output' else 'input  wire'
+        top_ports.append(f'  {vdir} {wspec}{pd.name}')
+
     lines.append(f'module {mod} (')
-    lines.append(f'  input wire clk,')
-    lines.append(f'  input wire rst_n')
+    for i, p in enumerate(top_ports):
+        comma = '' if i == len(top_ports) - 1 else ','
+        lines.append(f'{p}{comma}')
     lines.append(f');')
     lines.append('')
 
@@ -605,6 +638,9 @@ def _gen_toplevel(pipeline_ir: Any) -> List[str]:
             conns += [(f'{cn}_raw',     f'{cn}_raw'),
                       (f'{cn}_raw_vld', f'{cn}_raw_vld'),
                       (f'{cn}_full',    f'{cn}_full')]
+        # External bundle ports pass through with the same name
+        for pd in stage.ports:
+            conns.append((pd.name, pd.name))
         for i, (pname, cname) in enumerate(conns):
             comma = '' if i == len(conns) - 1 else ','
             lines.append(f'    .{pname:<28} ({cname}){comma}')
