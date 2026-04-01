@@ -6,7 +6,7 @@ import dataclasses as dc
 import typing
 from typing import Any, Dict, Optional, Type, get_args, get_origin
 
-from .elab_ir import ComponentSynthMeta, ResourcePoolDecl, ArbiterDecl, InstanceDecl, PortDecl
+from .elab_ir import ComponentSynthMeta, ResourcePoolDecl, ArbiterDecl, InstanceDecl, PortDecl, RegFileDeclIR, IndexedPoolDeclIR
 
 
 def _get_pool_element_type(hint) -> Optional[type]:
@@ -15,6 +15,24 @@ def _get_pool_element_type(hint) -> Optional[type]:
     if args:
         return args[0]
     return None
+
+
+def _bit_width(type_hint) -> int:
+    """Extract the integer bit width from a zdc.uN / zdc.iN annotated type.
+
+    Handles:
+    * ``Annotated[int, U(N)]``  → N
+    * ``Annotated[int, S(N)]``  → N
+    * Bare ``int`` or unknown   → 32 (safe default)
+    """
+    if type_hint is None:
+        return 32
+    args = get_args(type_hint)
+    for a in args:
+        w = getattr(a, 'width', None)
+        if w is not None:
+            return int(w)
+    return 32
 
 
 def _expand_bundle_ports(bundle_field_name: str, bundle_type: type) -> list[PortDecl]:
@@ -108,6 +126,8 @@ class Elaborator:
         pools: list[ResourcePoolDecl] = []
         arbiters: list[ArbiterDecl] = []
         port_decls: list[PortDecl] = []
+        regfiles: list[RegFileDeclIR] = []
+        indexed_pools: list[IndexedPoolDeclIR] = []
 
         pipeline_width = config_dict.get('pipeline_width', 1)
 
@@ -144,6 +164,40 @@ class Elaborator:
                 if bundle_type is not None:
                     port_decls.extend(_expand_bundle_ports(f.name, bundle_type))
 
+            elif kind == 'indexed_regfile':
+                # IndexedRegFile[TIdx, TData] field
+                args = get_args(hint) if hint is not None else ()
+                idx_type  = args[0] if len(args) > 0 else None
+                data_type = args[1] if len(args) > 1 else None
+                idx_width  = _bit_width(idx_type)
+                data_width = _bit_width(data_type)
+                # Scale data_width to xlen: a regfile declared as u32 should be
+                # 64 bits wide when synthesizing a 64-bit core.
+                xlen = config_dict.get('xlen', 32)
+                if xlen > data_width:
+                    data_width = xlen
+                regfiles.append(RegFileDeclIR(
+                    field_name  = f.name,
+                    depth       = 2 ** idx_width,
+                    idx_width   = idx_width,
+                    data_width  = data_width,
+                    read_ports  = f.metadata.get('read_ports',  2),
+                    write_ports = f.metadata.get('write_ports', 1),
+                    shared_port = f.metadata.get('shared_port', False),
+                ))
+
+            elif kind == 'indexed_pool':
+                # IndexedPool[TIdx] field — scoreboard / data-hazard tracker
+                args      = get_args(hint) if hint is not None else ()
+                idx_type  = args[0] if len(args) > 0 else None
+                idx_width = _bit_width(idx_type)
+                indexed_pools.append(IndexedPoolDeclIR(
+                    field_name = f.name,
+                    depth      = f.metadata.get('depth',    2 ** idx_width),
+                    idx_width  = idx_width,
+                    noop_idx   = f.metadata.get('noop_idx', None),
+                ))
+
         return ComponentSynthMeta(
             component_class=component_cls,
             config=config_dict,
@@ -151,4 +205,6 @@ class Elaborator:
             resource_pools=pools,
             arbiters=arbiters,
             ports=port_decls,
+            regfiles=regfiles,
+            indexed_pools=indexed_pools,
         )

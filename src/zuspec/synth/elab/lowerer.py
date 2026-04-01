@@ -29,9 +29,6 @@ _STAGE_MODULE_OVERRIDES = {
     "WRITEBACK": "WriteBackStage",
 }
 
-# Payload widths per channel (PC[XLEN-1:0] + insn[31:0])
-# Actual width is resolved at lower() time from meta.config.xlen.
-_CHANNEL_WIDTH_DEFAULT = 64   # fallback when xlen is not available
 _CHANNEL_DEPTH = 2
 _CHANNEL_DEPTH_DEEP = 4        # depth used for stages with variable-latency ops
 # Stages whose downstream channel should use the deep-buffered skid buffer
@@ -45,6 +42,63 @@ _BUNDLE_STAGE_PREFERENCE = {
     "icache": ["FETCH"],
     "dcache": ["MEM_ACCESS", "EXECUTE"],
 }
+
+
+def channel_payload_width(src_key: str, xlen: int) -> int:
+    """Return the packed-bus width for the channel produced by *src_key*.
+
+    Payload layouts (LSB first):
+
+    **FETCH output** — ``{insn[31:0], pc[xlen-1:0]}``::
+
+        bits[xlen-1:0]      = PC
+        bits[xlen+31:xlen]  = INSN (32-bit instruction word)
+
+        total = xlen + 32
+
+    **DECODE output** — fetch payload + decoded fields::
+
+        bits[+4:+0]          = rd[4:0]
+        bits[+9:+5]          = rs1[4:0]
+        bits[+14:+10]        = rs2[4:0]
+        bits[+17:+15]        = funct3[2:0]
+        bits[+24:+18]        = funct7[6:0]
+        bits[+34:+25]        = optype[9:0]
+        bits[+34+xlen:+35]   = imm[xlen-1:0]  (sign-extended)
+
+        total = (xlen + 32) + 5+5+5+3+7+10+xlen = 2*xlen + 67
+
+    **REG_READ output** — decode payload + register-file values::
+
+        bits[+xlen-1:+0]     = rs1_val[xlen-1:0]
+        bits[+2*xlen-1:+xlen]= rs2_val[xlen-1:0]
+
+        total = (2*xlen + 67) + 2*xlen = 4*xlen + 67
+
+    **EXECUTE / MEM_ACCESS / ISSUE_* output** — writeback bundle::
+
+        bits[4:0]             = rd[4:0]
+        bits[xlen+4:5]        = result[xlen-1:0]
+        bits[xlen+5]          = we         (register write enable)
+        bits[xlen+6]          = branch_taken
+        bits[2*xlen+6:xlen+7] = branch_target[xlen-1:0]
+
+        total = 2*xlen + 7
+    """
+    if src_key == "FETCH":
+        return xlen + 32
+    elif src_key == "DECODE":
+        return 2 * xlen + 67
+    elif src_key == "REG_READ":
+        return 4 * xlen + 67
+    elif src_key in ("ISSUE_A", "ISSUE_B"):
+        # Issue slots pass the full decode+regread payload through to EXECUTE
+        return 4 * xlen + 67
+    elif src_key in ("EXECUTE", "MEM_ACCESS"):
+        return 2 * xlen + 7
+    else:
+        # Unknown stage key — fall back to xlen
+        return xlen
 
 
 def _stage_module_name(key: str) -> str:
@@ -70,17 +124,14 @@ class Lowerer:
         module_name: str,
     ) -> PipelineIR:
         """Return a ``PipelineIR`` for the given stage count."""
-        # Derive channel width from config.xlen (fall back to 64 if unavailable).
-        # meta.config may be a dict (from dataclass-style elaborator) or an object.
-        xlen = _CHANNEL_WIDTH_DEFAULT
+        # Derive xlen from config (fall back to 32 if unavailable).
+        xlen = 32
         if meta is not None and meta.config is not None:
             cfg = meta.config
             if isinstance(cfg, dict):
-                xlen = cfg.get("xlen", _CHANNEL_WIDTH_DEFAULT)
+                xlen = cfg.get("xlen", 32)
             else:
-                xlen = getattr(cfg, "xlen", _CHANNEL_WIDTH_DEFAULT)
-        # Payload = PC (xlen bits) + insn (32 bits), but keep as xlen for simplicity
-        channel_width = xlen
+                xlen = getattr(cfg, "xlen", 32)
 
         stage_keys = _STAGE_NAMES.get(
             pipeline_stages,
@@ -94,14 +145,12 @@ class Lowerer:
 
         channels: List[ChannelDecl] = []
         for i in range(len(stages) - 1):
-            # Use a deeper channel after variable-latency stages so the
-            # skid buffer template is selected in the emitter.
             src_key = stage_keys[i]
             is_deep = src_key in _DEEP_CHANNEL_AFTER
             depth = _CHANNEL_DEPTH_DEEP if is_deep else _CHANNEL_DEPTH
             ch = ChannelDecl(
                 name=_channel_name(stage_keys[i], stage_keys[i + 1]),
-                width=channel_width,
+                width=channel_payload_width(src_key, xlen),
                 depth=depth,
                 src_stage=stages[i].name,
                 dst_stage=stages[i + 1].name,
