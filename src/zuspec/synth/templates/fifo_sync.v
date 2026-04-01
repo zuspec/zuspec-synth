@@ -10,6 +10,7 @@
 //   wr_en / din   — write port
 //   rd_en / dout  — read port
 //   full / empty  — status flags
+//   flush         — synchronous flush: resets FIFO to empty on next rising edge
 
 module fifo_sync #(
   parameter WIDTH = 32,
@@ -17,6 +18,7 @@ module fifo_sync #(
 ) (
   input  wire             clk,
   input  wire             rst_n,
+  input  wire             flush,
   input  wire             wr_en,
   input  wire [WIDTH-1:0] din,
   output wire [WIDTH-1:0] dout,
@@ -35,7 +37,7 @@ module fifo_sync #(
   assign dout  = data[rd_ptr];
 
   always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
+    if (!rst_n || flush) begin
       count  <= 2'd0;
       wr_ptr <= 1'b0;
       rd_ptr <= 1'b0;
