@@ -37,14 +37,20 @@ module fifo_sync #(
   assign dout  = data[rd_ptr];
 
   always @(posedge clk or negedge rst_n) begin
-    if (!rst_n || flush) begin
+    if (!rst_n) begin
       count  <= 2'd0;
       wr_ptr <= 1'b0;
       rd_ptr <= 1'b0;
       data[0] <= {WIDTH{1'b0}};
       data[1] <= {WIDTH{1'b0}};
     end else begin
-      if (wr_en && !full && rd_en && !empty) begin
+      if (flush) begin
+        count  <= 2'd0;
+        wr_ptr <= 1'b0;
+        rd_ptr <= 1'b0;
+        data[0] <= {WIDTH{1'b0}};
+        data[1] <= {WIDTH{1'b0}};
+      end else if (wr_en && !full && rd_en && !empty) begin
         // Simultaneous read and write
         data[wr_ptr] <= din;
         wr_ptr       <= ~wr_ptr;

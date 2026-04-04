@@ -510,3 +510,29 @@ def generate_sv(fsm: FSMModule, config: Optional[SVGenConfig] = None) -> str:
     """
     generator = SVCodeGenerator(config)
     return generator.generate(fsm)
+
+
+def generate_regfile_sv(meta, module_prefix: str = "") -> str:
+    """Generate SystemVerilog for all IndexedRegFile fields in *meta*.
+
+    Args:
+        meta: ``ComponentSynthMeta`` instance (from the elaborator).
+        module_prefix: Optional prefix string applied to all generated module names.
+
+    Returns:
+        Concatenated SV source for every register file declared in the
+        component, separated by blank lines.  Returns an empty string if
+        the component has no ``IndexedRegFile`` fields.
+    """
+    from .regfile_synth import RegFileHazardAnalyzer, RegFileSVGenerator
+
+    analyzer  = RegFileHazardAnalyzer()
+    generator = RegFileSVGenerator()
+    parts = []
+
+    for decl in meta.regfiles:
+        hazards = analyzer.analyze(decl)
+        sv      = generator.generate(decl, hazards, module_prefix=module_prefix)
+        parts.append(sv)
+
+    return '\n\n'.join(parts)

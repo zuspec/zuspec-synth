@@ -39,8 +39,10 @@ _DEEP_CHANNEL_AFTER = {"EXECUTE", "MEM_ACCESS"}
 # list wins.  For dcache, MEM_ACCESS is preferred over EXECUTE so that the
 # data-cache interface is exposed on the right stage in 6/7-stage pipelines.
 _BUNDLE_STAGE_PREFERENCE = {
-    "icache": ["FETCH"],
-    "dcache": ["MEM_ACCESS", "EXECUTE"],
+    "icache":       ["FETCH"],
+    "dcache":       ["MEM_ACCESS", "EXECUTE"],
+    "dcache_load":  ["MEM_ACCESS", "EXECUTE"],
+    "dcache_store": ["MEM_ACCESS", "EXECUTE"],
 }
 
 
