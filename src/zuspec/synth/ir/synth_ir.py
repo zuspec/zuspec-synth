@@ -42,15 +42,12 @@ class SynthIR:
         rtl_modules: Generic RTL modules (future use).
         sv_path: Path of the last emitted ``.sv`` file.
         cert_path: Path of the last emitted ``.cert.json`` file.
-        decode_node: ``DecodeActionNode`` set by ``RVIdentifyPass``; carries the
-            primary decode action class for ``DecodeFieldExtractor``.
-        decode_c_node: ``DecodeConstraintNode`` set by ``RVIdentifyPass``; carries
-            the constraint-compiler-compatible decode class.
-        execute_node: ``ExecuteActionNode`` set by ``RVIdentifyPass``; carries the
-            execute-dispatch action class for ``ActionBodySynthesizer``.
-        domain_nodes: Active ``DomainNode`` instances introduced by
-            ``RVStageIntroducePass``.  Lowering passes remove nodes from this
-            list as they are lowered.  ``SVEmitPass`` raises if any remain.
+        decode_cls: The primary decode action class, set by ``RVSynthPass``.
+            Read by ``RVStageGeneratePass`` to emit decode-stage logic.
+        decode_c_cls: The constraint-compiler-compatible decode class, set by
+            ``RVSynthPass``.  Read by ``RVStageGeneratePass``.
+        execute_cls: The execute-dispatch action class, auto-discovered and set
+            by ``RVSynthPass``.  Read by ``RVStageGeneratePass``.
         lowered_sv: SV string fragments produced by lowering passes.  Keys are
             prefixed by stage (``'d_'`` for decode, ``'e_'`` for execute) and
             named by content (e.g. ``'d_field_wires'``, ``'e_body_synth'``).
@@ -70,9 +67,8 @@ class SynthIR:
     rtl_modules: List[Any] = dc.field(default_factory=list)
     sv_path: Optional[str] = dc.field(default=None)
     cert_path: Optional[str] = dc.field(default=None)
-    decode_node: Optional[Any] = dc.field(default=None)
-    decode_c_node: Optional[Any] = dc.field(default=None)
-    execute_node: Optional[Any] = dc.field(default=None)
-    domain_nodes: List[Any] = dc.field(default_factory=list)
+    decode_cls: Optional[Any] = dc.field(default=None)
+    decode_c_cls: Optional[Any] = dc.field(default=None)
+    execute_cls: Optional[Any] = dc.field(default=None)
     lowered_sv: Dict[str, Any] = dc.field(default_factory=dict)
     stage_sv: Dict[str, List[str]] = dc.field(default_factory=dict)
