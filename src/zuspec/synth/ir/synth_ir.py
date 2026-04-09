@@ -56,6 +56,12 @@ class SynthIR:
             Keys are stage names (e.g. ``'FetchStage'``); values are lists of
             SV text lines.  ``_generate_pipeline_sv`` prefers this dict over
             its built-in generators.
+        model_context: ``zuspec.dataclasses`` ``Context`` produced by
+            ``DataModelFactory``, set by ``ElaboratePass``.  Contains parsed
+            ``DataTypeComponent`` / ``DataTypeAction`` IR for every type
+            reachable from the top-level component class, including fully
+            parsed ``@zdc.process`` body statement trees.  Read by
+            ``FSMExtractPass`` to build a real operation graph.
     """
 
     component: Optional[Any] = dc.field(default=None)
@@ -72,3 +78,4 @@ class SynthIR:
     execute_cls: Optional[Any] = dc.field(default=None)
     lowered_sv: Dict[str, Any] = dc.field(default_factory=dict)
     stage_sv: Dict[str, List[str]] = dc.field(default_factory=dict)
+    model_context: Optional[Any] = dc.field(default=None)

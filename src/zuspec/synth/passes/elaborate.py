@@ -40,4 +40,13 @@ class ElaboratePass(SynthPass):
             _log.info("[ElaboratePass] elaborated %s", self._cls.__name__)
         except Exception as exc:
             _log.warning("[ElaboratePass] elaborator failed (%s) — meta not set", exc)
+
+        try:
+            from zuspec.dataclasses.data_model_factory import DataModelFactory
+            ir.model_context = DataModelFactory().build(self._cls)
+            _log.info("[ElaboratePass] built model context (%d types)",
+                      len(ir.model_context.type_m))
+        except Exception as exc:
+            _log.warning("[ElaboratePass] DataModelFactory failed (%s) — model_context not set", exc)
+
         return ir
