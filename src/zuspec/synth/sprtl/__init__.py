@@ -127,6 +127,7 @@ from .memory import (
     partition_array,
 )
 
+from .accessor_lowering import AccessorLowering
 from .multiproc import (
     ChannelType,
     FlowControl,
@@ -223,6 +224,7 @@ __all__ = [
     'MemoryBuffer',
     'MemorySVGenerator',
     'partition_array',
+    'AccessorLowering',
     # Multi-Process Communication
     'ChannelType',
     'FlowControl',
