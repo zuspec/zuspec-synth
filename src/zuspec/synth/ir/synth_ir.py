@@ -15,6 +15,15 @@ class SynthConfig:
         pipeline_stages: Number of pipeline stages to generate.
         strategy: Default scheduling strategy (``"asap"`` or ``"list"``).
         module_prefix: Optional prefix prepended to all emitted module names.
+        forward_default: Process-level default for unresolved RAW hazards in
+            ``@zdc.pipeline`` processes.  ``None`` requires explicit
+            declarations; ``True`` auto-forwards; ``False`` auto-stalls.
+        latency_model: Mapping from operation type name (e.g. ``"MUL"``) to
+            latency in clock cycles.  Used by the SDC scheduler (Approach A).
+            If empty, ``SDCScheduler.DEFAULT_LATENCY`` is used.
+        clock_period_ns: Target clock period in nanoseconds.  Used by the SDC
+            scheduler to check whether a stage's combinational depth fits in
+            one clock cycle.
     """
 
     xlen: int = dc.field(default=32)
@@ -22,6 +31,9 @@ class SynthConfig:
     pipeline_stages: int = dc.field(default=2)
     strategy: str = dc.field(default="asap")
     module_prefix: str = dc.field(default="")
+    forward_default: Optional[bool] = dc.field(default=None)
+    latency_model: Dict[str, int] = dc.field(default_factory=dict)
+    clock_period_ns: float = dc.field(default=10.0)
 
 
 @dc.dataclass

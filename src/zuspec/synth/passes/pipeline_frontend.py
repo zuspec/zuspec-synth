@@ -1,0 +1,260 @@
+"""PipelineFrontendPass — build PipelineIR from the new @zdc.pipeline / @zdc.stage API.
+
+Replaces ``PipelineAnnotationPass`` for components defined with the new-style API:
+
+.. code-block:: python
+
+    @zdc.pipeline(clock="clk", reset="rst_n")
+    def execute(self):
+        pc, insn = self.IF()
+        rs1, rs2, rd, imm = self.ID(insn)
+        result = self.EX(rs1, rs2, imm)
+        self.WB(rd, result)
+
+This pass:
+
+1. Locates the ``DataTypeComponent`` for the top-level component in
+   ``ir.model_context``.
+2. Reads ``pipeline_root_ir``, ``stage_method_irs``, and ``sync_method_irs``
+   (populated by ``DataModelFactory`` / DC-6).
+3. Builds an ordered list of :class:`~zuspec.synth.ir.pipeline_ir.StageIR`
+   from the ``StageCallNode`` sequence.
+4. Infers :class:`~zuspec.synth.ir.pipeline_ir.ChannelDecl` entries for
+   variable flows: each variable produced by stage k and consumed by stage m
+   gets a channel (k→m for adjacent, or k→k+1 for auto-threading prep).
+5. Copies ``no_forward``, ``stall_cond``, ``cancel_cond``, and ``flush_decls``
+   from each ``StageMethodIR`` into the corresponding ``StageIR``.
+6. Populates ``PipelineIR.sync_irs``, ``clock_field``, and ``reset_field``.
+7. Stores the result in ``ir.pipeline_ir``.
+
+If no ``pipeline_root_ir`` is found (old-style sentinel API), the pass is a
+no-op — ``PipelineAnnotationPass`` handles those components.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from .synth_pass import SynthPass
+from .pipeline_annotation import _width_from_type_hint
+from zuspec.synth.ir.pipeline_ir import (
+    ChannelDecl, PipelineIR, StageIR, SyncIR,
+)
+from zuspec.synth.ir.synth_ir import SynthConfig, SynthIR
+
+_log = logging.getLogger(__name__)
+
+_DEFAULT_WIDTH = 32
+
+
+class PipelineFrontendPass(SynthPass):
+    """Build ``PipelineIR`` from the new ``@zdc.pipeline`` / ``@zdc.stage`` API.
+
+    This pass is a no-op when ``ir.model_context`` is ``None`` or the
+    top-level component has no ``pipeline_root_ir`` (i.e. it uses the old
+    sentinel-based API).
+    """
+
+    @property
+    def name(self) -> str:
+        return "pipeline_frontend"
+
+    def run(self, ir: SynthIR) -> SynthIR:
+        """Build ``ir.pipeline_ir`` from new-style pipeline IR in model context.
+
+        :param ir: Synthesis IR with ``ir.component`` and ``ir.model_context`` set.
+        :type ir: SynthIR
+        :return: Updated IR with ``ir.pipeline_ir`` set (or unchanged on no-op).
+        :rtype: SynthIR
+        """
+        if ir.model_context is None:
+            _log.debug("[PipelineFrontendPass] no model_context — skipping")
+            return ir
+
+        comp_cls = ir.component
+        if comp_cls is None:
+            _log.debug("[PipelineFrontendPass] no component — skipping")
+            return ir
+
+        # Find DataTypeComponent in the model context
+        comp_type = self._find_component_type(ir.model_context, comp_cls)
+        if comp_type is None:
+            _log.debug("[PipelineFrontendPass] component type not found in model_context")
+            return ir
+
+        root_ir = getattr(comp_type, 'pipeline_root_ir', None)
+        if root_ir is None:
+            _log.debug("[PipelineFrontendPass] no pipeline_root_ir — old-style API, skipping")
+            return ir
+
+        stage_method_irs = getattr(comp_type, 'stage_method_irs', [])
+        sync_method_irs  = getattr(comp_type, 'sync_method_irs', [])
+
+        _log.info("[PipelineFrontendPass] building PipelineIR for %s (%d stages, %d syncs)",
+                  comp_cls.__name__, len(root_ir.stage_calls), len(sync_method_irs))
+
+        pip = self._build_pipeline_ir(comp_cls, root_ir, stage_method_irs, sync_method_irs)
+        ir.pipeline_ir = pip
+        return ir
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _find_component_type(self, ctx, comp_cls):
+        """Return the ``DataTypeComponent`` for *comp_cls* from *ctx*, or None."""
+        cls_name = comp_cls.__name__
+        for name, dt in ctx.type_m.items():
+            # Check by class name and by type
+            simple_name = name.split('.')[-1]
+            if simple_name == cls_name:
+                from zuspec.dataclasses.ir.data_type import DataTypeComponent
+                if isinstance(dt, DataTypeComponent):
+                    return dt
+        return None
+
+    def _build_pipeline_ir(
+        self,
+        comp_cls,
+        root_ir,
+        stage_method_irs,
+        sync_method_irs,
+    ) -> PipelineIR:
+        """Construct the full ``PipelineIR`` from the new-API IRs."""
+        # Build a map from stage name → StageMethodIR
+        method_map: Dict[str, Any] = {m.name: m for m in stage_method_irs}
+
+        # Build ordered stage list from root call sequence
+        stages: List[StageIR] = []
+        for idx, call in enumerate(root_ir.stage_calls):
+            sname = call.stage_name
+            smir = method_map.get(sname)
+            # Populate operations from stage method body AST (for hazard analysis)
+            operations = []
+            if smir and smir.body_ast is not None:
+                operations = list(smir.body_ast.body)
+            stage = StageIR(
+                name=sname,
+                index=idx,
+                operations=operations,
+                no_forward=smir.no_forward if smir else False,
+                stall_cond=smir.stall_decls[0].cond_ast if (smir and smir.stall_decls) else None,
+                cancel_cond=smir.cancel_decls[0].cond_ast if (smir and smir.cancel_decls) else None,
+                flush_decls=list(smir.flush_decls) if smir else [],
+            )
+            stages.append(stage)
+
+        stage_idx: Dict[str, int] = {s.name: i for i, s in enumerate(stages)}
+
+        # Infer channels from the call-sequence data flow
+        channels = self._infer_channels(root_ir.stage_calls, stages, stage_idx)
+
+        # Attach input/output channel lists to each StageIR
+        for ch in channels:
+            src = stage_idx.get(ch.src_stage)
+            dst = stage_idx.get(ch.dst_stage)
+            if src is not None:
+                stages[src].outputs.append(ch)
+            if dst is not None:
+                stages[dst].inputs.append(ch)
+
+        # Build SyncIR list
+        sync_irs: List[SyncIR] = []
+        for smir in sync_method_irs:
+            sync_irs.append(SyncIR(
+                name=smir.name,
+                clock=smir.clock,
+                reset=smir.reset,
+                flush_decls=list(getattr(smir, 'flush_decls', [])),
+                body_ast=getattr(smir, 'body_ast', None),
+            ))
+
+        # Forward default: if root_ir.forward is False, auto-stall; if True, auto-forward
+        forward_default: Optional[bool] = root_ir.forward if hasattr(root_ir, 'forward') else None
+
+        module_name = comp_cls.__name__
+        port_widths = self._build_port_widths(comp_cls)
+
+        return PipelineIR(
+            module_name=module_name,
+            stages=stages,
+            channels=channels,
+            meta=None,
+            pipeline_stages=len(stages),
+            forward_default=forward_default,
+            approach="new",
+            sync_irs=sync_irs,
+            clock_field=root_ir.clock,
+            reset_field=root_ir.reset,
+            port_widths=port_widths,
+        )
+
+    def _build_port_widths(self, comp_cls) -> Dict[str, int]:
+        """Return {field_name: bit_width} from the component class field annotations."""
+        import typing
+        widths: Dict[str, int] = {}
+        if comp_cls is None:
+            return widths
+        try:
+            hints = typing.get_type_hints(comp_cls, include_extras=True)
+        except Exception:
+            return widths
+        for name, hint in hints.items():
+            if name.startswith("_"):
+                continue
+            w = _width_from_type_hint(hint)
+            if w is not None:
+                widths[name] = w
+        return widths
+
+    def _infer_channels(
+        self,
+        stage_calls,
+        stages: List[StageIR],
+        stage_idx: Dict[str, int],
+    ) -> List[ChannelDecl]:
+        """Infer inter-stage channels from the call-sequence data flow.
+
+        For each variable produced at stage k (in ``return_names``) and consumed
+        at stage m > k (in ``arg_names``), create a ``ChannelDecl`` from stage
+        k to stage m.  Variables consumed at the immediately following stage get
+        a direct channel; variables that skip stages are handled by
+        :class:`~zuspec.synth.passes.auto_thread.AutoThreadPass`.
+        """
+        # Map each variable → (producer_stage_idx, producer_stage_name)
+        produced_at: Dict[str, Tuple[int, str]] = {}
+        for call in stage_calls:
+            sidx = stage_idx.get(call.stage_name)
+            if sidx is None:
+                continue
+            for vname in call.return_names:
+                produced_at[vname] = (sidx, call.stage_name)
+
+        channels: List[ChannelDecl] = []
+        seen: Set[Tuple[str, str, str]] = set()
+
+        for call in stage_calls:
+            consumer_idx = stage_idx.get(call.stage_name)
+            if consumer_idx is None:
+                continue
+            for vname in call.arg_names:
+                prod = produced_at.get(vname)
+                if prod is None:
+                    continue  # sourced from outside pipeline
+                prod_idx, prod_stage = prod
+                if prod_idx >= consumer_idx:
+                    continue  # feed-forward only
+                key = (prod_stage, call.stage_name, vname)
+                if key in seen:
+                    continue
+                seen.add(key)
+                ch_name = f"{vname}_{prod_stage.lower()}_to_{call.stage_name.lower()}"
+                channels.append(ChannelDecl(
+                    name=ch_name,
+                    width=_DEFAULT_WIDTH,
+                    depth=1,
+                    src_stage=prod_stage,
+                    dst_stage=call.stage_name,
+                ))
+
+        return channels

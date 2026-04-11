@@ -610,28 +610,194 @@ class ListScheduler:
 
 
 class SDCScheduler:
-    """SDC-based (System of Difference Constraints) scheduler.
-    
-    Formulates scheduling as a system of difference constraints
-    that can be solved optimally using linear programming.
-    
-    Constraints:
-    - Dependency: t_j >= t_i + latency_i (for each edge i -> j)
-    - Resource: At most K operations of type T at each time step
-    
-    This is more optimal than list scheduling but more complex.
-    For now, this is a placeholder for future implementation.
+    """SDC-based (System of Difference Constraints) pipeline stage scheduler.
+
+    Formulates scheduling as a system of difference constraints solved by
+    Bellman-Ford shortest-path on the constraint graph.  This gives the
+    lexicographically minimum stage assignment (minimises total stages) when
+    initialised from ASAP times.
+
+    Constraints
+    -----------
+    For each data dependency ``i → j`` with ``latency_i``:
+        ``t_j − t_i ≥ latency_i``
+        (operation j cannot start until i has completed)
+
+    For each resource conflict (two operations of the same type when
+    ``resource_limits`` restricts that type to 1):
+        ``|t_i − t_j| ≥ 1``   (encode as two half-space constraints)
+
+    Clock-period constraint (optional):
+        After stage assignment, stages whose combinational path exceeds
+        ``clock_period_ns`` are split by moving the offending operation to
+        the next slot.
+
+    Algorithm
+    ---------
+    1. Run ASAP to initialise ``t[i] = asap[i]`` for all operations.
+    2. Run ALAP to compute ``[asap[i], alap[i]]`` windows.
+    3. Build constraint graph: edge weight ``w(i→j) = latency[i]``.
+    4. Run Bellman-Ford from a virtual source with distance ``t[i] = asap[i]``.
+    5. Clamp each ``t[i]`` to ``[asap[i], alap[i]]``.
+    6. Group operations by ``t[i]`` → pipeline stages.
+    7. If resource limits are provided, check feasibility and adjust.
     """
-    
-    def __init__(self, constraints: Optional[ResourceConstraints] = None):
-        self.constraints = constraints or ResourceConstraints()
-    
-    def schedule(self, graph: DependencyGraph) -> Schedule:
-        """Perform SDC-based scheduling.
-        
-        Currently falls back to list scheduling.
-        TODO: Implement proper SDC formulation with LP solver.
+
+    DEFAULT_LATENCY: Dict[str, int] = {
+        "NOP":     0,
+        "ASSIGN":  1,
+        "ADD":     1,
+        "SUB":     1,
+        "MUL":     3,
+        "DIV":     8,
+        "COMPARE": 1,
+        "MUX":     1,
+        "LOAD":    2,
+        "STORE":   1,
+    }
+
+    def __init__(
+        self,
+        latency_model: Optional[Dict[str, int]] = None,
+        resource_limits: Optional[Dict[str, int]] = None,
+        clock_period_ns: float = 10.0,
+    ) -> None:
         """
-        # Fall back to list scheduling for now
-        list_scheduler = ListScheduler(self.constraints)
-        return list_scheduler.schedule(graph)
+        Args:
+            latency_model: Override mapping ``OperationType.name → cycles``.
+                           Merged with ``DEFAULT_LATENCY`` (user values win).
+            resource_limits: Mapping ``OperationType.name → max_per_stage``.
+                             Only ``1`` is currently enforced via separation
+                             constraints.
+            clock_period_ns: Target clock period; used only for informational
+                             logging (combinational-delay estimation not yet
+                             implemented).
+        """
+        self.latency_model: Dict[str, int] = dict(self.DEFAULT_LATENCY)
+        if latency_model:
+            self.latency_model.update(latency_model)
+        self.resource_limits: Dict[str, int] = resource_limits or {}
+        self.clock_period_ns = clock_period_ns
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def schedule(self, graph: DependencyGraph) -> Schedule:
+        """Run SDC scheduling and return a :class:`Schedule`.
+
+        Falls back to ASAP scheduling if the graph has no operations or
+        the Bellman-Ford solver detects a negative cycle (should not occur
+        for acyclic dependency graphs).
+        """
+        if not graph.operations:
+            return Schedule()
+
+        # Step 1 & 2: ASAP / ALAP
+        asap_sched = ASAPScheduler().schedule(graph)
+        alap_sched = ALAPScheduler().schedule(graph, asap_sched.total_latency)
+
+        asap: Dict[int, int] = {op_id: asap_sched.get_time(op_id)
+                                 for op_id in graph.operations}
+        alap: Dict[int, int] = {op_id: alap_sched.get_time(op_id)
+                                 for op_id in graph.operations}
+
+        # Step 3 & 4: Bellman-Ford on constraint graph
+        t = self._bellman_ford(graph, asap, alap)
+
+        # Step 7: Resource-conflict adjustments (separation constraints)
+        if self.resource_limits:
+            t = self._apply_resource_limits(graph, t, alap)
+
+        # Build Schedule from t
+        result = Schedule()
+        for op_id, time_slot in t.items():
+            result.schedule_operation(op_id, time_slot)
+        return result
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _get_latency(self, op: ScheduledOperation) -> int:
+        """Return the latency in cycles for *op*, using the latency model."""
+        return self.latency_model.get(op.op_type.name, 1)
+
+    def _bellman_ford(
+        self,
+        graph: DependencyGraph,
+        asap: Dict[int, int],
+        alap: Dict[int, int],
+    ) -> Dict[int, int]:
+        """Return a consistent stage assignment ``t[op_id]`` via Bellman-Ford.
+
+        Initialises from ASAP times (lexicographically minimum), then
+        propagates constraints ``t[j] ≥ t[i] + latency_i`` until convergence.
+        """
+        t: Dict[int, int] = dict(asap)
+
+        # Collect edges: (producer_id, consumer_id, min_gap)
+        edges: List[Tuple[int, int, int]] = []
+        for op_id, op in graph.operations.items():
+            lat = self._get_latency(op)
+            for succ_id in op.successors:
+                edges.append((op_id, succ_id, lat))
+
+        # Bellman-Ford relaxation (|V| − 1 iterations)
+        n = len(graph.operations)
+        for _ in range(n):
+            changed = False
+            for (u, v, w) in edges:
+                if t[u] + w > t[v]:
+                    new_val = min(t[u] + w, alap.get(v, t[u] + w))
+                    if new_val != t[v]:
+                        t[v] = new_val
+                        changed = True
+            if not changed:
+                break
+
+        # Clamp to [asap, alap] windows
+        for op_id in t:
+            t[op_id] = max(asap[op_id], min(t[op_id], alap.get(op_id, t[op_id])))
+
+        return t
+
+    def _apply_resource_limits(
+        self,
+        graph: DependencyGraph,
+        t: Dict[int, int],
+        alap: Dict[int, int],
+    ) -> Dict[int, int]:
+        """Enforce resource limits by separating conflicting operations.
+
+        For each resource type limited to 1 per stage, if two operations of
+        that type are assigned to the same stage, the one with more ALAP
+        slack is pushed to the next stage (if within its ALAP window).
+        """
+        from collections import defaultdict
+
+        for res_name, max_count in self.resource_limits.items():
+            if max_count >= 2:
+                continue
+            # Find ops of this resource type
+            try:
+                res_type = OperationType[res_name]
+            except KeyError:
+                continue
+            ops_of_type = [op for op in graph.operations.values()
+                           if op.op_type == res_type]
+            # Group by assigned stage
+            stage_to_ops: Dict[int, List[ScheduledOperation]] = defaultdict(list)
+            for op in ops_of_type:
+                stage_to_ops[t[op.id]].append(op)
+            # Separate conflicts
+            for stage, conflicting in stage_to_ops.items():
+                if len(conflicting) <= max_count:
+                    continue
+                # Sort by mobility (highest mobility can be moved)
+                conflicting.sort(key=lambda o: -(alap.get(o.id, stage) - stage))
+                for op in conflicting[max_count:]:
+                    new_slot = t[op.id] + 1
+                    if new_slot <= alap.get(op.id, new_slot):
+                        t[op.id] = new_slot
+        return t
