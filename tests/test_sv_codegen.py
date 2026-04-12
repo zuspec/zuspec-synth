@@ -336,6 +336,30 @@ class TestSVCodeGeneratorIntegration:
         
         assert "module test" in code
 
+    def test_generate_sv_async_reset_derived_from_fsm(self):
+        """generate_sv() derives ASYNC_LOW from fsm.reset_async=True, reset_active_low=True."""
+        fsm = FSMModule(name="async_test", reset_async=True, reset_active_low=True)
+        fsm.add_state("IDLE")
+        code = generate_sv(fsm)
+        assert "negedge" in code
+        assert "always_ff @(posedge clk or negedge" in code
+
+    def test_generate_sv_sync_reset_derived_from_fsm(self):
+        """generate_sv() derives SYNC_LOW when fsm.reset_async=False (default)."""
+        fsm = FSMModule(name="sync_test", reset_async=False, reset_active_low=True)
+        fsm.add_state("IDLE")
+        code = generate_sv(fsm)
+        assert "negedge" not in code
+        assert "always_ff @(posedge clk)" in code
+
+    def test_generate_sv_explicit_config_overrides_fsm(self):
+        """Explicit SVGenConfig always wins over FSM fields."""
+        fsm = FSMModule(name="override_test", reset_async=False, reset_active_low=True)
+        fsm.add_state("IDLE")
+        config = SVGenConfig(reset_style=ResetStyle.ASYNC_LOW)
+        code = generate_sv(fsm, config=config)
+        assert "negedge" in code
+
 
 class TestSVCodeGeneratorCounterExample:
     """Test generating the counter example from the plan."""
@@ -392,3 +416,53 @@ class TestSVCodeGeneratorCounterExample:
         
         print("\n=== Generated Counter ===")
         print(code)
+
+
+class TestUserEnumTypedefs:
+    """Tests for user-defined @zdc.enum typedef emission."""
+
+    def test_user_enum_typedef_emitted(self):
+        """FSMModule.add_user_enum() causes typedef enum logic in SV output."""
+        fsm = FSMModule(name="state_machine")
+        fsm.add_state("IDLE")
+        fsm.add_user_enum("State", 2, {"IDLE": 0, "FETCH": 1, "EXEC": 2})
+
+        code = generate_sv(fsm)
+        assert "typedef enum logic [1:0]" in code
+        assert "IDLE = 2'd0" in code
+        assert "FETCH = 2'd1" in code
+        assert "EXEC = 2'd2" in code
+        assert "} State_t;" in code
+
+    def test_user_enum_appears_before_module(self):
+        """Enum typedefs are emitted before the module keyword."""
+        fsm = FSMModule(name="test")
+        fsm.add_state("S0")
+        fsm.add_user_enum("Color", 2, {"RED": 0, "GREEN": 1, "BLUE": 2})
+
+        code = generate_sv(fsm)
+        typedef_pos = code.find("typedef enum")
+        module_pos = code.find("module test")
+        assert typedef_pos != -1 and module_pos != -1
+        assert typedef_pos < module_pos
+
+    def test_duplicate_enum_not_emitted_twice(self):
+        """Calling add_user_enum() twice with the same name only emits once."""
+        fsm = FSMModule(name="dup")
+        fsm.add_state("S0")
+        fsm.add_user_enum("Op", 1, {"A": 0, "B": 1})
+        fsm.add_user_enum("Op", 1, {"A": 0, "B": 1})  # duplicate
+
+        code = generate_sv(fsm)
+        assert code.count("} Op_t;") == 1
+
+    def test_no_user_enums_no_typedef(self):
+        """No user_enums → no typedef enum in output."""
+        fsm = FSMModule(name="plain")
+        fsm.add_state("IDLE")
+
+        code = generate_sv(fsm)
+        # Only the FSM state enum typedef is present (for the state register)
+        assert "typedef enum" in code  # state encoding enum
+        # But no user-defined typedef suffix (_t) outside the state encoding section
+

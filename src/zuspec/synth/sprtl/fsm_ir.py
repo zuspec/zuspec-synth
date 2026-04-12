@@ -151,6 +151,7 @@ class FSMModule:
         clock_signal: Name of the clock signal
         reset_signal: Name of the reset signal
         reset_active_low: True if reset is active-low (rst_n)
+        reset_async: True if reset is asynchronous (appears in posedge/negedge sensitivity list)
     """
     name: str
     ports: List[FSMPort] = dc.field(default_factory=list)
@@ -160,6 +161,10 @@ class FSMModule:
     clock_signal: str = "clk"
     reset_signal: str = "rst_n"
     reset_active_low: bool = True
+    reset_async: bool = False
+    # User-defined @zdc.enum types referenced by this module.
+    # Each entry is a dict with keys: name, width, items (name→value OrderedDict).
+    user_enums: List[Dict[str, Any]] = dc.field(default_factory=list)
     
     # State encoding
     state_width: int = 0  # Computed from number of states
@@ -227,3 +232,16 @@ class FSMModule:
     def get_output_ports(self) -> List[FSMPort]:
         """Get all output ports."""
         return [p for p in self.ports if p.direction == 'output']
+
+    def add_user_enum(self, name: str, width: int, items: Dict[str, int]) -> None:
+        """Register a user-defined enum type for ``typedef enum`` emission.
+
+        Args:
+            name:  Enum type name (e.g. ``"State"``).
+            width: Bit width of the enum.
+            items: Ordered dict mapping member name → integer value.
+        """
+        # Avoid duplicates by name.
+        if any(e['name'] == name for e in self.user_enums):
+            return
+        self.user_enums.append({'name': name, 'width': width, 'items': dict(items)})

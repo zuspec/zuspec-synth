@@ -124,30 +124,37 @@ class PipelineFrontendPass(SynthPass):
         # Build a map from stage name → StageMethodIR
         method_map: Dict[str, Any] = {m.name: m for m in stage_method_irs}
 
-        # Build ordered stage list from root call sequence
+        # Expand multi-cycle calls before building stages / inferring channels.
+        expanded_calls = self._expand_stage_calls(root_ir.stage_calls, method_map)
+
+        # Build ordered stage list from expanded call sequence
         stages: List[StageIR] = []
-        for idx, call in enumerate(root_ir.stage_calls):
+        for idx, call in enumerate(expanded_calls):
             sname = call.stage_name
-            smir = method_map.get(sname)
+            # Resolve original method: substage names like EX_c2 → look up EX
+            orig_name = call._orig_stage_name if hasattr(call, '_orig_stage_name') else sname
+            smir = method_map.get(orig_name) or method_map.get(sname)
+            is_first_substage = getattr(call, '_is_first_substage', True)
             # Populate operations from stage method body AST (for hazard analysis)
+            # Only the first substage carries the real logic; others are pass-through.
             operations = []
-            if smir and smir.body_ast is not None:
+            if smir and smir.body_ast is not None and is_first_substage:
                 operations = list(smir.body_ast.body)
             stage = StageIR(
                 name=sname,
                 index=idx,
                 operations=operations,
-                no_forward=smir.no_forward if smir else False,
-                stall_cond=smir.stall_decls[0].cond_ast if (smir and smir.stall_decls) else None,
-                cancel_cond=smir.cancel_decls[0].cond_ast if (smir and smir.cancel_decls) else None,
-                flush_decls=list(smir.flush_decls) if smir else [],
+                no_forward=smir.no_forward if (smir and is_first_substage) else False,
+                stall_cond=smir.stall_decls[0].cond_ast if (smir and smir.stall_decls and is_first_substage) else None,
+                cancel_cond=smir.cancel_decls[0].cond_ast if (smir and smir.cancel_decls and is_first_substage) else None,
+                flush_decls=list(smir.flush_decls) if (smir and is_first_substage) else [],
             )
             stages.append(stage)
 
         stage_idx: Dict[str, int] = {s.name: i for i, s in enumerate(stages)}
 
-        # Infer channels from the call-sequence data flow
-        channels = self._infer_channels(root_ir.stage_calls, stages, stage_idx)
+        # Infer channels from the expanded call-sequence data flow
+        channels = self._infer_channels(expanded_calls, stages, stage_idx)
 
         # Attach input/output channel lists to each StageIR
         for ch in channels:
@@ -188,6 +195,97 @@ class PipelineFrontendPass(SynthPass):
             reset_field=root_ir.reset,
             port_widths=port_widths,
         )
+
+    def _effective_cycles(self, call, method_map: Dict[str, Any]) -> int:
+        """Return the effective cycle count for *call*, combining Form A and Form B.
+
+        Form B (context manager, ``call.cycles``) wins when it is > 1.
+        Otherwise fall back to the decorator default (Form A, ``StageMethodIR.cycles``).
+        """
+        if call.cycles > 1:
+            return call.cycles
+        smir = method_map.get(call.stage_name)
+        if smir is not None:
+            return getattr(smir, 'cycles', 1)
+        return 1
+
+    def _expand_stage_calls(self, stage_calls, method_map: Dict[str, Any]):
+        """Expand multi-cycle stage calls into N single-cycle substage calls.
+
+        Each ``StageCallNode`` with ``cycles > 1`` (after combining Form A and
+        Form B) is replaced by N synthetic call nodes — one per substage — that
+        chain intermediate signals named ``_{STAGE}_c{K}_{var}`` between them.
+
+        Single-cycle calls (the common case) pass through unchanged.
+
+        The returned objects are plain objects with the same interface as
+        ``StageCallNode`` plus two extra attributes used by the stage builder:
+
+        - ``_orig_stage_name``  — the original method name (e.g. ``"EX"``).
+        - ``_is_first_substage`` — True only for the first substage.
+        """
+        from zuspec.dataclasses.ir.pipeline import StageCallNode
+
+        class _SubstageCall:
+            """Lightweight substage call node."""
+            __slots__ = ('stage_name', 'arg_names', 'return_names', 'cycles',
+                         '_orig_stage_name', '_is_first_substage')
+
+            def __init__(self, stage_name, arg_names, return_names,
+                         orig_stage_name, is_first_substage):
+                self.stage_name = stage_name
+                self.arg_names = arg_names
+                self.return_names = return_names
+                self.cycles = 1
+                self._orig_stage_name = orig_stage_name
+                self._is_first_substage = is_first_substage
+
+        expanded = []
+        for call in stage_calls:
+            n = self._effective_cycles(call, method_map)
+            if n <= 1:
+                # Single-cycle: pass through with identity attrs
+                call._orig_stage_name = call.stage_name
+                call._is_first_substage = True
+                expanded.append(call)
+                continue
+
+            sname = call.stage_name
+            ret_names = call.return_names  # final output variable names
+
+            if n == 1:
+                expanded.append(call)
+                continue
+
+            # Build N substage call nodes
+            for k in range(1, n + 1):
+                sub_name = f"{sname}_c{k}"
+                is_first = (k == 1)
+                is_last  = (k == n)
+
+                if is_first:
+                    arg_names_k = call.arg_names
+                    # Intermediate outputs (not the final consumer names)
+                    if n > 1:
+                        ret_names_k = [f"_{sname}_c{k}_{r}" for r in ret_names]
+                    else:
+                        ret_names_k = ret_names
+                elif is_last:
+                    arg_names_k = [f"_{sname}_c{k-1}_{r}" for r in ret_names]
+                    ret_names_k = ret_names
+                else:
+                    arg_names_k = [f"_{sname}_c{k-1}_{r}" for r in ret_names]
+                    ret_names_k = [f"_{sname}_c{k}_{r}" for r in ret_names]
+
+                expanded.append(_SubstageCall(
+                    stage_name=sub_name,
+                    arg_names=arg_names_k,
+                    return_names=ret_names_k,
+                    orig_stage_name=sname,
+                    is_first_substage=is_first,
+                ))
+
+        return expanded
 
     def _build_port_widths(self, comp_cls) -> Dict[str, int]:
         """Return {field_name: bit_width} from the component class field annotations."""
