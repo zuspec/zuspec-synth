@@ -219,6 +219,22 @@ class HazardDetector:
                         hazards.append((op1, op2, HazardType.WAW))
         
         return hazards
+
+    def detect_regfile_hazards(self, regfile_decl) -> list:
+        """Return regfile hazard pairs for a given RegFileDeclIR.
+
+        Delegates to ``RegFileHazardAnalyzer`` so that pipeline scheduling
+        can account for RAW forwarding and WAW stall requirements that arise
+        from ``IndexedRegFile`` accesses.
+
+        Args:
+            regfile_decl: A ``RegFileDeclIR`` instance.
+
+        Returns:
+            List of ``RegFileHazardPair`` instances.
+        """
+        from .regfile_synth import RegFileHazardAnalyzer
+        return RegFileHazardAnalyzer().analyze(regfile_decl)
     
     def _get_reads(self, op: FSMAssign) -> Set[str]:
         """Extract signals read by an assignment."""

@@ -171,22 +171,33 @@ class TBGenerator:
         self._emitln()
         self._emitln(f"`timescale {self.config.timescale}")
         self._emitln()
-    
+
+    def _eff_clk(self, fsm: FSMModule) -> str:
+        if fsm.domain_binding is not None:
+            return fsm.domain_binding.clock_name
+        return fsm.clock_signal
+
+    def _eff_rst(self, fsm: FSMModule) -> str:
+        if fsm.domain_binding is not None:
+            return fsm.domain_binding.reset_name
+        return fsm.reset_signal
+
     def _generate_module_declaration(self, fsm: FSMModule):
         self._emitln(f"module {fsm.name}_tb;")
         self._emitln()
-    
+
+
     def _generate_signal_declarations(self, fsm: FSMModule):
         self._indent()
         self._emitln("// Clock and reset")
-        self._emitln(f"logic {fsm.clock_signal};")
-        self._emitln(f"logic {fsm.reset_signal};")
+        self._emitln(f"logic {self._eff_clk(fsm)};")
+        self._emitln(f"logic {self._eff_rst(fsm)};")
         self._emitln()
-        
+
         # Separate inputs and outputs
-        inputs = [p for p in fsm.ports 
-                 if p.direction == "input" and 
-                 p.name not in (fsm.clock_signal, fsm.reset_signal)]
+        inputs = [p for p in fsm.ports
+                 if p.direction == "input" and
+                 p.name not in (self._eff_clk(fsm), self._eff_rst(fsm))]
         outputs = [p for p in fsm.ports if p.direction == "output"]
         
         if inputs:
@@ -221,9 +232,9 @@ class TBGenerator:
         self._indent()
         
         # Connect all ports
-        all_ports = [fsm.clock_signal, fsm.reset_signal]
-        all_ports.extend(p.name for p in fsm.ports 
-                        if p.name not in (fsm.clock_signal, fsm.reset_signal))
+        all_ports = [self._eff_clk(fsm), self._eff_rst(fsm)]
+        all_ports.extend(p.name for p in fsm.ports
+                        if p.name not in (self._eff_clk(fsm), self._eff_rst(fsm)))
         
         for i, port in enumerate(all_ports):
             comma = "," if i < len(all_ports) - 1 else ""
@@ -239,8 +250,8 @@ class TBGenerator:
         half_period = self.config.clock_period_ns // 2
         
         self._emitln("// Clock generation")
-        self._emitln(f"initial {fsm.clock_signal} = 0;")
-        self._emitln(f"always #{half_period} {fsm.clock_signal} = ~{fsm.clock_signal};")
+        self._emitln(f"initial {self._eff_clk(fsm)} = 0;")
+        self._emitln(f"always #{half_period} {self._eff_clk(fsm)} = ~{self._eff_clk(fsm)};")
         self._emitln()
         
         if self.config.dump_waves:
@@ -287,9 +298,9 @@ class TBGenerator:
                 self._emitln(f'$display("Running test: {test.name}");')
             
             # Initialize inputs
-            inputs = [p for p in fsm.ports 
-                     if p.direction == "input" and 
-                     p.name not in (fsm.clock_signal, fsm.reset_signal)]
+            inputs = [p for p in fsm.ports
+                     if p.direction == "input" and
+                     p.name not in (self._eff_clk(fsm), self._eff_rst(fsm))]
             for port in inputs:
                 self._emitln(f"{port.name} = 0;")
             

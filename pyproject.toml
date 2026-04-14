@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "zuspec-dataclasses",
+    "dv-flow-mgr",
 ]
 
 [project.optional-dependencies]
@@ -31,10 +32,14 @@ dev = [
     "pytest-cov>=4.0",
 ]
 
+[project.entry-points."dv_flow.mgr"]
+zuspec-synth = "zuspec.synth.__ext__"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
+"zuspec.synth" = ["flow.dv", "py.typed"]
 "*" = ["py.typed"]
 
 [tool.pytest.ini_options]

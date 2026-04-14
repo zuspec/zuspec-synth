@@ -105,6 +105,8 @@ class SPRTLTransformer:
         if 'reset' in metadata:
             reset_expr = metadata['reset']
             module.reset_signal = self._extract_signal_name(reset_expr, 'rst_n')
+        module.reset_async = bool(metadata.get('reset_async', False))
+        module.reset_active_low = bool(metadata.get('reset_active_low', True))
         
         # Extract ports from component fields
         self._extract_ports(component_ir)
