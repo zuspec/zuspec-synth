@@ -119,6 +119,48 @@ class FSMState:
 
 
 @dc.dataclass
+class FSMRegRead(FSMOperation):
+    """Register read operation: result_var = reg.read()."""
+    reg_name: str         # Human-readable register path (e.g. "ctrl", "ch_src")
+    result_var: str = ""  # Local variable name that receives the read value
+
+
+@dc.dataclass
+class FSMRegWrite(FSMOperation):
+    """Register write operation: reg.write(value)."""
+    reg_name: str   # Human-readable register path
+    value: Any = None  # Value expression to write
+
+
+@dc.dataclass
+class FSMMemRequest(FSMOperation):
+    """Memory-interface request drive: port.request(req)."""
+    port_name: str   # Port name (e.g. "mem")
+    req_var: str = ""  # Local variable holding the MemReq struct
+
+
+@dc.dataclass
+class FSMMemResponse(FSMOperation):
+    """Memory-interface response latch: result_var = port.response()."""
+    port_name: str    # Port name (e.g. "mem")
+    result_var: str = ""  # Local variable that receives the MemRsp struct
+
+
+@dc.dataclass
+class FSMAddrDecode:
+    """Combinational address-decode block for a memory-mapped register file.
+
+    Emitted as ``always @(*)`` in Verilog-2005.  One instance is attached to
+    an ``FSMModule`` that exposes a ``cfg`` MemIF export bound to a RegFile.
+    """
+    port_name: str       # e.g. "cfg"
+    n_chan: int          # Number of channels
+    regs_per_chan: int   # Bytes per channel (e.g. 0x10)
+    reg_names: List[str]  # e.g. ["src", "dst", "length", "ctrl"]
+    reg_widths: List[int]  # e.g. [32, 32, 32, 3]
+
+
+@dc.dataclass
 class FSMPort:
     """Port declaration for an FSM module."""
     name: str
@@ -161,6 +203,9 @@ class FSMModule:
     reset_signal: str = "rst_n"
     reset_active_low: bool = True
     
+    # Optional address-decode block (emitted as always @(*) combinational logic)
+    addr_decode: Optional['FSMAddrDecode'] = None
+
     # State encoding
     state_width: int = 0  # Computed from number of states
     state_encoding: Dict[int, int] = dc.field(default_factory=dict)  # state_id -> encoded value

@@ -32,7 +32,8 @@ from dataclasses import dataclass, field
 
 from .fsm_ir import (
     FSMModule, FSMState, FSMStateKind, FSMTransition,
-    FSMOperation, FSMAssign, FSMCond, FSMPort, FSMRegister
+    FSMOperation, FSMAssign, FSMCond, FSMPort, FSMRegister,
+    FSMRegRead, FSMRegWrite, FSMMemRequest, FSMMemResponse,
 )
 
 
@@ -67,25 +68,33 @@ class SPRTLTransformer:
     
     def __init__(self):
         self._ctx: Optional[TransformContext] = None
-    
+        self._field_names: Dict[int, str] = {}  # ExprRefField.index → field name
+
     def transform(self, component_ir: Any, process_ir: Any) -> FSMModule:
         """Transform a sync process to an FSM module.
-        
+
         Args:
             component_ir: The DataTypeComponent IR node
-            process_ir: The Function IR node for the sync process
-            
+            process_ir: The Function or Process IR node for the process
+
         Returns:
             FSMModule representing the transformed FSM
         """
         # Extract module name from component
         module_name = getattr(component_ir, 'name', 'fsm') or 'fsm'
-        
+
         # Create the FSM module
         module = FSMModule(name=module_name)
-        
+
         # Set up transformation context
         self._ctx = TransformContext(module=module)
+
+        # Build field-index → name map for ExprRefField resolution
+        fields = getattr(component_ir, 'fields', [])
+        self._field_names = {
+            i: getattr(f, 'name', f'field_{i}')
+            for i, f in enumerate(fields)
+        }
         
         # Extract clock and reset from process metadata
         metadata = getattr(process_ir, 'metadata', {})
@@ -325,16 +334,37 @@ class SPRTLTransformer:
     def _transform_assign(self, stmt: Any):
         """Transform an assignment statement."""
         if self._ctx.in_reset_section:
-            # Assignment in reset section - extract reset value
-            # Reset values should come from port declarations instead
             return
-        
+
         if not self._ctx.current_state:
             return
-        
+
         targets = getattr(stmt, 'targets', [])
         value = getattr(stmt, 'value', None)
-        
+
+        # Await on the RHS — the target variable receives the result
+        if value is not None and type(value).__name__ == 'ExprAwait':
+            # For tuple unpacking (e.g. src, dst, length, ctrl = await read_all(...))
+            # pass the full target list so read_all can name each register result.
+            first_target = targets[0] if targets else None
+            if first_target is not None and type(first_target).__name__ == 'ExprTuple':
+                result_vars = [
+                    self._expr_to_name(e)
+                    for e in getattr(first_target, 'elts', [])
+                ]
+                self._transform_await(value, result_var=result_vars)
+            else:
+                result_var = self._expr_to_name(first_target) if first_target else None
+                self._transform_await(value, result_var=result_var)
+            return
+
+        # Detect next(generator_exp, default) — synthesise as priority encoder.
+        if value is not None and self._is_next_generator_call(value):
+            for target in targets:
+                target_name = self._expr_to_name(target)
+                self._transform_priority_encode(target_name, value)
+            return
+
         for target in targets:
             target_name = self._expr_to_name(target)
             self._ctx.current_state.add_operation(
@@ -369,35 +399,357 @@ class SPRTLTransformer:
         if expr_type == 'ExprAwait':
             self._transform_await(expr)
     
-    def _transform_await(self, expr: Any):
+    def _transform_await(self, expr: Any, result_var=None):
         """Transform an await expression.
-        
-        This creates a new FSM state boundary.
+
+        ``result_var`` carries the name (str) or names (list[str]) of the
+        local variable(s) that receive the awaited value.
         """
         if self._ctx.in_reset_section:
             return
-        
+
         await_value = getattr(expr, 'value', None)
         if not await_value:
             return
-        
-        # Determine what kind of await this is
+
         await_type = type(await_value).__name__
-        
+
         if await_type == 'ExprCall':
-            # Check if it's zdc.cycles()
             func = getattr(await_value, 'func', None)
-            if func and self._is_cycles_call(func):
-                self._transform_await_cycles(await_value)
-                return
-        
+            if func:
+                attr = getattr(func, 'attr', None)
+                if attr == 'read':
+                    self._transform_await_reg_read(await_value, result_var)
+                    return
+                elif attr == 'write':
+                    self._transform_await_reg_write(await_value)
+                    return
+                elif attr == 'request':
+                    self._transform_await_mem_request(await_value)
+                    return
+                elif attr == 'response':
+                    self._transform_await_mem_response(await_value, result_var)
+                    return
+                elif attr == 'read_all':
+                    self._transform_await_read_all(await_value, result_var)
+                    return
+                elif attr == 'wait':
+                    # Distinguish self.wait(Time) from self.regs.wait(regs, cond).
+                    # When the receiver is TypeExprRefSelf it is a component-level
+                    # idle wait; when it is an ExprRefField it is a bulk register
+                    # poll that stalls until a condition on register values is met.
+                    receiver_type = type(getattr(func, 'value', None)).__name__
+                    if receiver_type == 'TypeExprRefSelf':
+                        self._transform_await_idle(await_value)
+                    else:
+                        self._transform_await_reg_wait(await_value, result_var)
+                    return
+                elif self._is_cycles_call(func):
+                    self._transform_await_cycles(await_value)
+                    return
+
         if await_type == 'ExprCompare':
-            # await <expr> == <value> - wait for condition
             self._transform_await_condition(await_value)
             return
-        
-        # Generic await - treat as wait for condition
+
+        # Generic await — treat as wait-for-condition
         self._transform_await_condition(await_value)
+
+    # ------------------------------------------------------------------
+    # Await helper: extract names from IR expressions
+    # ------------------------------------------------------------------
+
+    def _extract_reg_name(self, func_expr: Any) -> str:
+        """Return the register attribute name from a .read()/.write() call func.
+
+        For ``ExprAttribute(attr='read', value=ExprAttribute(attr='ctrl', …))``
+        this returns ``'ctrl'``.
+        """
+        reg_expr = getattr(func_expr, 'value', None)
+        attr = getattr(reg_expr, 'attr', None) if reg_expr is not None else None
+        return attr if attr else 'reg'
+
+    def _extract_port_name(self, func_expr: Any) -> str:
+        """Return the port name from a .request()/.response() call func.
+
+        ``func_expr.value`` is an ``ExprRefField`` whose ``index`` maps to a
+        field name via ``self._field_names``.
+        """
+        port_expr = getattr(func_expr, 'value', None) if func_expr else None
+        if port_expr is not None and type(port_expr).__name__ == 'ExprRefField':
+            idx = getattr(port_expr, 'index', 0)
+            return self._field_names.get(idx, f'port_{idx}')
+        return 'mem'
+
+    # ------------------------------------------------------------------
+    # Await handlers: reg read / write
+    # ------------------------------------------------------------------
+
+    def _transform_await_reg_read(self, call_expr: Any,
+                                   result_var: Optional[str] = None):
+        """Transform ``result = await reg.read()`` → single NORMAL state."""
+        reg_name = self._extract_reg_name(getattr(call_expr, 'func', None))
+        state_name = f"{reg_name.upper()}_READ"
+
+        reg_state = self._ctx.new_state(state_name, FSMStateKind.NORMAL)
+        reg_state.add_operation(
+            FSMRegRead(reg_name=reg_name, result_var=result_var or '')
+        )
+
+        if self._ctx.current_state:
+            self._ctx.current_state.add_transition(reg_state.id)
+
+        self._ctx.current_state = reg_state
+
+    def _transform_await_reg_write(self, call_expr: Any):
+        """Transform ``await reg.write(value)`` → single NORMAL state."""
+        reg_name = self._extract_reg_name(getattr(call_expr, 'func', None))
+        args = getattr(call_expr, 'args', [])
+        write_value = args[0] if args else None
+        state_name = f"{reg_name.upper()}_WRITE"
+
+        reg_state = self._ctx.new_state(state_name, FSMStateKind.NORMAL)
+        reg_state.add_operation(
+            FSMRegWrite(reg_name=reg_name, value=write_value)
+        )
+
+        if self._ctx.current_state:
+            self._ctx.current_state.add_transition(reg_state.id)
+
+        self._ctx.current_state = reg_state
+
+    # ------------------------------------------------------------------
+    # Await handlers: memory-interface request / response
+    # ------------------------------------------------------------------
+
+    def _transform_await_mem_request(self, call_expr: Any):
+        """Transform ``await port.request(req)`` → WAIT_COND state.
+
+        The FSM stays in this state until ``{port}_req_ready`` is asserted.
+        """
+        port_name = self._extract_port_name(getattr(call_expr, 'func', None))
+        args = getattr(call_expr, 'args', [])
+        req_var = self._expr_to_name(args[0]) if args else ''
+        cond_signal = f"{port_name}_req_ready"
+        state_name = f"{port_name.upper()}_REQ"
+
+        req_state = self._ctx.new_state(
+            state_name, FSMStateKind.WAIT_COND, wait_condition=cond_signal
+        )
+        req_state.add_operation(FSMMemRequest(port_name=port_name, req_var=req_var))
+        # Self-loop (stay) when not ready; advance when ready
+        req_state.add_transition(req_state.id, priority=1)
+
+        if self._ctx.current_state:
+            self._ctx.current_state.add_transition(req_state.id)
+
+        # Post-request state (advance when ready)
+        post_state = self._ctx.new_state(f"{state_name}_DONE", FSMStateKind.NORMAL)
+        req_state.add_transition(post_state.id, condition=cond_signal)
+
+        self._ctx.current_state = post_state
+
+    def _transform_await_mem_response(self, call_expr: Any,
+                                       result_var: Optional[str] = None):
+        """Transform ``result = await port.response()`` → WAIT_COND state.
+
+        The FSM stays until ``{port}_rsp_valid`` is asserted.
+        """
+        port_name = self._extract_port_name(getattr(call_expr, 'func', None))
+        cond_signal = f"{port_name}_rsp_valid"
+        state_name = f"{port_name.upper()}_RSP"
+
+        rsp_state = self._ctx.new_state(
+            state_name, FSMStateKind.WAIT_COND, wait_condition=cond_signal
+        )
+        rsp_state.add_operation(
+            FSMMemResponse(port_name=port_name, result_var=result_var or '')
+        )
+        rsp_state.add_transition(rsp_state.id, priority=1)
+
+        if self._ctx.current_state:
+            self._ctx.current_state.add_transition(rsp_state.id)
+
+        post_state = self._ctx.new_state(f"{state_name}_DONE", FSMStateKind.NORMAL)
+        rsp_state.add_transition(post_state.id, condition=cond_signal)
+
+        self._ctx.current_state = post_state
+
+    # ------------------------------------------------------------------
+    # Await handler: self.wait(Time.ns(N)) — idle for one cycle
+    # ------------------------------------------------------------------
+
+    def _transform_await_idle(self, call_expr: Any):
+        """Transform ``await self.wait(Time.ns(N))`` → single NORMAL idle state."""
+        idle_state = self._ctx.new_state("IDLE_WAIT", FSMStateKind.NORMAL)
+
+        if self._ctx.current_state:
+            self._ctx.current_state.add_transition(idle_state.id)
+
+        self._ctx.current_state = idle_state
+
+    # ------------------------------------------------------------------
+    # Await handler: self.regs.wait(regs, cond) — poll registers
+    # ------------------------------------------------------------------
+
+    def _transform_await_reg_wait(self, call_expr: Any, result_var=None):
+        """Transform ``ctrls = await self.regs.wait(regs, cond)`` → WAIT_COND state.
+
+        The RegFile.wait() call polls a list of registers (0-time, combinational)
+        and stalls the FSM until ``cond(values)`` is true.  In RTL this maps to a
+        single WAIT_COND state that reads all listed registers combinationally and
+        checks the condition every cycle.
+
+        The result variable(s) (if any) receive the register values so the
+        caller can use them immediately — exactly as in the Python model.
+        """
+        args = getattr(call_expr, 'args', [])
+        # args[0] = register list expression (ExprListComp or ExprList)
+        # args[1] = condition expression   (ExprLambda or ExprGeneratorExp)
+        regs_expr = args[0] if len(args) > 0 else None
+        cond_expr = args[1] if len(args) > 1 else None
+
+        # Build a string description of the wait condition for the FSM IR.
+        # Downstream passes (code generators, optimisers) can inspect it.
+        cond_str = self._summarise_reg_cond(cond_expr)
+
+        wait_state = self._ctx.new_state(
+            "IDLE_WAIT",
+            FSMStateKind.WAIT_COND,
+            wait_condition=('reg_cond', cond_str, regs_expr),
+        )
+
+        # Add a FSMRegRead for each register in the list so the code generator
+        # knows which registers drive the combinational condition check.
+        for reg_name, var_name in self._extract_reg_list(regs_expr, result_var):
+            wait_state.add_operation(FSMRegRead(reg_name=reg_name, result_var=var_name))
+
+        if self._ctx.current_state:
+            self._ctx.current_state.add_transition(wait_state.id)
+
+        # Advance to a new NORMAL state when the condition is met.
+        post_state = self._ctx.new_state(
+            self._ctx.make_state_name("S"),
+            FSMStateKind.NORMAL,
+        )
+        wait_state.add_transition(post_state.id, condition=('reg_cond', cond_str, regs_expr))
+        wait_state.add_transition(wait_state.id, priority=1)  # self-loop while not met
+
+        self._ctx.current_state = post_state
+
+    def _summarise_reg_cond(self, cond_expr: Any) -> str:
+        """Return a compact string description of a register wait condition.
+
+        For the common ``lambda vals: any(v.en for v in vals)`` pattern this
+        produces ``'any.en'``; unknown forms fall back to ``'cond'``.
+        """
+        if cond_expr is None:
+            return 'cond'
+        cond_type = type(cond_expr).__name__
+        if cond_type == 'ExprLambda':
+            body = getattr(cond_expr, 'body', None)
+            if body is not None:
+                body_type = type(body).__name__
+                if body_type == 'ExprCall':
+                    func = getattr(body, 'func', None)
+                    func_name = getattr(func, 'name', '') or getattr(func, 'attr', '')
+                    gen_args = getattr(body, 'args', [])
+                    if func_name in ('any', 'all') and gen_args:
+                        gen = gen_args[0]
+                        elt = getattr(gen, 'elt', None)
+                        attr = getattr(elt, 'attr', None) if elt is not None else None
+                        if attr:
+                            return f'{func_name}.{attr}'
+        return 'cond'
+
+    def _extract_reg_list(self, regs_expr: Any, result_var=None):
+        """Yield (reg_name, result_var_name) pairs from a register list expression.
+
+        Handles ``ExprListComp`` (``[self.regs.ch[i].ctrl for i in range(N)]``) and
+        ``ExprList`` (``[ch.src, ch.dst, ...]``).
+        """
+        if regs_expr is None:
+            return
+        regs_type = type(regs_expr).__name__
+
+        if regs_type == 'ExprList':
+            elts = getattr(regs_expr, 'elts', [])
+            result_names = result_var if isinstance(result_var, list) else [None] * len(elts)
+            for i, elt in enumerate(elts):
+                reg_name = getattr(elt, 'attr', None) or f'reg_{i}'
+                var_name = result_names[i] if i < len(result_names) else ''
+                yield reg_name, var_name or ''
+        elif regs_type == 'ExprListComp':
+            # e.g. [self.regs.ch[i].ctrl for i in range(N)]
+            elt = getattr(regs_expr, 'elt', None)
+            reg_name = getattr(elt, 'attr', None) or 'reg' if elt is not None else 'reg'
+            var_name = result_var if isinstance(result_var, str) else ''
+            yield reg_name, var_name
+
+    # ------------------------------------------------------------------
+    # Await handler: self.regs.read_all(regs) — bulk combinational read
+    # ------------------------------------------------------------------
+
+    def _transform_await_read_all(self, call_expr: Any, result_var=None):
+        """Transform ``src, dst, length, ctrl = await self.regs.read_all([...])`` →
+        single NORMAL state with one FSMRegRead per register.
+
+        This is a 0-time (combinational) operation in RTL — all registers are
+        read in the same clock cycle, so only a single FSM state is needed.
+        """
+        args = getattr(call_expr, 'args', [])
+        regs_expr = args[0] if args else None
+
+        read_state = self._ctx.new_state("REG_FETCH", FSMStateKind.NORMAL)
+
+        for reg_name, var_name in self._extract_reg_list(regs_expr, result_var):
+            read_state.add_operation(FSMRegRead(reg_name=reg_name, result_var=var_name))
+
+        if self._ctx.current_state:
+            self._ctx.current_state.add_transition(read_state.id)
+
+        self._ctx.current_state = read_state
+
+    # ------------------------------------------------------------------
+    # Combinational: next(generator, default) → priority encoder
+    # ------------------------------------------------------------------
+
+    def _is_next_generator_call(self, expr: Any) -> bool:
+        """Return True if *expr* is ``next(<generator-exp>, <default>)``."""
+        if type(expr).__name__ != 'ExprCall':
+            return False
+        func = getattr(expr, 'func', None)
+        if func is None or getattr(func, 'name', None) != 'next':
+            return False
+        args = getattr(expr, 'args', [])
+        if not args:
+            return False
+        return type(args[0]).__name__ == 'ExprGeneratorExp'
+
+    def _transform_priority_encode(self, target_name: str, call_expr: Any):
+        """Emit a combinational priority-encoder assignment for ``next(gen, default)``.
+
+        ``next((i for i, v in enumerate(seq) if pred(v)), default)`` describes a
+        priority encoder: scan ``seq`` and return the first index where ``pred``
+        holds, else ``default``.  In RTL this is a purely combinational always@(*)
+        block — no extra FSM state is needed; the operation is added to the
+        *current* state.
+        """
+        if self._ctx.current_state is None:
+            return
+        args = getattr(call_expr, 'args', [])
+        gen_expr = args[0]   # ExprGeneratorExp
+        default_expr = args[1] if len(args) > 1 else None
+
+        # Record as a structured FSMAssign so code generators can lower it
+        # to a priority-mux always-block.
+        self._ctx.current_state.add_operation(
+            FSMAssign(
+                target=target_name,
+                value=('priority_encode', gen_expr, default_expr),
+                is_nonblocking=False,
+            )
+        )
     
     def _is_cycles_call(self, func: Any) -> bool:
         """Check if a function call is zdc.cycles()."""
@@ -455,21 +807,77 @@ class SPRTLTransformer:
         self._ctx.current_state = next_state
     
     def _transform_for(self, stmt: Any):
-        """Transform a for loop.
-        
-        Note: For synthesis, for loops should typically be unrolled.
-        This handles the case where unrolling hasn't been applied.
+        """Transform a for loop into LOOP_CHK / LOOP_BODY FSM states.
+
+        Supports ``for <var> in range(<bound>):`` where ``<bound>`` is either
+        a constant or a local variable.  The loop variable is synthesized as a
+        counter register.
+
+        Generated states
+        ----------------
+        ``LOOP_<VAR>_CHK``   — WAIT_COND: check ``var < bound``; exit when false
+        ``LOOP_<VAR>_BODY``  — NORMAL: first state of the loop body
+        …                    — states created by body's await expressions
+        ``LOOP_<VAR>_DONE``  — NORMAL: first state after the loop
         """
-        # For now, treat like a while loop
-        # Full implementation would check for @Unroll directive
         target = getattr(stmt, 'target', None)
         iter_expr = getattr(stmt, 'iter', None)
         body = getattr(stmt, 'body', [])
-        
-        # TODO: Implement proper for loop handling with bounds analysis
-        # For now, just transform the body
+
+        loop_var = getattr(target, 'name', 'loop_i') if target else 'loop_i'
+
+        # Extract bound from range(bound)
+        bound_expr = None
+        if iter_expr is not None and type(iter_expr).__name__ == 'ExprCall':
+            args = getattr(iter_expr, 'args', [])
+            if args:
+                bound_expr = args[0]
+
+        # Initialise loop counter in current state
+        if self._ctx.current_state is not None:
+            self._ctx.current_state.add_operation(
+                FSMAssign(target=loop_var, value=0, is_nonblocking=True)
+            )
+
+        # LOOP_CHK — stay while var < bound (WAIT_COND exits when ≥ bound)
+        loop_chk = self._ctx.new_state(
+            f"LOOP_{loop_var.upper()}_CHK",
+            FSMStateKind.WAIT_COND,
+            wait_condition=('lt', loop_var, bound_expr),
+        )
+        if self._ctx.current_state is not None:
+            self._ctx.current_state.add_transition(loop_chk.id)
+        self._ctx.current_state = loop_chk
+
+        # LOOP_BODY — first state executed when condition is met
+        loop_body = self._ctx.new_state(
+            f"LOOP_{loop_var.upper()}_BODY",
+            FSMStateKind.NORMAL,
+        )
+        # Conditional advance: var < bound → body
+        loop_chk.add_transition(loop_body.id, condition=('lt', loop_var, bound_expr))
+
+        self._ctx.current_state = loop_body
+
+        # Transform body statements (may create more states via awaits)
         self._transform_body(body)
-    
+
+        # Increment counter and loop back from whatever state body ended in
+        if self._ctx.current_state is not None:
+            self._ctx.current_state.add_operation(
+                FSMAssign(target=loop_var, value=(loop_var, '+', 1),
+                          is_nonblocking=True)
+            )
+            self._ctx.current_state.add_transition(loop_chk.id)
+
+        # LOOP_DONE — reached when var >= bound (unconditional else from chk)
+        loop_done = self._ctx.new_state(
+            f"LOOP_{loop_var.upper()}_DONE",
+            FSMStateKind.NORMAL,
+        )
+        loop_chk.add_transition(loop_done.id)  # unconditional = else branch
+
+        self._ctx.current_state = loop_done
     def _finalize(self):
         """Finalize the FSM after transformation."""
         module = self._ctx.module
