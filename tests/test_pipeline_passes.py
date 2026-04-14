@@ -382,9 +382,10 @@ class TestSVPhase6ExprLowering:
         assert "input  wire [31:0] b," in sv
 
     def test_real_output_port_in_header(self):
-        """Output port (self.out) appears as 'output reg' declaration."""
+        """Output port (self.out) appears as 'output wire' with feedback accumulator."""
         sv = self._get_sv()
-        assert "output reg  [31:0] out" in sv
+        assert "output wire [31:0] out" in sv
+        assert "assign out = out_q;" in sv
 
     def test_no_trailing_comma_on_last_port(self):
         """The last entry in the port list must not be followed by a comma."""
@@ -416,9 +417,9 @@ class TestSVPhase6ExprLowering:
         assert "result_ex = (a_if_to_ex_q + b_if_to_ex_q);" in sv
 
     def test_wb_stage_drives_output(self):
-        """WB stage always block drives the output port from its pipeline register."""
+        """WB stage always block drives the output accumulator from its pipeline register."""
         sv = self._get_sv()
-        assert "out = result_ex_to_wb_q;" in sv
+        assert "out_next = result_ex_to_wb_q;" in sv
 
     def test_stage_signals_declared_before_always_blocks(self):
         """Stage-local signal declarations appear before the combinational always blocks."""
@@ -449,8 +450,8 @@ class TestSVPhase6ExprLowering:
         assert "a_if = 32'b0;" in sv
         assert "b_if = 32'b0;" in sv
         assert "result_ex = 32'b0;" in sv
-        # Output port should also have default zero
-        assert "out = 32'b0;" in sv
+        # Output accumulator should also have default zero
+        assert "out_next = 32'b0;" in sv
 
     def test_verilog_2005_only(self):
         """No SystemVerilog-only keywords appear in the output."""

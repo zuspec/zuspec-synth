@@ -33,6 +33,7 @@ no-op — ``PipelineAnnotationPass`` handles those components.
 from __future__ import annotations
 
 import logging
+import inspect
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .synth_pass import SynthPass
@@ -181,6 +182,7 @@ class PipelineFrontendPass(SynthPass):
 
         module_name = comp_cls.__name__
         port_widths = self._build_port_widths(comp_cls)
+        module_globals = self._build_module_globals(comp_cls)
 
         return PipelineIR(
             module_name=module_name,
@@ -194,6 +196,7 @@ class PipelineFrontendPass(SynthPass):
             clock_field=root_ir.clock,
             reset_field=root_ir.reset,
             port_widths=port_widths,
+            module_globals=module_globals,
         )
 
     def _effective_cycles(self, call, method_map: Dict[str, Any]) -> int:
@@ -286,6 +289,19 @@ class PipelineFrontendPass(SynthPass):
                 ))
 
         return expanded
+
+    def _build_module_globals(self, comp_cls) -> Dict[str, Any]:
+        """Return {name: value} for integer constants in the component's module."""
+        if comp_cls is None:
+            return {}
+        try:
+            mod = inspect.getmodule(comp_cls)
+            if mod is None:
+                return {}
+            return {k: v for k, v in vars(mod).items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        except Exception:
+            return {}
 
     def _build_port_widths(self, comp_cls) -> Dict[str, int]:
         """Return {field_name: bit_width} from the component class field annotations."""

@@ -17,6 +17,7 @@ from .pipeline_sv_emit import PipelineSVCodegen, SVEmitPass
 
 from .pipeline_to_source import PipelineToSource, PipelineToSourcePass
 from .expr_lowerer import ExprLowerer, collect_ports
+from .cdc_analysis import CDCAnalysisPass, CDCCrossing
 
 __all__ = [
     "SynthPass",
@@ -44,4 +45,6 @@ __all__ = [
     "PipelineToSourcePass",
     "ExprLowerer",
     "collect_ports",
+    "CDCAnalysisPass",
+    "CDCCrossing",
 ]

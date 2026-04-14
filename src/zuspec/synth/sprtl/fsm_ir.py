@@ -136,6 +136,73 @@ class FSMRegister:
 
 
 @dc.dataclass
+class DomainBinding:
+    """Resolved clock/reset binding used by synthesis emitters.
+
+    Created by :class:`ClockDomainAnalysisPass` (Phase 4) from a component's
+    ``clock_domain`` / ``reset_domain`` IR attributes.  All names here are the
+    concrete signal names that will appear in the generated SV.
+
+    Attributes:
+        clock_name:     Clock signal name (e.g. ``"clk"``).
+        reset_name:     Reset signal name (e.g. ``"rst_n"``).
+        reset_active_low: ``True`` → reset asserts low (``rst_n`` style).
+        reset_async:    ``True`` → asynchronous reset sensitivity list.
+        period:         Clock period if known (None → not generated in SDC).
+    """
+    clock_name:      str  = "clk"
+    reset_name:      str  = "rst_n"
+    reset_active_low: bool = True
+    reset_async:     bool  = False
+    period:          Optional[Any] = None   # Time | None
+
+    @classmethod
+    def from_component_ir(cls, component_ir) -> "DomainBinding":
+        """Build a DomainBinding from a DataTypeComponent's domain slots.
+
+        Falls back to sensible defaults when no domain is declared.
+
+        :param component_ir: A ``DataTypeComponent`` IR node.
+        """
+        # Lazy import to avoid circular dependency with zuspec-dataclasses
+        try:
+            from zuspec.dataclasses.domain import (
+                ClockDomain, ResetDomain,
+            )
+        except ImportError:
+            return cls()
+
+        clock_domain = getattr(component_ir, "clock_domain", None)
+        reset_domain = getattr(component_ir, "reset_domain", None)
+
+        # Determine clock name
+        if isinstance(clock_domain, ClockDomain):
+            clock_name = clock_domain.name or "clk"
+            period = clock_domain.period
+        else:
+            clock_name = "clk"
+            period = None
+
+        # Determine reset name, polarity, style
+        if isinstance(reset_domain, ResetDomain):
+            active_low = (reset_domain.polarity == "active_low")
+            reset_name = "rst_n" if active_low else "rst"
+            reset_async = (reset_domain.style == "async")
+        else:
+            active_low = True
+            reset_name = "rst_n"
+            reset_async = False
+
+        return cls(
+            clock_name=clock_name,
+            reset_name=reset_name,
+            reset_active_low=active_low,
+            reset_async=reset_async,
+            period=period,
+        )
+
+
+@dc.dataclass
 class FSMModule:
     """Complete FSM module representation.
     
@@ -162,6 +229,8 @@ class FSMModule:
     reset_signal: str = "rst_n"
     reset_active_low: bool = True
     reset_async: bool = False
+    # New-style domain binding (takes precedence over clock_signal/reset_signal when set)
+    domain_binding: Optional[DomainBinding] = dc.field(default=None)
     # User-defined @zdc.enum types referenced by this module.
     # Each entry is a dict with keys: name, width, items (name→value OrderedDict).
     user_enums: List[Dict[str, Any]] = dc.field(default_factory=list)

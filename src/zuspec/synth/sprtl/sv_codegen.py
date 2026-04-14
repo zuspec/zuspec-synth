@@ -134,7 +134,31 @@ class SVCodeGenerator:
     def _dedent(self):
         """Decrease indentation."""
         self._indent_level = max(0, self._indent_level - 1)
-    
+
+    def _eff_clk(self, fsm: FSMModule) -> str:
+        """Effective clock signal name — prefers DomainBinding when set."""
+        if fsm.domain_binding is not None:
+            return fsm.domain_binding.clock_name
+        return fsm.clock_signal
+
+    def _eff_rst(self, fsm: FSMModule) -> str:
+        """Effective reset signal name — prefers DomainBinding when set."""
+        if fsm.domain_binding is not None:
+            return fsm.domain_binding.reset_name
+        return fsm.reset_signal
+
+    def _eff_reset_active_low(self, fsm: FSMModule) -> bool:
+        """Effective reset polarity — prefers DomainBinding when set."""
+        if fsm.domain_binding is not None:
+            return fsm.domain_binding.reset_active_low
+        return fsm.reset_active_low
+
+    def _eff_reset_async(self, fsm: FSMModule) -> bool:
+        """Effective reset style — prefers DomainBinding when set."""
+        if fsm.domain_binding is not None:
+            return fsm.domain_binding.reset_async
+        return fsm.reset_async
+
     def _generate_header(self, fsm: FSMModule):
         """Generate file header comment."""
         if self.config.generate_comments:
@@ -173,21 +197,24 @@ class SVCodeGenerator:
         """Generate module declaration with ports."""
         self._emitln(f"module {fsm.name} (")
         self._indent()
-        
+
+        clk = self._eff_clk(fsm)
+        rst = self._eff_rst(fsm)
+
         # Clock and reset first
-        self._emitln(f"input  logic {fsm.clock_signal},")
-        self._emitln(f"input  logic {fsm.reset_signal},")
-        
+        self._emitln(f"input  logic {clk},")
+        self._emitln(f"input  logic {rst},")
+
         # Other ports
-        ports = [p for p in fsm.ports 
-                if p.name not in (fsm.clock_signal, fsm.reset_signal)]
-        
+        ports = [p for p in fsm.ports
+                if p.name not in (clk, rst)]
+
         for i, port in enumerate(ports):
             direction = "input " if port.direction == "input" else "output"
             width_str = self._format_width(port.width)
             comma = "," if i < len(ports) - 1 else ""
             self._emitln(f"{direction} logic {width_str}{port.name}{comma}")
-        
+
         self._dedent()
         self._emitln(");")
         self._emitln()
@@ -255,9 +282,9 @@ class SVCodeGenerator:
         initial_name = initial_state.name if initial_state else "IDLE"
         
         if self.config.reset_style == ResetStyle.ASYNC_LOW:
-            self._emitln(f"always_ff @(posedge {fsm.clock_signal} or negedge {fsm.reset_signal}) begin")
+            self._emitln(f"always_ff @(posedge {self._eff_clk(fsm)} or negedge {self._eff_rst(fsm)}) begin")
             self._indent()
-            self._emitln(f"if (!{fsm.reset_signal})")
+            self._emitln(f"if (!{self._eff_rst(fsm)})")
             self._indent()
             self._emitln(f"state <= {initial_name};")
             self._dedent()
@@ -268,9 +295,9 @@ class SVCodeGenerator:
             self._dedent()
             self._emitln("end")
         elif self.config.reset_style == ResetStyle.SYNC_LOW:
-            self._emitln(f"always_ff @(posedge {fsm.clock_signal}) begin")
+            self._emitln(f"always_ff @(posedge {self._eff_clk(fsm)}) begin")
             self._indent()
-            self._emitln(f"if (!{fsm.reset_signal})")
+            self._emitln(f"if (!{self._eff_rst(fsm)})")
             self._indent()
             self._emitln(f"state <= {initial_name};")
             self._dedent()
@@ -415,9 +442,9 @@ class SVCodeGenerator:
         output_ports = fsm.get_output_ports()
         
         if self.config.reset_style == ResetStyle.ASYNC_LOW:
-            self._emitln(f"always_ff @(posedge {fsm.clock_signal} or negedge {fsm.reset_signal}) begin")
+            self._emitln(f"always_ff @(posedge {self._eff_clk(fsm)} or negedge {self._eff_rst(fsm)}) begin")
             self._indent()
-            self._emitln(f"if (!{fsm.reset_signal}) begin")
+            self._emitln(f"if (!{self._eff_rst(fsm)}) begin")
             self._indent()
             
             # Reset assignments for outputs
@@ -547,11 +574,18 @@ def generate_sv(fsm: FSMModule, config: Optional[SVGenConfig] = None) -> str:
         SystemVerilog source code
     """
     if config is None:
-        if fsm.reset_async and fsm.reset_active_low:
+        # Prefer domain_binding for reset style derivation
+        if fsm.domain_binding is not None:
+            reset_async    = fsm.domain_binding.reset_async
+            reset_act_low  = fsm.domain_binding.reset_active_low
+        else:
+            reset_async   = fsm.reset_async
+            reset_act_low = fsm.reset_active_low
+        if reset_async and reset_act_low:
             reset_style = ResetStyle.ASYNC_LOW
-        elif fsm.reset_async and not fsm.reset_active_low:
+        elif reset_async and not reset_act_low:
             reset_style = ResetStyle.ASYNC_HIGH
-        elif not fsm.reset_async and fsm.reset_active_low:
+        elif not reset_async and reset_act_low:
             reset_style = ResetStyle.SYNC_LOW
         else:
             reset_style = ResetStyle.SYNC_HIGH

@@ -167,7 +167,11 @@ def collect_ports(
     for stage in pip.stages:
         for stmt in stage.operations:
             scanner.visit(stmt)
-    return list(scanner.inputs.items()), list(scanner.outputs.items())
+    # Ports that are both read and written are output registers — they are
+    # readable internally in SV, so remove them from the input list.
+    output_names = set(scanner.outputs)
+    inputs = [(n, w) for n, w in scanner.inputs.items() if n not in output_names]
+    return inputs, list(scanner.outputs.items())
 
 
 # ---------------------------------------------------------------------------
@@ -223,11 +227,15 @@ class ExprLowerer:
         look up pipeline-register names for variables crossing stage boundaries.
     """
 
-    def __init__(self, stage: StageIR, pip: PipelineIR) -> None:
+    def __init__(self, stage: StageIR, pip: PipelineIR,
+                 feedback_ports: Optional[Dict[str, int]] = None) -> None:
         self.stage = stage
         self.pip   = pip
         self._stage_lower = stage.name.lower()
         self._ann = pip.annotation_map
+        # Feedback ports: output ports that are both read and written in this stage.
+        # For reads, use portname_q (registered). For writes, use portname_next.
+        self._feedback_ports: Dict[str, int] = feedback_ports or {}
 
         # Map: var_name → SV signal for reading that var in this stage.
         # Populated from stage.inputs (pipeline register reads).
@@ -283,7 +291,11 @@ class ExprLowerer:
 
         if isinstance(node, ast.Attribute):
             if isinstance(node.value, ast.Name) and node.value.id == "self":
-                return node.attr   # component port → bare name
+                attr = node.attr
+                # Feedback ports: reads go to portname_q (the registered version)
+                if attr in self._feedback_ports:
+                    return f"{attr}_q"
+                return attr   # component port → bare name
             return f"{self.lower_expr(node.value)}__{node.attr}"
 
         if isinstance(node, ast.Name):
@@ -335,7 +347,8 @@ class ExprLowerer:
         """Return ``[(port_name, width)]`` for all ``self.X = ...`` assignments.
 
         Used to generate default-zero assignments in the ``else`` branch of the
-        valid guard, preventing output-port latches.
+        valid guard, preventing output-port latches. For feedback ports,
+        returns ``portname_next`` instead of ``portname``.
         """
         result: List[Tuple[str, int]] = []
         for stmt in stmts:
@@ -352,7 +365,12 @@ class ExprLowerer:
                         ann = self._ann.get(stmt.value.id)
                         if ann is not None:
                             w = _get_sv_width(ann)
-                    result.append((t.attr, w))
+                    attr = t.attr
+                    if attr in self._feedback_ports:
+                        w = self._feedback_ports[attr]
+                        result.append((f"{attr}_next", w))
+                    else:
+                        result.append((attr, w))
         return result
 
     def lower_stmts_procedural(self, stmts: List[ast.stmt]) -> List[str]:
@@ -384,6 +402,10 @@ class ExprLowerer:
         # Variable arriving via pipeline register
         if name in self._reg_read:
             return self._reg_read[name]
+        # Module-level integer constant (e.g. ACCUM_MAX) → inline the value
+        module_globals = getattr(self.pip, "module_globals", {})
+        if name in module_globals:
+            return str(module_globals[name])
         # Unresolved — leave as-is (may be a loop variable, builtin, etc.)
         return name
 
@@ -457,8 +479,11 @@ class ExprLowerer:
             lines.append("end")
             return lines
 
-        # ── Skip: pass, bare expression (e.g. function calls), return ───
-        if isinstance(node, (ast.Pass, ast.Expr, ast.Return)):
+        # ── Skip: pass, bare expression (e.g. function calls) ───────────
+        if isinstance(node, (ast.Pass, ast.Expr)):
+            return []
+
+        if isinstance(node, ast.Return):
             return []
 
         return [f"/* TODO: {type(node).__name__} */"]
@@ -485,7 +510,12 @@ class ExprLowerer:
                     and t.value.id == "self"
                 ):
                     rhs = self.lower_expr(node.value)
-                    lines.append(f"{t.attr} = {rhs};")
+                    attr = t.attr
+                    # Feedback ports: writes go to portname_next (to be registered)
+                    if attr in self._feedback_ports:
+                        lines.append(f"{attr}_next = {rhs};")
+                    else:
+                        lines.append(f"{attr} = {rhs};")
                 elif isinstance(t, ast.Name):
                     var_name = t.id
                     self._defined.add(var_name)
@@ -518,8 +548,25 @@ class ExprLowerer:
             lines.append("end")
             return lines
 
-        if isinstance(node, (ast.Pass, ast.Expr, ast.Return)):
+        if isinstance(node, (ast.Pass, ast.Expr)):
             return []
+
+        if isinstance(node, ast.Return):
+            # Lower return (val1, val2, ...) by assigning each element to the
+            # corresponding output channel variable for this stage.
+            lines = []
+            out_channels = getattr(self.stage, "outputs", [])
+            if out_channels and node.value is not None:
+                elts = (node.value.elts if isinstance(node.value, ast.Tuple)
+                        else [node.value])
+                for ch, elt in zip(out_channels, elts):
+                    suffix = f"_{ch.src_stage.lower()}_to_{ch.dst_stage.lower()}"
+                    var_name = ch.name[:-len(suffix)] if ch.name.endswith(suffix) else ch.name
+                    sig = f"{var_name}_{self._stage_lower}"
+                    self._defined.add(var_name)
+                    rhs = self.lower_expr(elt)
+                    lines.append(f"{sig} = {rhs};")
+            return lines
 
         return [f"/* TODO: {type(node).__name__} */"]
 
@@ -548,4 +595,15 @@ class ExprLowerer:
         elif isinstance(node, ast.If):
             for s in node.body + node.orelse:
                 result.extend(self._collect_signals_stmt(s))
+        elif isinstance(node, ast.Return):
+            # Return values are assigned to output channel variables; declare those signals
+            out_channels = getattr(self.stage, "outputs", [])
+            if out_channels and node.value is not None:
+                elts = (node.value.elts if isinstance(node.value, ast.Tuple)
+                        else [node.value])
+                for ch, _ in zip(out_channels, elts):
+                    suffix = f"_{ch.src_stage.lower()}_to_{ch.dst_stage.lower()}"
+                    var_name = ch.name[:-len(suffix)] if ch.name.endswith(suffix) else ch.name
+                    sig = f"{var_name}_{self._stage_lower}"
+                    result.append((sig, ch.width))
         return result

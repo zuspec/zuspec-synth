@@ -220,6 +220,7 @@ class PipelineIR:
     forward_default:      Optional[bool]         = None  # process-level forward= value
     annotation_map:       Dict[str, Any]         = field(default_factory=dict)  # var → AST annotation node
     port_widths:          Dict[str, int]         = field(default_factory=dict)  # port_name → bit-width from component fields
+    module_globals:       Dict[str, Any]         = field(default_factory=dict)  # module-level constants (e.g. ACCUM_MAX)
     # New-API fields (SY-1)
     sync_irs:    List[SyncIR]  = field(default_factory=list)  # @zdc.sync methods
     clock_field: Optional[str] = None   # component field name for clock
