@@ -62,7 +62,7 @@ class HazardPair:
 
 @dataclass
 class RegFileDeclInfo:
-    """Describes an ``IndexedRegFile`` field used in the pipeline body.
+    """Describes an ``IndexedRegFile`` or ``PipelineResource`` field used in the pipeline body.
 
     Built by :class:`~zuspec.synth.passes.hazard_analysis.HazardAnalysisPass`
     from the accesses found in the stage AST bodies.
@@ -77,11 +77,16 @@ class RegFileDeclInfo:
         Address bit-width (typically ``ceil(log2(depth))``).
     data_width:
         Data bit-width (e.g. 32).
+    lock_type:
+        Hazard resolution strategy: ``"bypass"`` (forwarding mux) or
+        ``"queue"`` (stall until write completes).  Defaults to ``"bypass"``
+        which matches the ``BypassLock`` / ``forward_default=True`` behaviour.
     """
     field_name:  str
     depth:       int = 32
     addr_width:  int = 5
     data_width:  int = 32
+    lock_type:   str = "bypass"  # "bypass" or "queue"
 
 
 @dataclass
@@ -225,4 +230,28 @@ class PipelineIR:
     sync_irs:    List[SyncIR]  = field(default_factory=list)  # @zdc.sync methods
     clock_field: Optional[str] = None   # component field name for clock
     reset_field: Optional[str] = None   # component field name for reset
+    # Async-pipeline extension fields
+    bubble_stages: List[str]   = field(default_factory=list)
+    """Stage names that insert pipeline bubbles (derived from ``IrBubble`` nodes).
+
+    When a stage appears in this list, ``SVEmitPass`` emits a
+    ``{stage_lower}_bubble`` wire and gates the downstream stage's valid
+    register on ``!{stage_lower}_bubble``.  ``StallGenPass`` uses this list
+    to set the correct ``source_valid`` expression for the subsequent stage.
+    """
+    # Method port fields — populated by AsyncPipelineToIrPass from IrIngressOp/IrEgressOp.
+    # Each entry is (port_name, width_bits).
+    ingress_ports: List[tuple] = field(default_factory=list)
+    """``[(port_name, width)]`` for each ``InPort.get()`` call detected."""
+    egress_ports:  List[tuple] = field(default_factory=list)
+    """``[(port_name, width)]`` for each ``OutPort.put()`` call detected."""
+    clock_domain_field: Optional[str] = None
+    """Component field name for the :class:`ClockDomain` (new clock_domain= form)."""
+    ingress_var_map: Dict[str, str] = field(default_factory=dict)
+    """Mapping from Python local variable name → ingress port name.
+
+    Populated from ``IrIngressOp.result_var`` → ``IrIngressOp.port_name``.
+    Used by :class:`~zuspec.synth.passes.expr_lowerer.ExprLowerer` to
+    substitute ingress variable names with their port data signals.
+    """
 

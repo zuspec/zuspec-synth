@@ -23,6 +23,7 @@ applicable—inlined register-file arrays.
 
    quickstart
    pipeline
+   async_pipeline_synthesis
    examples
 
 .. toctree::

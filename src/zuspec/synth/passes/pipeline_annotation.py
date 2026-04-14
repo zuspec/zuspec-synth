@@ -502,7 +502,10 @@ class PipelineAnnotationPass(SynthPass):
 
     def _check_no_cycles_await(self, func_def: ast.FunctionDef, method_name: str) -> None:
         """Raise ``PipelineError`` if the body contains ``await zdc.cycles(...)``."""
-        from zuspec.dataclasses.decorators import PipelineError
+        try:
+            from zuspec.dataclasses.decorators import PipelineError
+        except ImportError:
+            PipelineError = ValueError
 
         for node in ast.walk(func_def):
             if not isinstance(node, ast.Await):
@@ -530,7 +533,10 @@ class PipelineAnnotationPass(SynthPass):
         method_name: str,
     ) -> None:
         """Validate discovered stage list against the ``stages=`` decorator arg."""
-        from zuspec.dataclasses.decorators import PipelineError
+        try:
+            from zuspec.dataclasses.decorators import PipelineError
+        except ImportError:
+            PipelineError = ValueError
 
         if declared is True or callable(declared):
             # Approach A or lambda — no count validation here

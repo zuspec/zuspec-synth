@@ -1,6 +1,8 @@
 """zuspec.synth.passes — synthesis pass classes."""
 from .synth_pass import SynthPass
 from .elaborate import ElaboratePass
+from .async_pipeline_elaborate import AsyncPipelineElaboratePass
+from .async_pipeline_to_ir import AsyncPipelineToIrPass
 from .fsm_extract import FSMExtractPass
 from .schedule import SchedulePass, parallel, _ParallelIssue
 from .lower import LowerPass
@@ -34,6 +36,9 @@ __all__ = [
     "PipelineFrontendPass",
     "AutoThreadPass",
     "SyncBodyLowerPass",
+    # Async pipeline passes
+    "AsyncPipelineElaboratePass",
+    "AsyncPipelineToIrPass",
     # Shared pipeline passes
     "HazardAnalysisPass",
     "ForwardingGenPass",

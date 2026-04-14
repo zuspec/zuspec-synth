@@ -187,6 +187,20 @@ class StallGenPass(SynthPass):
             if target_flushes:
                 ve.flush_signal = f"{sl}_flush"
 
+        # Always add multi-cycle mc_stall signals to valid-chain entries so
+        # that formal properties (P2/P8) guard correctly against MC freeze cycles.
+        _stage_to_idx = {s.name: s.index for s in pip.stages}
+        for stage in pip.stages:
+            if stage.cycle_hi <= 0:
+                continue
+            sl = stage.name.lower()
+            mc_stall_sig = f"{sl}_mc_stall"
+            mc_idx = _stage_to_idx.get(stage.name, 0)
+            for ve in valid_chain:
+                if _stage_to_idx.get(ve.stage_name, 0) <= mc_idx:
+                    if mc_stall_sig not in ve.stall_signals:
+                        ve.stall_signals.append(mc_stall_sig)
+
         if not stall_hazards:
             pip.stall_signals = []  # type: ignore[attr-defined]
             _log.debug("[StallGenPass] no stall hazards — valid chain generated only")
@@ -341,6 +355,7 @@ class StallGenPass(SynthPass):
 
     def _build_valid_chain(self, pip: PipelineIR) -> List[ValidStageEntry]:
         """Build the ordered list of valid-register entries for all stages."""
+        bubble_stages = set(getattr(pip, "bubble_stages", []))
         entries: List[ValidStageEntry] = []
         for idx, stage in enumerate(pip.stages):
             stage_lower = stage.name.lower()
@@ -348,8 +363,15 @@ class StallGenPass(SynthPass):
             if idx == 0:
                 source_valid = "valid_in"
             else:
-                prev_lower   = pip.stages[idx - 1].name.lower()
-                source_valid = f"{prev_lower}_valid_q"
+                prev_stage   = pip.stages[idx - 1]
+                prev_lower   = prev_stage.name.lower()
+                if prev_stage.cycle_hi > 0:
+                    # Multi-cycle stage: source is the done signal, not valid_q
+                    source_valid = f"{prev_lower}_done"
+                elif prev_stage.name in bubble_stages:
+                    source_valid = f"({prev_lower}_valid_q && !{prev_lower}_bubble)"
+                else:
+                    source_valid = f"{prev_lower}_valid_q"
             entries.append(ValidStageEntry(
                 stage_name=stage.name,
                 valid_reg=valid_reg,

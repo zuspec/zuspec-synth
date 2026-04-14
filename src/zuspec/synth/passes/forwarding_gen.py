@@ -143,7 +143,10 @@ class ForwardingGenPass(SynthPass):
         pip.forwarding.extend(auto_decls)
 
         if unresolved:
-            from zuspec.dataclasses.decorators import PipelineError
+            try:
+                from zuspec.dataclasses.decorators import PipelineError
+            except ImportError:
+                PipelineError = ValueError
             lines = [
                 f"  {h.kind} hazard: '{h.signal}' written in stage '{h.producer_stage}', "
                 f"read in stage '{h.consumer_stage}'"
@@ -176,12 +179,21 @@ class ForwardingGenPass(SynthPass):
         return ir
 
     def _resolve_regfile_hazards(self, pip: "PipelineIR", forward_default) -> None:
-        """Resolve each ``RegFileHazard`` to forwarding mux or stall."""
+        """Resolve each ``RegFileHazard`` to forwarding mux or stall.
+
+        Resolution priority:
+        1. Explicit per-signal forwarding declaration (``pip.forwarding``).
+        2. Per-regfile ``lock_type`` from ``RegFileDeclInfo`` (``"bypass"`` →
+           forward; ``"queue"`` → stall).
+        3. Global ``forward_default``.
+        """
         from zuspec.synth.ir.pipeline_ir import PipelineIR
+        # Build a lookup from field_name → lock_type for quick access
+        decl_lock = {d.field_name: d.lock_type for d in getattr(pip, "regfile_decls", [])}
         for rfh in pip.regfile_hazards:
             if rfh.resolved_by != "unresolved":
                 continue
-            # Check per-signal forwarding declaration (signal = "field.result_var")
+            # 1. Explicit forwarding declaration override
             signal_key = f"{rfh.field_name}.{rfh.read_result_var}"
             decl = None
             for d in pip.forwarding:
@@ -191,11 +203,19 @@ class ForwardingGenPass(SynthPass):
             if decl is not None:
                 rfh.resolved_by = "stall" if decl.suppressed else "forward"
                 rfh.suppressed  = decl.suppressed
+                continue
+            # 2. Per-regfile lock_type
+            lt = decl_lock.get(rfh.field_name)
+            if lt == "bypass":
+                rfh.resolved_by = "forward"
+            elif lt == "queue":
+                rfh.resolved_by = "stall"
+                rfh.suppressed  = True
+            # 3. Global forward_default fallback
             elif forward_default is True:
                 rfh.resolved_by = "forward"
             elif forward_default is False:
                 rfh.resolved_by = "stall"
                 rfh.suppressed  = True
             else:
-                # Default to forward for regfile hazards to avoid stalls
                 rfh.resolved_by = "forward"

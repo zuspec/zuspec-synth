@@ -80,6 +80,13 @@ class SynthIR:
     config: Optional[Any] = dc.field(default=None)
     meta: Optional[Any] = dc.field(default=None)
     pipeline_ir: Optional[Any] = dc.field(default=None)
+    async_pipeline_ir: Optional[Any] = dc.field(default=None)
+    """IrPipeline extracted by AsyncPipelineElaboratePass.
+
+    Populated from a ``@zdc.pipeline`` async method; consumed by
+    ``AsyncPipelineToIrPass`` which converts it to a ``PipelineIR``.
+    Set to ``None`` when the component has no async pipeline method.
+    """
     fsm_module: Optional[Any] = dc.field(default=None)
     schedule_obj: Optional[Any] = dc.field(default=None)
     rtl_modules: List[Any] = dc.field(default_factory=list)

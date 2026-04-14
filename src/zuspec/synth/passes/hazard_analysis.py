@@ -277,8 +277,11 @@ class HazardAnalysisPass(SynthPass):
                         )
 
         # Delegate IndexedRegFile accesses to RegFileHazardAnalyzer
-        regfile_hazards = self._analyze_regfile_hazards(ir)
-        hazards.extend(regfile_hazards)
+        # Note: regfile hazards are tracked separately in pip.regfile_hazards
+        # and resolved by ForwardingGenPass._resolve_regfile_hazards.
+        # We do NOT add them to pip.hazards to avoid the plain-variable
+        # forwarding logic auto-generating bypasses that conflict with lock_type.
+        self._analyze_regfile_hazards(ir)
 
         # De-duplicate (same kind/producer/consumer/signal)
         seen: Set[Tuple[str, str, str, str]] = set()
@@ -296,34 +299,43 @@ class HazardAnalysisPass(SynthPass):
         )
         return ir
 
-    def _analyze_regfile_hazards(self, ir: SynthIR) -> List[HazardPair]:
-        """Detect RAW hazards for IndexedRegFile accesses across pipeline stages.
+    def _analyze_regfile_hazards(self, ir: SynthIR) -> None:
+        """Detect RAW hazards for IndexedRegFile / PipelineResource accesses.
 
         Scans each stage's AST operations for ``self.FIELD.read(addr)`` and
         ``self.FIELD.write(idx, val)`` calls.  For every read in stage R and
         write in stage W where W > R, a ``RegFileHazard`` is appended to
-        ``pip.regfile_hazards`` and a corresponding ``HazardPair`` is returned
-        for the common hazard list.
+        ``pip.regfile_hazards``.
+
+        Regfile hazards are tracked separately from plain-variable hazards
+        (``pip.hazards``) so that ``ForwardingGenPass`` resolves them using
+        per-field ``lock_type`` rather than the global ``forward_default``.
         """
         pip = ir.pipeline_ir
         if pip is None:
-            return []
+            return
 
-        # Collect all regfile accesses per stage
-        all_accesses: List[RegFileAccess] = []
-        for stage in pip.stages:
-            if not stage.operations or not isinstance(stage.operations[0], ast.stmt):
-                continue
-            accesses = _collect_regfile_accesses(stage.name, stage.operations)
-            all_accesses.extend(accesses)
+        # If accesses were pre-populated by AsyncPipelineToIrPass (from IrHazardOp),
+        # use them directly instead of re-scanning the AST — the AST patterns differ.
+        pre_populated = bool(getattr(pip, "regfile_accesses", None))
+        if pre_populated:
+            all_accesses = list(pip.regfile_accesses)
+        else:
+            # Fall back to AST scanning for sync pipelines
+            all_accesses = []
+            for stage in pip.stages:
+                if not stage.operations or not isinstance(stage.operations[0], ast.stmt):
+                    continue
+                accesses = _collect_regfile_accesses(stage.name, stage.operations)
+                all_accesses.extend(accesses)
+            pip.regfile_accesses = all_accesses
 
-        pip.regfile_accesses = all_accesses
-
-        # Build RegFileDeclInfo entries (one per unique field name)
-        pip.regfile_decls = self._build_regfile_decls(all_accesses, pip)
+        # Build RegFileDeclInfo entries only if not already set.
+        if not getattr(pip, "regfile_decls", None):
+            pip.regfile_decls = self._build_regfile_decls(all_accesses, pip)
 
         if not all_accesses:
-            return []
+            return
 
         # Determine width information from component annotations
         comp = ir.component
@@ -339,7 +351,6 @@ class HazardAnalysisPass(SynthPass):
         writes = [a for a in all_accesses if a.kind == "write"]
 
         rf_hazards: List[RegFileHazard] = []
-        hazard_pairs: List[HazardPair] = []
 
         for read in reads:
             r_idx = stage_index.get(read.stage, -1)
@@ -352,9 +363,6 @@ class HazardAnalysisPass(SynthPass):
                     and r_idx >= 0
                     and w_idx >= 0
                 ):
-                    # Infer widths from port_widths or defaults
-                    data_w = port_widths.get(write.data_var, port_widths.get(read.result_var, 32))
-                    addr_w = port_widths.get(read.addr_var,  port_widths.get(write.addr_var, 5))
                     rfh = RegFileHazard(
                         field_name=read.field_name,
                         write_stage=write.stage,
@@ -365,12 +373,6 @@ class HazardAnalysisPass(SynthPass):
                         read_result_var=read.result_var,
                     )
                     rf_hazards.append(rfh)
-                    hazard_pairs.append(HazardPair(
-                        kind="RAW",
-                        producer_stage=write.stage,
-                        consumer_stage=read.stage,
-                        signal=f"{read.field_name}.{read.result_var}",
-                    ))
                     _log.debug(
                         "[HazardAnalysisPass] RAW_RF: %s.read(%s) in %s, write(%s) in %s",
                         read.field_name, read.addr_var, read.stage,
@@ -378,7 +380,6 @@ class HazardAnalysisPass(SynthPass):
                     )
 
         pip.regfile_hazards = rf_hazards
-        return hazard_pairs
 
     def _build_regfile_decls(
         self,
@@ -390,9 +391,14 @@ class HazardAnalysisPass(SynthPass):
         Infers ``data_width`` from ``pip.port_widths`` (keyed on the data/result
         variable names found in the accesses) and ``addr_width`` from the address
         variables, defaulting to 32-bit data and 5-bit address.
+
+        Preserves ``lock_type`` from any pre-existing entry in
+        ``pip.regfile_decls`` (set by ``AsyncPipelineToIrPass``).
         """
         import math
         port_widths = getattr(pip, "port_widths", {}) or {}
+        # Preserve lock_type from pre-populated decls (e.g. from PipelineResource)
+        existing_lock = {d.field_name: d.lock_type for d in getattr(pip, "regfile_decls", [])}
         seen: Dict[str, RegFileDeclInfo] = {}
         for acc in accesses:
             if acc.field_name in seen:
@@ -412,5 +418,6 @@ class HazardAnalysisPass(SynthPass):
                 depth=depth,
                 addr_width=aw,
                 data_width=dw,
+                lock_type=existing_lock.get(acc.field_name, "bypass"),
             )
         return list(seen.values())

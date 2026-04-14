@@ -92,7 +92,15 @@ def _get_sv_width(annotation: Optional[ast.expr]) -> int:
         return _get_sv_width(annotation.value)
     else:
         return 32
-    return _WIDTH_MAP.get(name, 32)
+    w = _WIDTH_MAP.get(name)
+    if w is not None:
+        return w
+    # Generic uN / iN types (e.g. u5, u12, i7)
+    import re
+    m = re.match(r'^[ui](\d+)$', name)
+    if m:
+        return int(m.group(1))
+    return 32
 
 
 # ---------------------------------------------------------------------------
@@ -237,13 +245,23 @@ class ExprLowerer:
         # For reads, use portname_q (registered). For writes, use portname_next.
         self._feedback_ports: Dict[str, int] = feedback_ports or {}
 
+        # Ingress variable → port name map (from IrIngressOp.result_var → port_name)
+        # Populated from PipelineIR.ingress_var_map so that variables like `a`
+        # from `a = await self.a_in.get()` resolve to the port signal `a_in`.
+        self._ingress_var_map: Dict[str, str] = getattr(pip, "ingress_var_map", {}) or {}
+
         # Map: var_name → SV signal for reading that var in this stage.
         # Populated from stage.inputs (pipeline register reads).
         self._reg_read: Dict[str, str] = {}
+        # Map: pipeline register name → declared bit-width.
+        # Used to emit explicit zero-extension when the LHS is wider than the RHS.
+        self._in_reg_widths: Dict[str, int] = {}
         for ch in stage.inputs:
             suffix = f"_{ch.src_stage.lower()}_to_{ch.dst_stage.lower()}"
             var_name = ch.name[: -len(suffix)] if ch.name.endswith(suffix) else ch.name
-            self._reg_read[var_name] = f"{ch.name}_q"
+            reg_name = f"{ch.name}_q"
+            self._reg_read[var_name] = reg_name
+            self._in_reg_widths[reg_name] = ch.width
 
         # Track variables defined in *this* stage so they take priority.
         self._defined: Set[str] = set()
@@ -349,28 +367,41 @@ class ExprLowerer:
         Used to generate default-zero assignments in the ``else`` branch of the
         valid guard, preventing output-port latches. For feedback ports,
         returns ``portname_next`` instead of ``portname``.
+
+        Recursively scans ``ast.If`` bodies so that conditional egress ports
+        (``if cond: self.PORT = expr``) are also included.
         """
         result: List[Tuple[str, int]] = []
-        for stmt in stmts:
-            if not isinstance(stmt, ast.Assign):
-                continue
-            for t in stmt.targets:
-                if (
-                    isinstance(t, ast.Attribute)
-                    and isinstance(t.value, ast.Name)
-                    and t.value.id == "self"
-                ):
-                    w = 32
-                    if isinstance(stmt.value, ast.Name):
-                        ann = self._ann.get(stmt.value.id)
-                        if ann is not None:
-                            w = _get_sv_width(ann)
-                    attr = t.attr
-                    if attr in self._feedback_ports:
-                        w = self._feedback_ports[attr]
-                        result.append((f"{attr}_next", w))
-                    else:
-                        result.append((attr, w))
+        seen: set = set()
+
+        def _scan(stmts_inner):
+            for stmt in stmts_inner:
+                if isinstance(stmt, ast.Assign):
+                    for t in stmt.targets:
+                        if (
+                            isinstance(t, ast.Attribute)
+                            and isinstance(t.value, ast.Name)
+                            and t.value.id == "self"
+                        ):
+                            w = 32
+                            if isinstance(stmt.value, ast.Name):
+                                ann = self._ann.get(stmt.value.id)
+                                if ann is not None:
+                                    w = _get_sv_width(ann)
+                            attr = t.attr
+                            if attr in seen:
+                                continue
+                            seen.add(attr)
+                            if attr in self._feedback_ports:
+                                w = self._feedback_ports[attr]
+                                result.append((f"{attr}_next", w))
+                            else:
+                                result.append((attr, w))
+                elif isinstance(stmt, ast.If):
+                    _scan(stmt.body)
+                    _scan(stmt.orelse)
+
+        _scan(stmts)
         return result
 
     def lower_stmts_procedural(self, stmts: List[ast.stmt]) -> List[str]:
@@ -394,6 +425,18 @@ class ExprLowerer:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _zero_extend(self, rhs_sv: str, lhs_width: int) -> str:
+        """Wrap *rhs_sv* with explicit zero-extension if it is a pipeline register
+        whose declared width is less than *lhs_width*.
+
+        Returns *rhs_sv* unchanged when no extension is needed.
+        """
+        rhs_width = self._in_reg_widths.get(rhs_sv)
+        if rhs_width is not None and 0 < rhs_width < lhs_width:
+            pad = lhs_width - rhs_width
+            return f"{{{{{pad}{{1'b0}}}}, {rhs_sv}}}"
+        return rhs_sv
+
     def _resolve_var(self, name: str) -> str:
         """Map a Python variable name to its SV signal name in this stage."""
         # Locally defined variable takes priority
@@ -402,6 +445,9 @@ class ExprLowerer:
         # Variable arriving via pipeline register
         if name in self._reg_read:
             return self._reg_read[name]
+        # Ingress variable (from `v = await self.PORT.get()`) → port data bus
+        if name in self._ingress_var_map:
+            return self._ingress_var_map[name]
         # Module-level integer constant (e.g. ACCUM_MAX) → inline the value
         module_globals = getattr(self.pip, "module_globals", {})
         if name in module_globals:
@@ -497,8 +543,13 @@ class ExprLowerer:
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             var_name = node.target.id
             sig      = f"{var_name}_{self._stage_lower}"
+            lhs_width = _get_sv_width(node.annotation)
             self._defined.add(var_name)
-            rhs = self.lower_expr(node.value) if node.value else "0"
+            if node.value:
+                rhs = self.lower_expr(node.value)
+                rhs = self._zero_extend(rhs, lhs_width)
+            else:
+                rhs = "0"
             return [f"{sig} = {rhs};"]
 
         if isinstance(node, ast.Assign):

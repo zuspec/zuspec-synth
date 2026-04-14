@@ -35,7 +35,10 @@ else:
     sys.path.insert(1, _dc_src)
 
 import zuspec.dataclasses as zdc
-from zuspec.dataclasses.decorators import PipelineError
+try:
+    from zuspec.dataclasses.decorators import PipelineError
+except ImportError:
+    PipelineError = ValueError
 from zuspec.synth.ir.synth_ir import SynthIR, SynthConfig
 from zuspec.synth.ir.pipeline_ir import PipelineIR, StageIR, HazardPair
 from zuspec.synth.passes import (

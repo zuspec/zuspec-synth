@@ -100,6 +100,34 @@ def _valid_reg(stage: StageIR) -> str:
     return f"{_stage_lower(stage.name)}_valid_q"
 
 
+def _collect_pipeline_ports(
+    pip: PipelineIR,
+) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+    """Return ``(inputs, outputs)`` — each a list of ``(port_name, width)``.
+
+    If the pipeline has explicit method ports (``ingress_ports`` / ``egress_ports``
+    populated from ``IrIngressOp`` / ``IrEgressOp``), use those directly.
+    Otherwise fall back to the old field-scan heuristic (``collect_ports``).
+
+    The fallback path emits a deprecation warning to encourage migration to
+    the explicit ``InPort``/``OutPort`` API.
+    """
+    import warnings
+    if getattr(pip, "ingress_ports", None) or getattr(pip, "egress_ports", None):
+        in_ports = list(pip.ingress_ports or [])
+        out_ports = list(pip.egress_ports or [])
+        return in_ports, out_ports
+    # Legacy fallback
+    warnings.warn(
+        f"Pipeline '{pip.module_name}' uses the legacy field-access port pattern. "
+        "Declare InPort/OutPort fields and use in_port.get()/out_port.put() for "
+        "explicit synthesis-visible ports.",
+        DeprecationWarning,
+        stacklevel=5,
+    )
+    return collect_ports(pip)
+
+
 def _find_feedback_ports(stage: StageIR, pip: PipelineIR) -> Dict[str, int]:
     """Return {portname: width} for output ports that are both read and written in *stage*.
 
@@ -155,7 +183,13 @@ def _find_feedback_ports(stage: StageIR, pip: PipelineIR) -> Dict[str, int]:
     for stmt in stage.operations:
         scanner.visit(stmt)
 
-    return {name: width for name, width in candidates.items() if name in scanner.reads}
+    return {
+        name: width
+        for name, width in candidates.items()
+        if name in scanner.reads
+        # Egress ports are pure outputs — never feedback regardless of read appearance
+        and name not in {pn for pn, _ in (getattr(pip, "egress_ports", None) or [])}
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +253,7 @@ class PipelineSVCodegen:
         self._emit_regfile_arrays(sv, pip)
         self._emit_pipeline_registers(sv, pip, clock_name, reset_name, reset_cond)
         self._emit_regfile_writes(sv, pip, clock_name, reset_name, reset_cond)
+        self._emit_multicycle_and_bubble(sv, pip, clock_name, reset_cond)
         self._emit_valid_chain(sv, pip, clock_name, reset_name, reset_cond)
         self._emit_stall_signals(sv, pip)
         self._emit_forwarding_muxes(sv, pip)
@@ -250,7 +285,8 @@ class PipelineSVCodegen:
             for fb in all_feedback.values():
                 feedback_port_names.update(fb.keys())
         # Collect all ports first so we can handle commas correctly
-        in_ports, out_ports = collect_ports(pip)
+        # Collect all ports first so we can handle commas correctly
+        in_ports, out_ports = _collect_pipeline_ports(pip)
         in_port_names = {name for name, _ in in_ports}
         port_lines: List[str] = [
             f"input  wire {clock_name}",
@@ -359,6 +395,72 @@ class PipelineSVCodegen:
         sv.line("end")
         sv.line()
 
+    def _emit_multicycle_and_bubble(
+        self, sv: _SV, pip: PipelineIR,
+        clock_name: str, reset_cond: str,
+    ) -> None:
+        """Emit cycle counters for multi-cycle stages and bubble wires.
+
+        For each stage with ``cycle_hi > 0``:
+          - ``{sl}_cycle_q``   — counter register counting 0..cycle_hi.
+          - ``{sl}_done``      — asserted when stage completes (cycle_q == cycle_hi).
+          - ``{sl}_mc_stall``  — asserted while stage is counting (freeze upstream).
+
+        For each stage in ``pip.bubble_stages``:
+          - ``{sl}_bubble``    — asserted when the stage outputs a bubble.
+            Currently always asserted when the stage is valid (unconditional
+            bubble); conditional-bubble support is a future extension.
+        """
+        import math
+
+        any_mc = any(s.cycle_hi > 0 for s in pip.stages)
+        bubble_stages = set(getattr(pip, "bubble_stages", []))
+        any_bubble = bool(bubble_stages)
+
+        if not any_mc and not any_bubble:
+            return
+
+        sv.line("// ── Multi-cycle counters / bubble wires ─────────────────────────")
+
+        for stage in pip.stages:
+            sl = stage.name.lower()
+            if stage.cycle_hi > 0:
+                N = stage.cycle_hi
+                # Compute minimum counter width for 0..N
+                w = max(1, math.ceil(math.log2(N + 2)))
+                sv.line(f"// {stage.name}: {N + 1}-cycle stage (cycle_hi={N})")
+                sv.line(f"reg [{w-1}:0] {sl}_cycle_q;")
+                sv.line(f"wire {sl}_done = {sl}_valid_q && ({sl}_cycle_q == {w}'d{N});")
+                sv.line(f"wire {sl}_mc_stall = {sl}_valid_q && ({sl}_cycle_q < {w}'d{N});")
+                sv.line(f"always @(posedge {clock_name}) begin")
+                sv.indent()
+                sv.line(f"if ({reset_cond}) begin")
+                sv.indent()
+                sv.line(f"{sl}_cycle_q <= {w}'b0;")
+                sv.dedent()
+                sv.line(f"end else if ({sl}_valid_q) begin")
+                sv.indent()
+                sv.line(f"if ({sl}_cycle_q == {w}'d{N})")
+                sv.indent()
+                sv.line(f"{sl}_cycle_q <= {w}'b0;  // reset when done")
+                sv.dedent()
+                sv.line("else")
+                sv.indent()
+                sv.line(f"{sl}_cycle_q <= {sl}_cycle_q + {w}'d1;")
+                sv.dedent()
+                sv.dedent()
+                sv.line("end")
+                sv.dedent()
+                sv.line("end")
+                sv.line()
+
+            if stage.name in bubble_stages:
+                sv.line(f"// {stage.name} can insert a bubble")
+                sv.line(f"wire {sl}_bubble = {sl}_valid_q;  // TODO: conditional bubble")
+                sv.line()
+
+        sv.line()
+
     def _emit_valid_chain(
         self, sv: _SV, pip: PipelineIR,
         clock_name: str, reset_name: str, reset_cond: str,
@@ -386,14 +488,47 @@ class PipelineSVCodegen:
             stall_sigs_all.append(ds.wire_name)
         stall_expr = " | ".join(stall_sigs_all) if stall_sigs_all else ""
 
+        # Multi-cycle stall: each multi-cycle stage freezes all upstream stages.
+        # mc_freeze[stage_name] = list of mc_stall wires that affect it.
+        bubble_stages: Set[str] = set(getattr(pip, "bubble_stages", []))
+        mc_freeze: Dict[str, List[str]] = {}
+        for mc_stage in pip.stages:
+            if mc_stage.cycle_hi <= 0:
+                continue
+            mc_sl = mc_stage.name.lower()
+            mc_wire = f"{mc_sl}_mc_stall"
+            # Freeze all stages up to and including the multi-cycle stage itself
+            for up_stage in pip.stages:
+                if up_stage.index <= mc_stage.index:
+                    mc_freeze.setdefault(up_stage.name, []).append(mc_wire)
+
         for idx, stage in enumerate(pip.stages):
             vr = _valid_reg(stage)
-            src = "valid_in" if idx == 0 else _valid_reg(pip.stages[idx - 1])
+            prev_stage = pip.stages[idx - 1] if idx > 0 else None
 
+            # Determine the upstream valid source.
+            # If prev stage is multi-cycle, use its _done signal instead of _valid_reg.
+            if prev_stage is None:
+                src = "valid_in"
+            elif prev_stage.cycle_hi > 0:
+                src = f"{prev_stage.name.lower()}_done"
+            else:
+                src = _valid_reg(prev_stage)
+
+            # If prev stage can bubble, gate the source on !prev_bubble.
+            if prev_stage is not None and prev_stage.name in bubble_stages:
+                src = f"({src} && !{prev_stage.name.lower()}_bubble)"
+
+            # Gather all stall/freeze signals for this stage.
             ve = valid_chain[idx] if idx < len(valid_chain) else None
+            extra_mc_stalls = mc_freeze.get(stage.name, [])
+
+            # Combine stall signals from valid_chain entry + mc_stalls.
+            ve_stalls = (ve.stall_signals if ve else []) + extra_mc_stalls
+            all_stalls = list(dict.fromkeys(ve_stalls))  # deduplicate, preserve order
 
             # Priority: flush > cancel > stall-freeze > normal
-            if ve and (ve.flush_signal or ve.cancel_signal or ve.stall_signals):
+            if ve and (ve.flush_signal or ve.cancel_signal or all_stalls):
                 flush_cond = ve.flush_signal if ve.flush_signal else "1'b0"
                 sv.line(f"if ({flush_cond}) begin")
                 sv.indent()
@@ -404,8 +539,8 @@ class PipelineSVCodegen:
                     sv.indent()
                     sv.line(f"{vr} <= 1'b0;  // cancel (no upstream freeze)")
                     sv.dedent()
-                if ve.stall_signals:
-                    freeze_cond = " | ".join(ve.stall_signals)
+                if all_stalls:
+                    freeze_cond = " | ".join(all_stalls)
                     sv.line(f"end else if ({freeze_cond}) begin")
                     sv.indent()
                     sv.line(f"{vr} <= {vr};  // frozen by stall")
@@ -419,6 +554,17 @@ class PipelineSVCodegen:
                     sv.line(f"{vr} <= {src};")
                 sv.dedent()
                 sv.line("end")
+            elif extra_mc_stalls:
+                # No explicit stall signals but mc_stall exists — freeze self on mc_stall.
+                freeze_cond = " | ".join(extra_mc_stalls)
+                sv.line(f"if ({freeze_cond})")
+                sv.indent()
+                sv.line(f"{vr} <= {vr};  // frozen by multi-cycle stall")
+                sv.dedent()
+                sv.line("else")
+                sv.indent()
+                sv.line(f"{vr} <= {src};")
+                sv.dedent()
             elif ve and ve.bubble_on_stall and ve.stall_signals:
                 bubble_cond = " | ".join(ve.stall_signals)
                 sv.line(f"{vr} <= ({bubble_cond}) ? 1'b0 : {src};")
@@ -598,6 +744,15 @@ class PipelineSVCodegen:
             # Default values for feedback _next signals (hold current value)
             for port_name, width in fb.items():
                 sv.line(f"{port_name}_next = {port_name}_q;")
+            # Default-zero for non-feedback output ports (prevents latches when
+            # the port is conditionally driven, e.g. inside an if-block).
+            if stage.operations:
+                lowerer_d0 = ExprLowerer(stage, pip, feedback_ports=fb)
+                for port_name, width in lowerer_d0.collect_output_ports(stage.operations):
+                    # Skip feedback _next ports — already handled above
+                    if port_name.endswith("_next"):
+                        continue
+                    sv.line(f"{port_name} = {width}'b0;")
             sv.line(f"if ({_valid_reg(stage)}) begin")
             sv.indent()
             if stage.operations:
@@ -610,13 +765,11 @@ class PipelineSVCodegen:
             sv.dedent()
             sv.line("end else begin")
             sv.indent()
-            # Default assignments prevent latches
+            # Default assignments for local signals prevent latches
             if stage.operations:
                 lowerer_d = ExprLowerer(stage, pip, feedback_ports=fb)
                 for sig_name, width in lowerer_d.collect_signals(stage.operations):
                     sv.line(f"{sig_name} = {width}'b0;")
-                for port_name, width in lowerer_d.collect_output_ports(stage.operations):
-                    sv.line(f"{port_name} = {width}'b0;")
             sv.dedent()
             sv.line("end")
             sv.dedent()
