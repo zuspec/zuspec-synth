@@ -241,7 +241,7 @@ class TestRiscV3Stage:
 
     @pytest.fixture(scope="class")
     def sv(self, ir):
-        return ir.lowered_sv.get("pipeline_sv", "")
+        return ir.lowered_sv.get("sv/pipeline/top", "")
 
     # -- Pass-chain sanity ------------------------------------------------
 
@@ -367,7 +367,7 @@ class TestRiscV5Stage:
 
     @pytest.fixture(scope="class")
     def sv(self, ir):
-        return ir.lowered_sv.get("pipeline_sv", "")
+        return ir.lowered_sv.get("sv/pipeline/top", "")
 
     # -- Pass-chain sanity ------------------------------------------------
 

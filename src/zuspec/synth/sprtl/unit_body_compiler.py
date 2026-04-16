@@ -349,7 +349,7 @@ class UnitBodyCompiler:
 
     @staticmethod
     def _unwrap(obj: Any):
-        """Unwrap @zdc.process / ExecProc to the underlying function."""
+        """Unwrap @zdc.proc / ExecProc to the underlying function."""
         if hasattr(obj, 'method'):
             return obj.method
         return obj

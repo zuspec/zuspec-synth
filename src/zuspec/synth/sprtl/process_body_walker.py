@@ -14,9 +14,9 @@
 # limitations under the License.
 #****************************************************************************
 """
-ProcessBodyWalker — extracts pipeline stage structure from a @zdc.process body.
+ProcessBodyWalker — extracts pipeline stage structure from a @zdc.proc body.
 
-Uses the Python AST of the @zdc.process method (and each action's body() method)
+Uses the Python AST of the @zdc.proc method (and each action's body() method)
 directly, because DataModelFactory flattens async-with blocks when it inlines
 action bodies, losing the concurrency structure needed for RTL synthesis.
 
@@ -73,7 +73,7 @@ class HwOp:
 
 @dataclass
 class ActionInfo:
-    """One action invocation found at the top level of a @zdc.process loop."""
+    """One action invocation found at the top level of a @zdc.proc loop."""
     name: str                           # action class name, e.g. 'FetchNext'
     cls: Optional[type]                 # resolved Python class, or None
     ops: List[HwOp] = field(default_factory=list)
@@ -82,7 +82,7 @@ class ActionInfo:
 
 @dataclass
 class ProcessInfo:
-    """All pipeline information extracted from a single @zdc.process method."""
+    """All pipeline information extracted from a single @zdc.proc method."""
     component_cls: type
     process_name: str
     actions: List[ActionInfo] = field(default_factory=list)
@@ -95,7 +95,7 @@ class ProcessInfo:
 
 class ProcessBodyWalker:
     """
-    Extracts pipeline stage structure from a @zdc.process method using Python AST.
+    Extracts pipeline stage structure from a @zdc.proc method using Python AST.
 
     Usage::
 
@@ -116,7 +116,7 @@ class ProcessBodyWalker:
 
     def walk(self, component_cls: type) -> ProcessInfo:
         """
-        Walk all @zdc.process descriptors on *component_cls*.
+        Walk all @zdc.proc descriptors on *component_cls*.
 
         Returns a :class:`ProcessInfo` describing the pipeline stages.
         """
@@ -130,7 +130,7 @@ class ProcessBodyWalker:
             if attr is not None and type(attr).__name__ == 'ExecProc':
                 info.process_name = attr_name
                 self._walk_process(info, attr.method, component_cls)
-                break  # only the first @zdc.process
+                break  # only the first @zdc.proc
 
         # Compute ordered unique stages across all actions
         seen: set = set()

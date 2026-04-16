@@ -359,8 +359,8 @@ class TestSVEmitPass:
         ir = _run_full_chain(_AluPipe)
         cfg = SynthConfig()
         ir = SVEmitPass(cfg).run(ir)
-        assert "pipeline_sv" in ir.lowered_sv
-        assert len(ir.lowered_sv["pipeline_sv"]) > 0
+        assert "sv/pipeline/top" in ir.lowered_sv
+        assert len(ir.lowered_sv["sv/pipeline/top"]) > 0
 
 
 class TestSVPhase6ExprLowering:
@@ -550,24 +550,24 @@ class TestApproachA:
 
     def test_sdc_sv_output_not_empty(self):
         ir = _run_approach_a_chain(_AluAutoA)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         assert "module" in sv
 
     def test_sdc_sv_module_name(self):
         ir = _run_approach_a_chain(_AluAutoA)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         assert "_AluAutoA" in sv
 
     def test_sdc_sv_has_pipeline_regs(self):
         """Generated SV should declare pipeline register flops for channels."""
         ir = _run_approach_a_chain(_AluAutoA)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         assert "_q;" in sv or "posedge clk" in sv
 
     def test_sdc_sv_has_two_always_blocks(self):
         """One always @(*) combinational block per stage."""
         ir = _run_approach_a_chain(_AluAutoA)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         # At minimum two combinational always blocks (one per scheduled stage)
         assert sv.count("always @(*)") >= 2
 
@@ -579,7 +579,7 @@ class TestApproachA:
 
     def test_sdc_unconstrained_sv_valid(self):
         ir = _run_approach_a_chain(_AluAutoAUnconstrained)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         assert "module" in sv and "endmodule" in sv
 
     def test_approach_a_no_phantom_channels(self):
@@ -709,63 +709,63 @@ class TestRegFileModeling:
     def test_sv_has_mem_array(self):
         """Emitted SV declares the regfile_mem array."""
         ir = _run_rf_chain(_RfPipe)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         assert "regfile_mem" in sv
 
     def test_sv_mem_array_dimensions(self):
         """Memory array has correct [31:0] data width and [0:31] depth."""
         ir = _run_rf_chain(_RfPipe)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         assert "reg [31:0] regfile_mem [0:31];" in sv
 
     def test_sv_has_clocked_write(self):
         """Emitted SV contains a clocked always block that writes to regfile_mem."""
         ir = _run_rf_chain(_RfPipe)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         assert "regfile_mem[" in sv and "posedge clk" in sv
 
     def test_sv_write_guarded_by_valid(self):
         """The regfile write block is gated by the WB stage valid register."""
         ir = _run_rf_chain(_RfPipe)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         assert "wb_valid_q" in sv
 
     def test_sv_has_read_mux(self):
         """Emitted SV contains a combinational always block for the read port."""
         ir = _run_rf_chain(_RfPipe)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         # Regfile read mux: always @(*) with memory read
         assert "regfile_mem[" in sv
 
     def test_sv_read_result_declared_as_reg(self):
         """The read result variable (rdata1_id) is declared as a reg by the mux block."""
         ir = _run_rf_chain(_RfPipe)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         assert "reg [31:0] rdata1_id;" in sv
 
     def test_sv_forwarding_mux_present(self):
         """When a regfile forwarding hazard exists, the mux bypasses from WB."""
         ir = _run_rf_chain(_RfPipe)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         # Forwarding: if wb_valid_q && rd_wb == rs1_id → rdata1_id = result_wb
         assert "wb_valid_q" in sv
 
     def test_sv_read_stmt_not_in_stage_block(self):
         """The self.regfile.read() statement is NOT emitted in the ID stage always block."""
         ir = _run_rf_chain(_RfPipe)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         # The read() call should not appear as a raw Python-style statement
         assert "self.regfile.read" not in sv
 
     def test_sv_write_stmt_not_in_stage_block(self):
         """The self.regfile.write() call is NOT emitted in the WB stage always block."""
         ir = _run_rf_chain(_RfPipe)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         assert "self.regfile.write" not in sv
 
     def test_sv_module_complete(self):
         """Emitted SV is a complete, non-empty module."""
         ir = _run_rf_chain(_RfPipe)
-        sv = ir.lowered_sv.get("pipeline_sv", "")
+        sv = ir.lowered_sv.get("sv/pipeline/top", "")
         assert "module _RfPipe" in sv
         assert "endmodule" in sv

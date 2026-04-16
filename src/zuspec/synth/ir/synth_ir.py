@@ -2,7 +2,85 @@
 from __future__ import annotations
 
 import dataclasses as dc
+import re
 from typing import Any, Dict, List, Optional
+
+
+# ---------------------------------------------------------------------------
+# lowered_sv key convention
+# ---------------------------------------------------------------------------
+
+_LOWERED_SV_KEY_RE = re.compile(
+    r'^[a-z][a-z0-9]*/[a-z][a-z0-9_]*/[a-zA-Z_][a-zA-Z0-9_./-]*$'
+)
+
+
+def validate_lowered_sv_key(key: str) -> None:
+    """Raise ``ValueError`` if *key* does not follow the ``lowered_sv`` naming convention.
+
+    All keys stored in :attr:`SynthIR.lowered_sv` must use the hierarchical
+    format ``<backend>/<category>/<item>``:
+
+    - ``backend``: lower-case ``zuspec-be-*`` suffix (e.g. ``sv``, ``sw``, ``fv``, ``trace``).
+    - ``category``: structural grouping (e.g. ``pipeline``, ``stage``, ``regfile``, ``module``).
+    - ``item``: specific artefact name (e.g. ``top``, ``FetchStage``, ``fifo_sync``).
+
+    Call this during development and testing.  It is **not** called automatically on the
+    hot synthesis path.
+
+    Args:
+        key: The ``lowered_sv`` dict key to validate.
+
+    Raises:
+        ValueError: If *key* does not match ``<backend>/<category>/<item>``.
+
+    Examples::
+
+        validate_lowered_sv_key("sv/pipeline/top")        # OK
+        validate_lowered_sv_key("sw/module/bus_bridge")   # OK
+        validate_lowered_sv_key("pipeline_sv")            # ValueError
+    """
+    if not _LOWERED_SV_KEY_RE.match(key):
+        raise ValueError(
+            f"lowered_sv key {key!r} does not follow the '<backend>/<category>/<item>' "
+            "convention (e.g. 'sv/pipeline/top').  See SynthIR.lowered_sv docstring."
+        )
+
+
+class ScheduleConstraintError(Exception):
+    """Raised when a ``fixed_assignments`` constraint in :class:`SchedulePass` is infeasible.
+
+    An assignment is infeasible when the requested stage index falls outside the
+    ``[earliest_stage, latest_stage]`` window computed by ASAP/ALAP analysis, meaning
+    a data-dependency chain prevents the operation from being placed there.
+
+    Args:
+        op_id: The :attr:`~zuspec.synth.sprtl.scheduler.ScheduledOperation.id` of the
+            operation that could not be pinned.
+        state_id: The FSM state ID used as the lookup key in ``fixed_assignments``.
+        requested_stage: The stage index requested by the caller.
+        earliest_stage: The earliest feasible stage (ASAP bound).
+        latest_stage: The latest feasible stage (ALAP bound).
+    """
+
+    def __init__(
+        self,
+        op_id: int,
+        state_id: int,
+        requested_stage: int,
+        earliest_stage: int,
+        latest_stage: int,
+    ) -> None:
+        super().__init__(
+            f"fixed_assignments: op {op_id} (state_id={state_id}) cannot be pinned to "
+            f"stage {requested_stage} — feasible window is "
+            f"[{earliest_stage}, {latest_stage}]"
+        )
+        self.op_id = op_id
+        self.state_id = state_id
+        self.requested_stage = requested_stage
+        self.earliest_stage = earliest_stage
+        self.latest_stage = latest_stage
 
 
 @dc.dataclass
@@ -72,7 +150,7 @@ class SynthIR:
             ``DataModelFactory``, set by ``ElaboratePass``.  Contains parsed
             ``DataTypeComponent`` / ``DataTypeAction`` IR for every type
             reachable from the top-level component class, including fully
-            parsed ``@zdc.process`` body statement trees.  Read by
+            parsed ``@zdc.proc`` body statement trees.  Read by
             ``FSMExtractPass`` to build a real operation graph.
     """
 
@@ -96,5 +174,29 @@ class SynthIR:
     decode_c_cls: Optional[Any] = dc.field(default=None)
     execute_cls: Optional[Any] = dc.field(default=None)
     lowered_sv: Dict[str, Any] = dc.field(default_factory=dict)
+    """SV/SW/FV string fragments produced by lowering passes.
+
+    **Key naming convention** (mandatory for all passes)::
+
+        <backend>/<category>/<item>
+
+    where ``backend`` is the ``zuspec-be-*`` suffix (``sv``, ``sw``, ``fv``, ``trace``),
+    ``category`` is a structural grouping (``pipeline``, ``stage``, ``regfile``, ``module``),
+    and ``item`` is the specific artefact name.
+
+    Use :func:`validate_lowered_sv_key` in tests to verify conformance.
+
+    **Registered keys:**
+
+    +----------------------+----------------+-------------------------------------------+
+    | Key                  | Producer pass  | Description                               |
+    +======================+================+===========================================+
+    | ``sv/pipeline/top``  | ``SVEmitPass`` | Full pipeline SystemVerilog text          |
+    +----------------------+----------------+-------------------------------------------+
+
+    Passes that add new keys **must** register them in the table above.  Experimental or
+    private keys must use a ``_`` prefix in the item segment
+    (e.g. ``sv/stage/_debug``).
+    """
     stage_sv: Dict[str, List[str]] = dc.field(default_factory=dict)
     model_context: Optional[Any] = dc.field(default=None)

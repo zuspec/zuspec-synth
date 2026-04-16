@@ -1,4 +1,4 @@
-"""FSMExtractPass — extract a real FSMModule from @zdc.process source."""
+"""FSMExtractPass — extract a real FSMModule from @zdc.proc source."""
 from __future__ import annotations
 
 import logging
@@ -11,7 +11,7 @@ _log = logging.getLogger(__name__)
 
 class FSMExtractPass(SynthPass):
     """Extract an :class:`~zuspec.synth.sprtl.fsm_ir.FSMModule` from the
-    component's ``@zdc.process`` body.
+    component's ``@zdc.proc`` body.
 
     Uses :class:`~zuspec.synth.sprtl.process_body_walker.ProcessBodyWalker` to
     parse the Python AST of the process method and every referenced action

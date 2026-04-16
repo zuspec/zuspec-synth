@@ -58,7 +58,7 @@ def run_synth(component_cls):
         ir = pass_cls(cfg).run(ir)
 
     ir = SVEmitPass(cfg).run(ir)
-    sv = ir.lowered_sv.get("pipeline_sv", "")
+    sv = ir.lowered_sv.get("sv/pipeline/top", "")
     return ir.pipeline_ir, sv
 
 

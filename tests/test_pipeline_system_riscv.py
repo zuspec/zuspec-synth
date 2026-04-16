@@ -81,7 +81,7 @@ def _run_passes(ir: SynthIR) -> SynthIR:
 def _get_sv(comp_cls) -> str:
     ir = _make_synth_ir(comp_cls)
     ir = _run_passes(ir)
-    return ir.lowered_sv.get("pipeline_sv", "") if hasattr(ir, "lowered_sv") else ""
+    return ir.lowered_sv.get("sv/pipeline/top", "") if hasattr(ir, "lowered_sv") else ""
 
 
 _verilator = shutil.which("verilator")

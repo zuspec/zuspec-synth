@@ -912,7 +912,7 @@ from zuspec.synth.ir.synth_ir import SynthConfig, SynthIR
 class SVEmitPass(SynthPass):
     """Emit Verilog 2005 from ``ir.pipeline_ir`` using :class:`PipelineSVCodegen`.
 
-    Stores the result in ``ir.lowered_sv["pipeline_sv"]`` and, if
+    Stores the result in ``ir.lowered_sv["sv/pipeline/top"]`` and, if
     ``output_path`` is set, writes it to a file.
 
     This pass is a no-op when ``ir.pipeline_ir`` is ``None``.
@@ -938,11 +938,11 @@ class SVEmitPass(SynthPass):
         return "sv_emit"
 
     def run(self, ir: SynthIR) -> SynthIR:
-        """Emit Verilog 2005 RTL and store it in ``ir.lowered_sv["pipeline_sv"]``.
+        """Emit Verilog 2005 RTL and store it in ``ir.lowered_sv["sv/pipeline/top"]``.
 
         :param ir: Synthesis IR with all passes completed.
         :type ir: SynthIR
-        :return: Updated IR with ``ir.lowered_sv["pipeline_sv"]`` set.
+        :return: Updated IR with ``ir.lowered_sv["sv/pipeline/top"]`` set.
             If ``output_path`` was specified, the file is written as a side
             effect.
         :rtype: SynthIR
@@ -962,7 +962,7 @@ class SVEmitPass(SynthPass):
             reset_name=reset_name,
             reset_active_low=self._reset_active_low,
         )
-        ir.lowered_sv["pipeline_sv"] = sv_text
+        ir.lowered_sv["sv/pipeline/top"] = sv_text
 
         if self._output_path:
             with open(self._output_path, "w") as f:

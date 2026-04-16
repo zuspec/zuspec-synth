@@ -182,7 +182,7 @@ def _build_dma_fsm():
     factory = zdc.DataModelFactory()
     ctx = factory.build(DmaEngine)
     comp = ctx.type_m['DmaEngine']
-    run_proc = next(f for f in comp.functions if f.name == 'run')
+    run_proc = next(f for f in comp.proc_processes if f.name == 'run')
     transformer = SPRTLTransformer()
     fsm = transformer.transform(comp, run_proc)
     return comp, run_proc, fsm
