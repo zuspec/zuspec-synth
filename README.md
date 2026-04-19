@@ -67,3 +67,38 @@ ir = PassManager([
 cd packages/zuspec-synth
 python3 -m pytest tests/ -q
 ```
+
+
+## CLI Plugin
+
+`zuspec-synth` registers itself automatically with `zuspec-cli` when both packages are installed.
+
+### Registered components
+
+| Name | Type | Description |
+|------|------|-------------|
+| `synth` | Command | `zuspec synth` — synthesize a constraint-action class to RTL |
+| `compute-support` | Transform | Compute active bit-ranges for each constraint |
+| `build-cubes` | Transform | Enumerate minterms and build per-output truth tables |
+| `odc` | Transform | Compute observability don't-cares |
+| `minimize` | Transform | SOP minimisation via Quine-McCluskey |
+| `python` | Frontend | Load a `@zdc.dataclass` action class by `module:Class` reference |
+
+### Python frontend usage
+
+```bash
+# Synthesize a Python @zdc.dataclass action to RTL
+zuspec synth --fe python mymodule:MyDecodeClass -o out.sv
+```
+
+The `--top` argument must be in `module:ClassName` form.  The module must be
+importable (i.e. on `sys.path` or `PYTHONPATH`).
+
+### Optimization flags
+
+```bash
+zuspec synth --fe python mymod:MyClass --no-odc --no-minimize -o out.sv
+```
+
+`--no-odc` skips the observability don't-care pass; `--no-minimize` skips
+Quine-McCluskey minimisation (useful for debugging).

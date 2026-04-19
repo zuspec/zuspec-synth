@@ -24,6 +24,7 @@ applicable—inlined register-file arrays.
    quickstart
    pipeline
    async_pipeline_synthesis
+   interface_protocols_synth
    examples
 
 .. toctree::

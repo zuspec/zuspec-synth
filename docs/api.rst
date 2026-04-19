@@ -601,3 +601,274 @@ Helper Functions
    :param stmt: AST statement node.
    :type stmt: ast.stmt
    :rtype: bool
+
+
+Interface Protocol Synthesis
+=============================
+
+This section documents the passes, IR types, and generated RTL structures
+introduced in version 2026.1 for ``zdc.IfProtocol``-driven synthesis.
+
+See also :doc:`zuspec-dataclasses:interface_protocols` and
+:doc:`zuspec-dataclasses:split_transactions` for the user-facing guide.
+
+Protocol Synthesis Passes
+--------------------------
+
+ProtocolCompatPass
+~~~~~~~~~~~~~~~~~~
+
+.. class:: zuspec.synth.passes.protocol_compat.ProtocolCompatPass
+
+   **Validates interface connections in the bind graph.**
+
+   Checks every ``port → export`` edge in the component hierarchy to ensure
+   the protocol properties on both sides are compatible:
+
+   * Requester ``max_outstanding`` ≤ provider ``max_outstanding``.
+   * ``in_order`` must match.
+   * ``fixed_latency`` must match if set on either side.
+   * ``initiation_interval`` on the requester ≤ provider's minimum cycle time.
+
+   Raises ``ProtocolCompatError`` with a human-readable message listing the
+   conflicting properties and the component path where the mismatch occurred.
+
+   Intra-protocol checks (run on every ``IfProtocol`` class at elaboration):
+
+   * Methods with ``@zdc.call(max_outstanding=N)`` must have N ≤ the
+     interface-level ``max_outstanding``.
+
+IfProtocolLowerPass
+~~~~~~~~~~~~~~~~~~~
+
+.. class:: zuspec.synth.passes.if_protocol_lower.IfProtocolLowerPass
+
+   **Generates port signal declarations for each ``IfProtocol`` port.**
+
+   Runs after ``ProtocolCompatPass``.  For each ``IfProtocol``-typed port
+   field, emits a :class:`IfProtocolPortIR` node (see below) that the SV
+   emitter uses to generate port bundles.
+
+   The emitted signals depend on the resolved properties (see
+   *Property → RTL signal mapping* below).
+
+QueueLowerPass
+~~~~~~~~~~~~~~
+
+.. class:: zuspec.synth.passes.queue_lower.QueueLowerPass
+
+   **Lowers ``zdc.Queue[T]`` fields to synchronous FIFO instances.**
+
+   Generates a FIFO instance with the element type and depth from the field
+   declaration.  Uses the existing ``ChannelType`` FIFO template where
+   adequate; falls back to a new depth-parameterised template when signal
+   naming differs.
+
+CompletionAnalysisPass
+~~~~~~~~~~~~~~~~~~~~~~
+
+.. class:: zuspec.synth.passes.completion_analysis.CompletionAnalysisPass
+
+   **Validates and maps ``zdc.Completion[T]`` tokens.**
+
+   For each ``Completion`` creation site:
+
+   1. Verifies there is exactly one ``done.set(value)`` call reachable from
+      the creation site.
+   2. Verifies there is exactly one ``await done`` expression.
+   3. Traces the data flow from the ``set()`` source to the ``await``
+      destination and records the mapping in the synthesis IR.
+
+   Raises ``CompletionAnalysisError`` if zero or multiple set/await sites are
+   found, or if the data flow passes through an unsupported construct.
+
+SpawnLowerPass
+~~~~~~~~~~~~~~
+
+.. class:: zuspec.synth.passes.spawn_lower.SpawnLowerPass
+
+   **Lowers ``zdc.spawn()`` calls to slot-array FSMs.**
+
+   For each ``zdc.spawn(coro)`` call:
+
+   * Determines the ``max_outstanding`` of the ``IfProtocol`` port called
+     inside ``coro``.
+   * Allocates a slot array of that depth with ``slot_valid``, ``slot_done``
+     bit vectors and payload registers.
+   * Emits a ``SpawnStmt`` IR node used by the SV emitter.
+
+   Raises an error if the spawned coroutine calls multiple ``IfProtocol``
+   ports with different ``max_outstanding`` values (unsupported; document as
+   requiring a follow-on design).
+
+SelectLowerPass
+~~~~~~~~~~~~~~~
+
+.. class:: zuspec.synth.passes.select_lower.SelectLowerPass
+
+   **Lowers ``zdc.select()`` calls to arbiter IR nodes.**
+
+   Maps ``priority='left_to_right'`` to a priority-encoded arbiter and
+   ``priority='round_robin'`` to a round-robin arbiter with a persistent
+   state register.
+
+
+Protocol IR Types
+-----------------
+
+.. class:: zuspec.synth.ir.protocol_ir.IfProtocolPortIR
+
+   Lowered representation of one ``IfProtocol`` port.
+
+   **Attributes:**
+
+   * ``port_name`` *(str)* — Python field name.
+   * ``properties`` *(IfProtocolProperties)* — resolved property set.
+   * ``signals`` *(List[PortSignalDecl])* — emitted signal declarations.
+   * ``fsm_states`` *(List[FSMState])* — FSM state descriptors (Scenarios C/D).
+   * ``inflight_counter_width`` *(int)* — bit-width of the in-flight counter
+     (0 for Scenarios A/B).
+   * ``response_fifo_depth`` *(int)* — response FIFO depth (0 for Scenarios A/B).
+   * ``rob_slots`` *(int)* — ROB slot count (0 unless ``in_order=False``).
+
+.. class:: zuspec.synth.ir.protocol_ir.PortSignalDecl
+
+   One generated RTL signal for an ``IfProtocol`` port.
+
+   **Attributes:**
+
+   * ``name`` *(str)* — signal name (e.g. ``"mem_req_valid"``).
+   * ``width`` *(int)* — bit-width.
+   * ``direction`` *(str)* — ``"output"`` or ``"input"``.
+   * ``role`` *(str)* — ``"req_valid"``, ``"req_ready"``, ``"req_payload"``,
+     ``"resp_valid"``, ``"resp_ready"``, ``"resp_data"``, ``"req_id"``,
+     ``"resp_id"``.
+
+
+Property → RTL Signal Mapping
+-------------------------------
+
+The table below shows which signals are generated for each combination of
+properties.  ``PORT`` is the Python port field name.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 20 50
+
+   * - Condition
+     - Signal
+     - Notes
+   * - Always
+     - ``PORT_req_payload``
+     - Request argument(s) packed into a word.
+   * - Always
+     - ``PORT_resp_data``
+     - Response value.
+   * - ``fixed_latency`` is ``None``
+     - ``PORT_req_valid``
+     - Asserted by requester for one cycle per request.
+   * - ``req_always_ready=False``
+     - ``PORT_req_ready``
+     - Asserted by target when it can accept a request.
+   * - ``fixed_latency`` is ``None``
+     - ``PORT_resp_valid``
+     - Asserted by target when response is ready.
+   * - ``resp_has_backpressure=True``
+     - ``PORT_resp_ready``
+     - Asserted by requester when it can accept a response.
+   * - ``max_outstanding > 1``
+     - ``PORT_inflight_cnt``
+     - Counter preventing over-issuing; gates ``req_valid``.
+   * - ``max_outstanding > 1, in_order=True``
+     - ``PORT_resp_fifo_*``
+     - Synchronous FIFO holding in-order responses.
+   * - ``in_order=False``
+     - ``PORT_req_id``, ``PORT_resp_id``
+     - Transaction ID for out-of-order matching.
+   * - ``in_order=False``
+     - ``PORT_rob_*``
+     - Reorder buffer indexed by ``PORT_resp_id``.
+   * - ``initiation_interval > 1``
+     - ``PORT_ii_cnt``
+     - Down-counter gating ``req_valid`` between requests.
+
+
+Reading the Generated SV
+-------------------------
+
+Fixed-latency output (Scenario A, ``fixed_latency=4``)::
+
+    // No handshake signals; only data wires
+    output [31:0] rom_req_payload,
+    input  [31:0] rom_resp_data,
+
+    // Shift-register delay line (4 stages)
+    reg [31:0] rom_delay_q [0:3];
+    always @(posedge clk) begin
+        rom_delay_q[0] <= rom_req_payload;
+        rom_delay_q[1] <= rom_delay_q[0];
+        rom_delay_q[2] <= rom_delay_q[1];
+        rom_delay_q[3] <= rom_delay_q[2];
+    end
+    assign rom_resp_data = rom_delay_q[3];
+
+Basic handshake (Scenario B, ``max_outstanding=1``)::
+
+    output        mem_req_valid,
+    input         mem_req_ready,
+    output [31:0] mem_req_payload,
+    input         mem_resp_valid,
+    input  [31:0] mem_resp_data,
+
+In-order multi-outstanding (Scenario C, ``max_outstanding=4``)::
+
+    output        mem_req_valid,
+    input         mem_req_ready,
+    output [31:0] mem_req_payload,
+    input         mem_resp_valid,
+    input  [31:0] mem_resp_data,
+    // In-flight counter (3 bits for max 4 outstanding)
+    reg [2:0] mem_inflight_cnt;
+    // Response FIFO signals
+    wire mem_resp_fifo_push, mem_resp_fifo_pop;
+    wire mem_resp_fifo_full, mem_resp_fifo_empty;
+    wire [31:0] mem_resp_fifo_dout;
+
+Out-of-order (Scenario D, ``in_order=False``)::
+
+    output [1:0]  mem_req_id,        // 2 bits for 4 slots
+    input  [1:0]  mem_resp_id,
+    // ROB per slot
+    reg [31:0] mem_rob_data [0:3];
+    reg        mem_rob_done [0:3];
+
+
+SVA Protocol Assertions
+------------------------
+
+When the SVA generator is enabled (``protocol_pipeline.py``) the emitter
+appends a ``// synthesis translate_off`` block with SystemVerilog assertions:
+
+**Request stability** (Scenario B/C/D): once asserted, ``req_valid`` and
+``req_payload`` must remain stable until ``req_ready``::
+
+    property p_req_stable;
+        @(posedge clk) (mem_req_valid && !mem_req_ready) |=>
+            ($stable(mem_req_valid) && $stable(mem_req_payload));
+    endproperty
+    assert property (p_req_stable);
+
+**In-order response FIFO not overflowed** (Scenario C): the in-flight
+counter must not exceed ``max_outstanding``::
+
+    assert property (@(posedge clk) mem_inflight_cnt <= 4);
+
+**ROB slot uniqueness** (Scenario D): a slot may not be allocated while its
+``done`` flag is still set::
+
+    assert property (@(posedge clk)
+        mem_req_valid && mem_req_ready |-> !mem_rob_done[mem_req_id]);
+
+To verify the assertions run any SVA-capable simulator (Questa, VCS, Xcelium)
+or a formal tool (SymbiYosys) on the generated ``.sv`` file.
+

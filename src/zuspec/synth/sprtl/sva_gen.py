@@ -141,6 +141,79 @@ class SVAGenerator:
     def get_properties(self) -> List[SVAProperty]:
         """Get the list of generated properties."""
         return self._properties
+
+    def generate_role_properties(
+        self,
+        action_cls: type,
+        clock: str = "clk",
+        trigger: Optional[str] = None,
+    ) -> List[SVAProperty]:
+        """Generate SVA assume/assert properties from ``@constraint.requires``
+        and ``@constraint.ensures`` methods on *action_cls*.
+
+        * ``@constraint.requires`` → ``assume property`` (constrain inputs)
+        * ``@constraint.ensures``  → ``assert property`` (verify postcondition)
+
+        Args:
+            action_cls: A Python class decorated with ``@zdc.action`` that
+                carries ``@constraint.requires`` / ``@constraint.ensures``
+                methods.
+            clock: Clock signal name used in the temporal expression.
+            trigger: Optional trigger expression (e.g. ``"action_valid"``).
+                When provided the property is written as
+                ``trigger |-> (expr)``.  When omitted the expression stands
+                alone as a combinational property.
+
+        Returns:
+            List of :class:`SVAProperty` objects (empty if no role constraints
+            are found).
+        """
+        from zuspec.dataclasses.constraint_parser import ConstraintParser
+
+        parser = ConstraintParser()
+        properties: List[SVAProperty] = []
+        translator = _ConstraintExprToSV()
+
+        for attr_name, method in vars(action_cls).items():
+            if not (callable(method) and getattr(method, '_is_constraint', False)):
+                continue
+            role = getattr(method, '_constraint_role', None)
+            if role not in ('requires', 'ensures'):
+                continue
+
+            try:
+                parsed = parser.parse_constraint(method)
+            except Exception:
+                continue
+
+            for expr in parsed.get('exprs', []):
+                sv_expr = translator.translate(expr)
+                if sv_expr is None:
+                    continue
+
+                if trigger:
+                    temporal = (
+                        f"@(posedge {clock}) {trigger} |-> ({sv_expr})"
+                    )
+                else:
+                    temporal = f"@(posedge {clock}) ({sv_expr})"
+
+                assertion_type = (
+                    AssertionType.ASSUME if role == 'requires'
+                    else AssertionType.ASSERT
+                )
+                prop_name = f"{role}_{attr_name}"
+                properties.append(SVAProperty(
+                    name=prop_name,
+                    expression=temporal,
+                    assertion_type=assertion_type,
+                    kind=PropertyKind.SAFETY,
+                    description=(
+                        f"Contract {role}: {action_cls.__name__}.{attr_name}"
+                    ),
+                ))
+
+        return properties
     
     def _emit(self, text: str = ""):
         self._output.write(text)
@@ -301,6 +374,68 @@ class SVAGenerator:
                 self._dedent()
                 self._emitln("endproperty")
                 self._emitln()
+
+
+
+
+class _ConstraintExprToSV:
+    """Translate a constraint expression dict (from ConstraintParser) to an SV
+    expression string.
+
+    Supports the subset of IR nodes produced by :meth:`ConstraintParser.parse_constraint`:
+    ``attribute``, ``constant``, ``compare``, ``bool_op``, ``bin_op``,
+    ``unary_op``, and ``implies``.
+    """
+
+    _COMPARE_OPS = {'==': '==', '!=': '!=', '<': '<', '<=': '<=', '>': '>', '>=': '>='}
+    _BOOL_OPS    = {'and': '&&', 'or': '||'}
+    _BIN_OPS     = {'+': '+', '-': '-', '*': '*', '/': '/', '%': '%',
+                    '&': '&', '|': '|', '^': '^', '<<': '<<', '>>': '>>'}
+    _UNARY_OPS   = {'not': '!', 'invert': '~', 'usub': '-'}
+
+    def translate(self, node: Dict[str, Any]) -> Optional[str]:
+        """Return an SV expression string for *node*, or ``None`` on failure."""
+        try:
+            return self._tr(node)
+        except Exception:
+            return None
+
+    def _tr(self, node: Dict[str, Any]) -> str:
+        t = node.get('type')
+        if t == 'attribute':
+            return str(node.get('attr', '?'))
+        if t == 'constant':
+            return str(node.get('value', 0))
+        if t == 'compare':
+            left = self._tr(node['left'])
+            ops = node.get('ops', [])
+            comps = node.get('comparators', [])
+            parts = [left]
+            for op, rhs in zip(ops, comps):
+                sv_op = self._COMPARE_OPS.get(op, op)
+                parts.append(f"{sv_op} {self._tr(rhs)}")
+            return '(' + ' '.join(parts) + ')'
+        if t == 'bool_op':
+            op = self._BOOL_OPS.get(node.get('op', 'and'), '&&')
+            parts = [self._tr(v) for v in node.get('values', [])]
+            return '(' + f' {op} '.join(parts) + ')'
+        if t == 'bin_op':
+            op = self._BIN_OPS.get(node.get('op', '+'), node.get('op', '+'))
+            return f"({self._tr(node['left'])} {op} {self._tr(node['right'])})"
+        if t == 'unary_op':
+            op = self._UNARY_OPS.get(node.get('op', 'not'), '!')
+            return f"({op}{self._tr(node['operand'])})"
+        if t == 'implies':
+            antecedent = self._tr(node['antecedent'])
+            consequent = node.get('consequent', [])
+            if isinstance(consequent, list) and consequent:
+                cons_str = ' && '.join(self._tr(c) for c in consequent)
+            elif isinstance(consequent, dict):
+                cons_str = self._tr(consequent)
+            else:
+                cons_str = '1'
+            return f"({antecedent} |-> {cons_str})"
+        raise ValueError(f"Unsupported node type: {t!r}")
 
 
 def generate_sva(fsm: FSMModule, config: Optional[SVAGenConfig] = None) -> str:

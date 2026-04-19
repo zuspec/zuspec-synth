@@ -87,7 +87,7 @@ class CDCAnalysisPass:
         :returns: A list of :class:`CDCCrossing` objects (may be empty).
         """
         from zuspec.dataclasses.data_model_factory import DataModelFactory
-        from zuspec.dataclasses.ir.data_type import DataTypeComponent
+        from zuspec.ir.core.data_type import DataTypeComponent
         from zuspec.synth.sprtl.fsm_ir import DomainBinding
 
         # Build the IR model for this class

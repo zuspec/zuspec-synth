@@ -251,9 +251,10 @@ class PipelineSVCodegen:
 
         self._emit_header(sv, pip, clock_name, reset_name, all_feedback)
         self._emit_regfile_arrays(sv, pip)
+        self._emit_multicycle_decls(sv, pip)    # wire/reg decls BEFORE first always
         self._emit_pipeline_registers(sv, pip, clock_name, reset_name, reset_cond)
         self._emit_regfile_writes(sv, pip, clock_name, reset_name, reset_cond)
-        self._emit_multicycle_and_bubble(sv, pip, clock_name, reset_cond)
+        self._emit_multicycle_logic(sv, pip, clock_name, reset_cond)  # always blocks
         self._emit_valid_chain(sv, pip, clock_name, reset_name, reset_cond)
         self._emit_stall_signals(sv, pip)
         self._emit_forwarding_muxes(sv, pip)
@@ -395,21 +396,11 @@ class PipelineSVCodegen:
         sv.line("end")
         sv.line()
 
-    def _emit_multicycle_and_bubble(
-        self, sv: _SV, pip: PipelineIR,
-        clock_name: str, reset_cond: str,
-    ) -> None:
-        """Emit cycle counters for multi-cycle stages and bubble wires.
+    def _emit_multicycle_decls(self, sv: _SV, pip: PipelineIR) -> None:
+        """Emit only the ``reg`` / ``wire`` declarations for multi-cycle stages.
 
-        For each stage with ``cycle_hi > 0``:
-          - ``{sl}_cycle_q``   — counter register counting 0..cycle_hi.
-          - ``{sl}_done``      — asserted when stage completes (cycle_q == cycle_hi).
-          - ``{sl}_mc_stall``  — asserted while stage is counting (freeze upstream).
-
-        For each stage in ``pip.bubble_stages``:
-          - ``{sl}_bubble``    — asserted when the stage outputs a bubble.
-            Currently always asserted when the stage is valid (unconditional
-            bubble); conditional-bubble support is a future extension.
+        Must be called **before** any ``always`` block so that Verilog-2005
+        linters do not flag wire declarations inside procedural blocks.
         """
         import math
 
@@ -420,46 +411,81 @@ class PipelineSVCodegen:
         if not any_mc and not any_bubble:
             return
 
-        sv.line("// ── Multi-cycle counters / bubble wires ─────────────────────────")
+        sv.line("// ── Multi-cycle / bubble declarations ───────────────────────────")
 
         for stage in pip.stages:
             sl = stage.name.lower()
             if stage.cycle_hi > 0:
                 N = stage.cycle_hi
-                # Compute minimum counter width for 0..N
                 w = max(1, math.ceil(math.log2(N + 2)))
-                sv.line(f"// {stage.name}: {N + 1}-cycle stage (cycle_hi={N})")
                 sv.line(f"reg [{w-1}:0] {sl}_cycle_q;")
                 sv.line(f"wire {sl}_done = {sl}_valid_q && ({sl}_cycle_q == {w}'d{N});")
                 sv.line(f"wire {sl}_mc_stall = {sl}_valid_q && ({sl}_cycle_q < {w}'d{N});")
-                sv.line(f"always @(posedge {clock_name}) begin")
-                sv.indent()
-                sv.line(f"if ({reset_cond}) begin")
-                sv.indent()
-                sv.line(f"{sl}_cycle_q <= {w}'b0;")
-                sv.dedent()
-                sv.line(f"end else if ({sl}_valid_q) begin")
-                sv.indent()
-                sv.line(f"if ({sl}_cycle_q == {w}'d{N})")
-                sv.indent()
-                sv.line(f"{sl}_cycle_q <= {w}'b0;  // reset when done")
-                sv.dedent()
-                sv.line("else")
-                sv.indent()
-                sv.line(f"{sl}_cycle_q <= {sl}_cycle_q + {w}'d1;")
-                sv.dedent()
-                sv.dedent()
-                sv.line("end")
-                sv.dedent()
-                sv.line("end")
-                sv.line()
-
             if stage.name in bubble_stages:
-                sv.line(f"// {stage.name} can insert a bubble")
                 sv.line(f"wire {sl}_bubble = {sl}_valid_q;  // TODO: conditional bubble")
-                sv.line()
 
         sv.line()
+
+    def _emit_multicycle_logic(
+        self, sv: _SV, pip: PipelineIR,
+        clock_name: str, reset_cond: str,
+    ) -> None:
+        """Emit the ``always`` blocks for multi-cycle stage counters.
+
+        Must be called after :meth:`_emit_multicycle_decls`.
+        """
+        import math
+
+        any_mc = any(s.cycle_hi > 0 for s in pip.stages)
+        if not any_mc:
+            return
+
+        sv.line("// ── Multi-cycle counters ─────────────────────────────────────────")
+
+        for stage in pip.stages:
+            sl = stage.name.lower()
+            if stage.cycle_hi <= 0:
+                continue
+            N = stage.cycle_hi
+            w = max(1, math.ceil(math.log2(N + 2)))
+            sv.line(f"// {stage.name}: {N + 1}-cycle stage (cycle_hi={N})")
+            sv.line(f"always @(posedge {clock_name}) begin")
+            sv.indent()
+            sv.line(f"if ({reset_cond}) begin")
+            sv.indent()
+            sv.line(f"{sl}_cycle_q <= {w}'b0;")
+            sv.dedent()
+            sv.line(f"end else if ({sl}_valid_q) begin")
+            sv.indent()
+            sv.line(f"if ({sl}_cycle_q == {w}'d{N})")
+            sv.indent()
+            sv.line(f"{sl}_cycle_q <= {w}'b0;  // reset when done")
+            sv.dedent()
+            sv.line("else")
+            sv.indent()
+            sv.line(f"{sl}_cycle_q <= {sl}_cycle_q + {w}'d1;")
+            sv.dedent()
+            sv.dedent()
+            sv.line("end")
+            sv.dedent()
+            sv.line("end")
+            sv.line()
+
+        sv.line()
+
+    def _emit_multicycle_and_bubble(
+        self, sv: _SV, pip: PipelineIR,
+        clock_name: str, reset_cond: str,
+    ) -> None:
+        """Emit cycle counters for multi-cycle stages and bubble wires.
+
+        .. deprecated::
+            Use :meth:`_emit_multicycle_decls` + :meth:`_emit_multicycle_logic`
+            instead to guarantee all ``wire`` declarations precede any ``always``
+            block (required by Verilog-2005 / IEEE 1364-2005).
+        """
+        self._emit_multicycle_decls(sv, pip)
+        self._emit_multicycle_logic(sv, pip, clock_name, reset_cond)
 
     def _emit_valid_chain(
         self, sv: _SV, pip: PipelineIR,
@@ -770,6 +796,11 @@ class PipelineSVCodegen:
                 lowerer_d = ExprLowerer(stage, pip, feedback_ports=fb)
                 for sig_name, width in lowerer_d.collect_signals(stage.operations):
                     sv.line(f"{sig_name} = {width}'b0;")
+            # Also zero out feedback _next signals in the else branch.
+            # The clocked feedback register only captures _next when valid, so
+            # zero-assigning here is safe and prevents simulation latches.
+            for port_name, width in fb.items():
+                sv.line(f"{port_name}_next = {width}'b0;")
             sv.dedent()
             sv.line("end")
             sv.dedent()

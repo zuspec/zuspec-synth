@@ -31,7 +31,7 @@ from io import StringIO
 
 from .fsm_ir import (
     FSMModule, FSMState, FSMStateKind, FSMTransition,
-    FSMOperation, FSMAssign, FSMCond, FSMPort, FSMRegister
+    FSMOperation, FSMAssign, FSMCond, FSMPort, FSMRegister, FSMRegWrite
 )
 from .fsm_generator import StateEncoding
 
@@ -102,7 +102,15 @@ class SVCodeGenerator:
         """
         self._output = StringIO()
         self._indent_level = 0
-        
+
+        # Auto-infer registers: collect all FSMAssign targets not yet in fsm.registers
+        known_reg_names = {r.name for r in fsm.registers}
+        for state in fsm.states:
+            for op in state.operations:
+                if isinstance(op, FSMAssign) and op.target not in known_reg_names:
+                    fsm.registers.append(FSMRegister(name=op.target, width=32))
+                    known_reg_names.add(op.target)
+
         self._generate_header(fsm)
         self._generate_user_enum_typedefs(fsm)
         self._generate_module_declaration(fsm)
@@ -368,7 +376,15 @@ class SVCodeGenerator:
         """Format a condition expression as SystemVerilog."""
         if condition is None:
             return "1'b1"
-        
+
+        # Tuple form from transformer: ('lt', lhs, rhs)
+        if isinstance(condition, tuple) and len(condition) == 3:
+            op_str, lhs, rhs = condition
+            op_map = {'lt': '<', 'lte': '<=', 'gt': '>', 'gte': '>=',
+                      'eq': '==', 'ne': '!='}
+            sv_op = op_map.get(str(op_str), str(op_str))
+            return f"{self._format_expr(lhs)} {sv_op} {self._format_expr(rhs)}"
+
         # Handle different condition types
         if hasattr(condition, 'left') and hasattr(condition, 'op') and hasattr(condition, 'right'):
             # Binary comparison
@@ -376,30 +392,57 @@ class SVCodeGenerator:
             right = self._format_expr(condition.right)
             op = self._format_operator(condition.op)
             return f"{left} {op} {right}"
-        
+
         # Simple expression
         return self._format_expr(condition)
-    
+
     def _format_expr(self, expr: Any) -> str:
         """Format an expression as SystemVerilog."""
         if expr is None:
             return "0"
-        
+
         if isinstance(expr, (int, float)):
             return str(expr)
-        
+
         if isinstance(expr, str):
             return expr
-        
+
+        t = type(expr).__name__
+
+        # IR ExprConstant
+        if t == 'ExprConstant':
+            return str(expr.value)
+
+        # IR ExprRefLocal — a local variable
+        if t == 'ExprRefLocal':
+            return expr.name
+
+        # IR ExprRefField(base=TypeExprRefSelf, index=N) → field_N
+        if t == 'ExprRefField':
+            base = getattr(expr, 'base', None)
+            if base is not None and type(base).__name__ == 'TypeExprRefSelf':
+                return f"field_{expr.index}"
+            # Fallback: try .name
+            if hasattr(expr, 'name'):
+                return expr.name
+
+        # IR ExprRefParam — a method parameter
+        if t == 'ExprRefParam':
+            return expr.name
+
+        # AugOp enum (e.g. AugOp.Add)
+        if t == 'AugOp':
+            aug_map = {1: '+', 2: '-', 3: '*', 4: '/'}
+            return aug_map.get(expr.value, str(expr.value))
+
+        # Generic fallbacks
         if hasattr(expr, 'name'):
             return expr.name
-        
         if hasattr(expr, 'attr'):
             return expr.attr
-        
         if hasattr(expr, 'value'):
             return str(expr.value)
-        
+
         return str(expr)
     
     def _format_operator(self, op: Any) -> str:
@@ -434,52 +477,61 @@ class SVCodeGenerator:
         has_operations = any(state.operations for state in fsm.states)
         if not has_operations:
             return
-        
+
         if self.config.generate_comments:
             self._emitln("// Output and datapath logic")
-        
+
         # Get output ports for reset
         output_ports = fsm.get_output_ports()
-        
-        if self.config.reset_style == ResetStyle.ASYNC_LOW:
-            self._emitln(f"always_ff @(posedge {self._eff_clk(fsm)} or negedge {self._eff_rst(fsm)}) begin")
-            self._indent()
-            self._emitln(f"if (!{self._eff_rst(fsm)}) begin")
-            self._indent()
-            
-            # Reset assignments for outputs
-            for port in output_ports:
-                reset_val = self._format_reset_value(port.reset_value, port.width)
-                self._emitln(f"{port.name} <= {reset_val};")
-            
-            # Reset internal registers
-            for reg in fsm.registers:
-                if reg.name != "state":
-                    reset_val = self._format_reset_value(reg.reset_value, reg.width)
-                    self._emitln(f"{reg.name} <= {reset_val};")
-            
-            self._dedent()
-            self._emitln("end else begin")
-            self._indent()
-            self._emitln("case (state)")
-            self._indent()
-            
-            for state in fsm.states:
-                if state.operations:
-                    self._emitln(f"{state.name}: begin")
-                    self._indent()
-                    self._generate_operations(state.operations)
-                    self._dedent()
-                    self._emitln("end")
-            
-            self._emitln("default: ; // No operation")
-            self._dedent()
-            self._emitln("endcase")
-            self._dedent()
-            self._emitln("end")
-            self._dedent()
-            self._emitln("end")
-        
+        rst = self._eff_rst(fsm)
+        clk = self._eff_clk(fsm)
+        act_low = self._eff_reset_active_low(fsm)
+        async_ = self._eff_reset_async(fsm)
+        rst_cond = f"!{rst}" if act_low else rst
+
+        # Build always_ff sensitivity list
+        if async_:
+            edge = f"negedge {rst}" if act_low else f"posedge {rst}"
+            self._emitln(f"always_ff @(posedge {clk} or {edge}) begin")
+        else:
+            self._emitln(f"always_ff @(posedge {clk}) begin")
+
+        self._indent()
+        self._emitln(f"if ({rst_cond}) begin")
+        self._indent()
+
+        # Reset assignments for outputs
+        for port in output_ports:
+            reset_val = self._format_reset_value(port.reset_value, port.width)
+            self._emitln(f"{port.name} <= {reset_val};")
+
+        # Reset internal registers (skip 'state' — handled by state register block)
+        for reg in fsm.registers:
+            if reg.name != "state":
+                reset_val = self._format_reset_value(reg.reset_value, reg.width)
+                self._emitln(f"{reg.name} <= {reset_val};")
+
+        self._dedent()
+        self._emitln("end else begin")
+        self._indent()
+        self._emitln("case (state)")
+        self._indent()
+
+        for state in fsm.states:
+            if state.operations:
+                self._emitln(f"{state.name}: begin")
+                self._indent()
+                self._generate_operations(state.operations)
+                self._dedent()
+                self._emitln("end")
+
+        self._emitln("default: ; // No operation")
+        self._dedent()
+        self._emitln("endcase")
+        self._dedent()
+        self._emitln("end")
+        self._dedent()
+        self._emitln("end")
         self._emitln()
     
     def _format_reset_value(self, value: Any, width: int) -> str:
@@ -495,8 +547,15 @@ class SVCodeGenerator:
         for op in operations:
             if isinstance(op, FSMAssign):
                 self._generate_assign(op)
+            elif isinstance(op, FSMRegWrite):
+                self._generate_reg_write(op)
             elif isinstance(op, FSMCond):
                 self._generate_conditional(op)
+
+    def _generate_reg_write(self, op: FSMRegWrite):
+        """Generate a register write: reg_name_q <= value."""
+        value_str = self._format_assign_value(op.value)
+        self._emitln(f"{op.reg_name}_q <= {value_str};")
     
     def _generate_assign(self, op: FSMAssign):
         """Generate assignment statement."""
@@ -512,21 +571,27 @@ class SVCodeGenerator:
         """Format the RHS of an assignment."""
         if value is None:
             return "0"
-        
+
         if isinstance(value, (int, float)):
             return str(value)
-        
+
         if isinstance(value, str):
             return value
-        
+
         if isinstance(value, tuple) and len(value) == 3:
-            # Augmented assignment: (target, op, value)
-            target, op, rhs = value
-            target_str = self._format_expr(target)
+            # Augmented assignment: (lhs, op, rhs) — elements may be strings, IR nodes, or AugOp
+            lhs, op, rhs = value
+            lhs_str = self._format_expr(lhs)
             rhs_str = self._format_expr(rhs)
-            op_str = self._format_operator(op)
-            return f"{target_str} {op_str} {rhs_str}"
-        
+            # op may be AugOp enum, '+'/'-' string, or operator string
+            t = type(op).__name__
+            if t == 'AugOp':
+                aug_map = {1: '+', 2: '-', 3: '*', 4: '/'}
+                op_str = aug_map.get(op.value, str(op.value))
+            else:
+                op_str = self._format_operator(op)
+            return f"{lhs_str} {op_str} {rhs_str}"
+
         return self._format_expr(value)
     
     def _generate_conditional(self, op: FSMCond):

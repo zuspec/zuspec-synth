@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import typing
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from zuspec.dataclasses.constraint_parser import ConstraintParser, extract_rand_fields
 from ..ir.constraint_ir import (
     BitRange, ConstraintBlock, ConstraintBlockSet, FieldDecl,
-    SOPCube, SOPFunction, SharedTerm,
+    SOPCube, SOPFunction, SharedTerm, ValidityDecl,
 )
 from .qm_minimizer import MultiOutputQM
+from .cube_minimizer import CubeExpandMinimizer
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +57,118 @@ class ConstraintCompiler:
         self._dontcares_by_bit: Dict[str, Set[int]] = {}
         self._n_vars: int = 0
         self.strategy = None
+        # Map from derived-field name → BitRange in the input word (built by pre-pass).
+        self._derived_to_bitrange: Dict[str, BitRange] = {}
+
+    # ------------------------------------------------------------------
+    # Phase A-alt — from_sv_action
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_sv_action(cls, action_ir: Any, prefix: str = 'd') -> 'ConstraintCompiler':
+        """Create a ConstraintCompiler pre-populated from a DataTypeAction IR node.
+
+        Bypasses ``extract()`` by converting an ``ActionConstraintSet``
+        (produced by the fe-sv pipeline) directly into a ``ConstraintBlockSet``.
+        Phases B–F (compute_support, validate, build_cubes/build_table, minimize,
+        emit_sv) can then be run unchanged.
+
+        Args:
+            action_ir: A ``DataTypeAction`` whose ``constraint_set`` is a
+                populated ``ActionConstraintSet`` from ``constraint_mapper.py``.
+            prefix:    Wire-name prefix for emitted RTL (e.g. ``'d'``).
+
+        Returns:
+            A ``ConstraintCompiler`` with ``cset`` populated; ready for
+            ``compute_support()``.
+
+        Raises:
+            ValueError: if ``action_ir.constraint_set`` is ``None``.
+        """
+        # Lazy import — avoids a hard build-time dep of zuspec-synth on zuspec-fe-sv.
+        from zuspec.fe.sv.constraint_mapper import (  # type: ignore[import]
+            ActionConstraintSet, ActionConstraintBlock, SVConditionalBody,
+            BitRangeExtraction, ValidMarker, DontCareMarker,
+        )
+
+        acs = getattr(action_ir, 'constraint_set', None)
+        if acs is None:
+            raise ValueError(
+                f"DataTypeAction '{getattr(action_ir, 'name', '?')}' has no constraint_set; "
+                "ensure zuspec-fe-sv parsed the file with ConstraintMapper enabled."
+            )
+
+        # Bypass __init__ — we populate everything manually.
+        cc: 'ConstraintCompiler' = cls.__new__(cls)
+        cc._cls = None
+        cc._prefix = prefix
+        cc.cset = None
+        cc._per_field_support = {}
+        cc._ones_by_bit = {}
+        cc._dontcares_by_bit = {}
+        cc._n_vars = 0
+        cc.strategy = None
+
+        # Build the derived-field → BitRange map from extraction constraints.
+        cc._derived_to_bitrange = {
+            e.field_name: BitRange(msb=e.msb, lsb=e.lsb)
+            for e in acs.extractions
+        }
+
+        # Build output FieldDecl list from rand fields.
+        output_fields: List[FieldDecl] = []
+        for f in acs.fields:
+            if f.is_rand:
+                output_fields.append(FieldDecl(name=f.name, width=f.width))
+
+        # Convert ActionConstraintBlocks → ConstraintBlocks + ValidityDecls.
+        constraints: List[ConstraintBlock] = []
+        validity_decls: List[ValidityDecl] = []
+
+        for sv_block in acs.constraint_blocks:
+            cond = sv_block.conditional
+            if cond is None:
+                continue  # extraction-only blocks don't produce synthesis blocks
+
+            # Guard: map SVConstraintExpr(field_name, value) → {BitRange: value}.
+            conditions: Dict[BitRange, int] = {}
+            for sc in cond.guard_conditions:
+                br = cc._derived_to_bitrange.get(sc.field_name)
+                if br is not None:
+                    conditions[br] = sc.value
+
+            if not conditions:
+                continue  # unmappable guard (unknown derived field) — skip
+
+            assignments = dict(cond.assignments)
+            if not assignments:
+                continue  # no assignments → nothing to synthesize
+
+            constraints.append(ConstraintBlock(
+                name=sv_block.name,
+                conditions=conditions,
+                assignments=assignments,
+            ))
+
+            # Valid markers → ValidityDecl (guard=None: conservative, always observable).
+            # The guard is already encoded in the ConstraintBlock conditions; treating
+            # the field as always observable is safe (conservative for ODC purposes).
+            for vm in cond.valid_markers:
+                validity_decls.append(ValidityDecl(
+                    field_name=vm.field_name,
+                    guard=None,
+                    source_method=sv_block.name,
+                ))
+
+        cc.cset = ConstraintBlockSet(
+            input_field=acs.input_field or 'instr',
+            input_width=acs.input_width,
+            output_fields=output_fields,
+            constraints=constraints,
+            validity_decls=validity_decls,
+        )
+
+        return cc
 
     # ------------------------------------------------------------------
     # Phase A — extract
@@ -63,10 +177,89 @@ class ConstraintCompiler:
     def extract(self) -> None:
         """Walk @_is_constraint methods, build ConstraintBlockSet."""
         parser = ConstraintParser()
-        blocks: List[ConstraintBlock] = []
-        cond_field_names: Set[str] = set()
 
-        for attr_name, value in vars(self._cls).items():
+        # ------------------------------------------------------------------ #
+        # Step 1: Scan dataclass fields to identify input field and outputs.  #
+        # This must run before block-building so we know the input field name  #
+        # for the derived-field pre-pass.                                      #
+        # ------------------------------------------------------------------ #
+        output_fields: List[FieldDecl] = []
+        input_field_name: Optional[str] = None
+        input_field_width: Optional[int] = None  # None = not yet determined
+        cond_field_names_legacy: Set[str] = set()  # used only for legacy fallback
+
+        if dataclasses.is_dataclass(self._cls):
+            try:
+                from zuspec.dataclasses.decorators import Input as _InputMarker
+            except ImportError:
+                _InputMarker = None
+
+            # Use __annotations__ directly to preserve Annotated metadata without
+            # triggering get_type_hints's forward-reference resolver (which fails on
+            # generic Action[T] base classes).
+            ann: Dict[str, Any] = {}
+            for klass in reversed(self._cls.__mro__):
+                ann.update(getattr(klass, '__annotations__', {}))
+
+            def _ann_width(name: str) -> Optional[int]:
+                hint = ann.get(name)
+                if hint is not None and hasattr(hint, '__metadata__') and hint.__metadata__:
+                    return getattr(hint.__metadata__[0], 'width', None)
+                return None
+
+            for f in dataclasses.fields(self._cls):
+                meta = f.metadata
+                if not meta and isinstance(getattr(f, 'type', None), dataclasses.Field):
+                    meta = f.type.metadata  # type: ignore[union-attr]
+
+                if meta.get('rand') or meta.get('randc'):
+                    width = meta.get('width', None)
+                    if not isinstance(width, int):
+                        width = _ann_width(f.name)
+                    if not isinstance(width, int):
+                        width = 1
+                    soft = meta.get('soft_default', None)
+                    # Auto-detect internal fields: leading '_' convention OR
+                    # explicit metadata["internal"] = True (from zdc.field(internal=True)).
+                    is_internal = f.name.startswith('_') or bool(meta.get('internal', False))
+                    output_fields.append(FieldDecl(name=f.name, width=width, soft_default=soft,
+                                                   internal=is_internal))
+                elif _InputMarker is not None and f.default_factory is _InputMarker:
+                    if input_field_name is None:
+                        input_field_name = f.name
+                        w = meta.get('width', None) if meta else None
+                        if not isinstance(w, int):
+                            w = _ann_width(f.name)
+                        if isinstance(w, int):
+                            input_field_width = w
+
+        # ------------------------------------------------------------------ #
+        # Step 2: Build derived-field map (pre-pass) using known input name.  #
+        # ------------------------------------------------------------------ #
+        if input_field_name is None:
+            # Temporary fallback: need at least a name for the pre-pass.
+            # Will be refined in Step 3 using legacy subscript detection.
+            input_field_name = 'insn'
+
+        self._build_derived_field_map(input_field_name, parser)
+
+        # ------------------------------------------------------------------ #
+        # Step 3: Build constraint blocks AND validity/internal decls.
+        # ------------------------------------------------------------------ #
+        blocks: List[ConstraintBlock] = []
+        validity_decls: List[ValidityDecl] = []
+        internal_fields: List[str] = []
+
+        # Collect constraint methods from the full MRO (base classes first so
+        # subclass overrides take precedence).  Using a dict keyed by attr_name
+        # means the last write wins — i.e. the most-derived definition is used.
+        _constraint_methods: Dict[str, Any] = {}
+        for klass in reversed(self._cls.__mro__):
+            for attr_name, value in vars(klass).items():
+                if callable(value) and getattr(value, '_is_constraint', False):
+                    _constraint_methods[attr_name] = value
+
+        for attr_name, value in _constraint_methods.items():
             if not (callable(value) and getattr(value, '_is_constraint', False)):
                 continue
             try:
@@ -78,55 +271,90 @@ class ConstraintCompiler:
                 block = self._build_block(attr_name, expr)
                 if block is not None:
                     blocks.append(block)
+                # Extract validity_decl / internal_decl from consequents of implies.
+                if expr.get('type') == 'implies':
+                    guard = expr.get('antecedent')
+                    for cons in (expr.get('consequent') or []):
+                        if isinstance(cons, dict):
+                            if cons.get('type') == 'validity_decl':
+                                fname = self._field_name_from_expr(cons.get('field', {}))
+                                if fname:
+                                    validity_decls.append(
+                                        ValidityDecl(field_name=fname, guard=guard,
+                                                     source_method=attr_name))
+                            elif cons.get('type') == 'internal_decl':
+                                fname = self._field_name_from_expr(cons.get('field', {}))
+                                if fname and fname not in internal_fields:
+                                    internal_fields.append(fname)
+                # Top-level validity_decl (unconditionally observable — explicit)
+                elif expr.get('type') == 'validity_decl':
+                    fname = self._field_name_from_expr(expr.get('field', {}))
+                    if fname:
+                        validity_decls.append(
+                            ValidityDecl(field_name=fname, guard=None,
+                                         source_method=attr_name))
+                elif expr.get('type') == 'internal_decl':
+                    fname = self._field_name_from_expr(expr.get('field', {}))
+                    if fname and fname not in internal_fields:
+                        internal_fields.append(fname)
+                # Legacy path: collect subscript-referenced field names.
                 for fname in self._collect_subscript_fields(
                         expr.get('antecedent', {}) if expr.get('type') == 'implies' else {}):
-                    cond_field_names.add(fname)
+                    cond_field_names_legacy.add(fname)
 
-        # Determine output fields (rand-marked) and detect the input field.
-        output_fields: List[FieldDecl] = []
-        input_field_name: Optional[str] = None
-        input_field_width: int = 32  # sensible default for instruction words
+        # Mark internal fields on their FieldDecl objects (from zdc.internal() calls).
+        for fname in internal_fields:
+            fd = next((f for f in output_fields if f.name == fname), None)
+            if fd is not None:
+                fd.internal = True
 
-        if dataclasses.is_dataclass(self._cls):
-            for f in dataclasses.fields(self._cls):
-                meta = f.metadata
-                # extract_rand_fields also handles metadata stored in field.type
-                if not meta and isinstance(getattr(f, 'type', None), dataclasses.Field):
-                    meta = f.type.metadata  # type: ignore[union-attr]
+        # Collect internal fields that were auto-detected from '_' prefix or
+        # metadata["internal"] during field construction above, and add them to
+        # the internal_fields list so ConstraintBlockSet.internal_fields is complete.
+        for fd in output_fields:
+            if fd.internal and fd.name not in internal_fields:
+                internal_fields.append(fd.name)
 
-                if meta.get('rand') or meta.get('randc'):
-                    width = meta.get('width', 1)
-                    soft = meta.get('soft_default', None)
-                    output_fields.append(FieldDecl(name=f.name, width=width, soft_default=soft))
-                else:
-                    # Candidate input: the non-rand field used in subscript conditions.
-                    if f.name in cond_field_names and input_field_name is None:
-                        input_field_name = f.name
-                        w = meta.get('width', None) if meta else None
-                        if isinstance(w, int):
-                            input_field_width = w
+        # ------------------------------------------------------------------ #
+        # Step 4: Refine input field detection using legacy fallback if needed.
+        # ------------------------------------------------------------------ #
+        if input_field_name == 'insn' and cond_field_names_legacy:
+            # No zdc.input() marker found; try subscript-referenced names.
+            if dataclasses.is_dataclass(self._cls):
+                dc_field_names = {f.name for f in dataclasses.fields(self._cls)}
+                for fname in sorted(cond_field_names_legacy):
+                    if fname in dc_field_names:
+                        input_field_name = fname
+                        # Re-run derived map with the correct name.
+                        self._build_derived_field_map(input_field_name, parser)
+                        break
 
-        # Fall back: pick the most commonly referenced field name from conditions.
-        if input_field_name is None and cond_field_names:
-            input_field_name = next(iter(sorted(cond_field_names)))
+        if input_field_name == 'insn' and cond_field_names_legacy:
+            input_field_name = next(iter(sorted(cond_field_names_legacy)))
 
-        if input_field_name is None:
-            input_field_name = 'insn'
-
-        # Infer input width from the highest MSB seen if still at the default.
-        if input_field_width == 32:
+        # Infer input width from highest MSB seen only when not determined from annotations.
+        if input_field_width is None:
             max_msb = max((br.msb for b in blocks for br in b.conditions), default=31)
-            if max_msb > 0:
-                input_field_width = max_msb + 1
+            input_field_width = max_msb + 1 if max_msb > 0 else 32
 
         self.cset = ConstraintBlockSet(
             input_field=input_field_name,
             input_width=input_field_width,
             output_fields=output_fields,
             constraints=blocks,
+            validity_decls=validity_decls,
+            internal_fields=internal_fields,
         )
 
     # -- Phase A helpers ---------------------------------------------------
+
+    def _field_name_from_expr(self, expr: Dict[str, Any]) -> Optional[str]:
+        """Extract an output field name from a parsed attribute/name expression."""
+        if expr.get('type') == 'attribute':
+            return expr.get('attr')
+        if expr.get('type') == 'name':
+            return expr.get('id')
+        return None
 
     def _build_block(self, method_name: str, expr: Dict[str, Any]) -> Optional[ConstraintBlock]:
         """Convert a single 'implies' expression dict into a ConstraintBlock."""
@@ -161,10 +389,20 @@ class ConstraintCompiler:
             ops = node.get('ops', [])
             comps = node.get('comparators', [])
             if ops == ['=='] and comps:
-                br = self._extract_bitrange(node.get('left', {}))
-                val = self._extract_int(comps[0])
-                if br is not None and val is not None:
-                    return {br: val}
+                left = node.get('left', {})
+                # Case 1: subscript guard — self.instr[6:0] == X
+                if left.get('type') == 'subscript':
+                    br = self._extract_bitrange(left)
+                    val = self._extract_int(comps[0])
+                    if br is not None and val is not None:
+                        return {br: val}
+                # Case 2: named derived-field guard — self.opcode == X
+                elif left.get('type') == 'attribute':
+                    field_name = left.get('attr', '')
+                    br = self._derived_to_bitrange.get(field_name)
+                    val = self._extract_int(comps[0])
+                    if br is not None and val is not None:
+                        return {br: val}
         elif t == 'bool_op' and node.get('op') == 'and':
             result: Dict[BitRange, int] = {}
             for child in node.get('values', []):
@@ -269,6 +507,100 @@ class ConstraintCompiler:
         elif t == 'compare':
             return self._collect_subscript_fields(node.get('left', {}))
         return []
+
+    def _build_derived_field_map(self, input_field_name: str, parser: Any) -> None:
+        """Pre-pass: scan constraints for bit-extraction patterns, build _derived_to_bitrange.
+
+        Recognizes patterns of the form::
+
+            assert self.<derived> == (self.<input> >> lsb) & mask   # shift-mask
+            assert self.<derived> == (self.<input> & mask)           # mask only (lsb=0)
+            assert self.<derived> == self.<input>[msb:lsb]           # subscript
+
+        The map is used by _parse_conditions() to resolve named-field guards
+        (``self.opcode == X``) into BitRange conditions on the input word.
+        """
+        self._derived_to_bitrange = {}
+
+        _methods: Dict[str, Any] = {}
+        for klass in reversed(self._cls.__mro__):
+            for attr_name, value in vars(klass).items():
+                if callable(value) and getattr(value, '_is_constraint', False):
+                    _methods[attr_name] = value
+
+        for attr_name, value in _methods.items():
+            if not (callable(value) and getattr(value, '_is_constraint', False)):
+                continue
+            try:
+                parsed = parser.parse_constraint(value)
+            except Exception:
+                continue
+
+            for expr in parsed.get('exprs', []):
+                if expr.get('type') != 'compare':
+                    continue
+                if expr.get('ops') != ['==']:
+                    continue
+                left = expr.get('left', {})
+                if left.get('type') != 'attribute':
+                    continue
+                derived_name = left.get('attr', '')
+                if not derived_name:
+                    continue
+                comparators = expr.get('comparators', [])
+                if not comparators:
+                    continue
+                rhs = comparators[0]
+                br = self._try_parse_extraction(rhs, input_field_name)
+                if br is not None:
+                    self._derived_to_bitrange[derived_name] = br
+
+    def _try_parse_extraction(self, node: Dict[str, Any], input_name: str) -> Optional[BitRange]:
+        """Try to parse an extraction RHS into a BitRange.
+
+        Handles:
+          - ``self.<input>[msb:lsb]``                   → BitRange(msb, lsb)
+          - ``(self.<input> >> lsb) & mask``             → BitRange(lsb + width(mask) - 1, lsb)
+          - ``self.<input> & mask``                      → BitRange(width(mask) - 1, 0)
+        """
+        t = node.get('type')
+
+        # Subscript form: self.<input>[msb:lsb]
+        if t == 'subscript':
+            val = node.get('value', {})
+            field = val.get('attr') if val.get('type') == 'attribute' else val.get('id')
+            if field != input_name:
+                return None
+            return self._extract_bitrange(node)
+
+        # Mask form: expr & mask
+        if t == 'bin_op' and node.get('op') == '&':
+            left = node.get('left', {})
+            right = node.get('right', {})
+            mask_val = self._extract_int(right)
+            if mask_val is None or mask_val <= 0:
+                return None
+            width = mask_val.bit_length()
+
+            # Plain mask: self.<input> & mask → lsb=0
+            if left.get('type') == 'attribute' and left.get('attr') == input_name:
+                return BitRange(msb=width - 1, lsb=0)
+
+            # Shift-mask: (self.<input> >> lsb) & mask
+            if left.get('type') == 'bin_op' and left.get('op') == '>>':
+                inner_left = left.get('left', {})
+                inner_right = left.get('right', {})
+                field = (inner_left.get('attr')
+                         if inner_left.get('type') == 'attribute'
+                         else inner_left.get('id'))
+                if field != input_name:
+                    return None
+                lsb = self._extract_int(inner_right)
+                if lsb is None:
+                    return None
+                return BitRange(msb=lsb + width - 1, lsb=lsb)
+
+        return None
 
     # ------------------------------------------------------------------
     # Phase B — compute_support
@@ -418,11 +750,13 @@ class ConstraintCompiler:
         This avoids all minterm enumeration.  Each block's conditions are
         converted to a single (mask, value) cube over the flat support vector.
         The cubes are grouped by output bit; for each output bit we record:
-          - ``_cubes_by_bit[col]`` — cubes for which this bit is driven to 1.
-          - ``_zero_cubes_by_bit[col]`` — cubes that explicitly drive this bit
-            to 0 (not currently used by QM, kept for future ODC).
+          - ``_cubes_by_bit[col]``     — cubes for which this bit is driven to 1
+            (ON-set).
+          - ``_off_cubes_by_bit[col]`` — cubes that explicitly drive this bit to 0
+            (OFF-set).  Used by CubeExpandMinimizer for don't-care exploitation.
 
-        Unconstrained outputs are naturally don't-care by omission.
+        Blocks that do not mention a field at all leave it as don't-care by
+        omission and contribute nothing to either cube list.
         """
         assert self.cset is not None, "Call compute_support() first"
         support = self.cset.support_bits
@@ -443,9 +777,12 @@ class ConstraintCompiler:
             return fname if width == 1 else f"{fname}_bit{bit}"
 
         cubes_by_bit: Dict[str, List[Tuple[int, int]]] = {}
+        off_cubes_by_bit: Dict[str, List[Tuple[int, int]]] = {}
         for fd in self.cset.output_fields:
             for b in range(fd.width):
-                cubes_by_bit[bit_col(fd.name, b, fd.width)] = []
+                col = bit_col(fd.name, b, fd.width)
+                cubes_by_bit[col] = []
+                off_cubes_by_bit[col] = []
 
         for block in self.cset.constraints:
             # Build the (mask, value) cube for this block's conditions.
@@ -462,29 +799,295 @@ class ConstraintCompiler:
             for fd in self.cset.output_fields:
                 assigned_val = block.assignments.get(fd.name)
                 if assigned_val is None:
-                    continue  # Not assigned — don't add a cube.
+                    continue  # Not assigned — DC by omission; no cube added.
                 for b in range(fd.width):
+                    col = bit_col(fd.name, b, fd.width)
                     if (assigned_val >> b) & 1:
-                        col = bit_col(fd.name, b, fd.width)
                         cubes_by_bit[col].append((cube_mask, cube_value))
+                    else:
+                        off_cubes_by_bit[col].append((cube_mask, cube_value))
 
         self._cubes_by_bit = cubes_by_bit
+        self._off_cubes_by_bit = off_cubes_by_bit
+
+    # ------------------------------------------------------------------
+    # Phase D-ODC — build_odc_cubes
+    # ------------------------------------------------------------------
+
+    def build_odc_cubes(self) -> None:
+        """Build per-output-bit observability cube lists from ValidityDecls.
+
+        Must be called after ``build_cubes()`` (requires ``_cubes_by_bit``
+        to be populated so that guard field names can be resolved to cube
+        lists).
+
+        For each output field that has at least one ``ValidityDecl``:
+          1. Resolve each guard to a list of (mask, value) cubes (the guard's
+             ON-set in the support space).
+          2. Union the resolved cubes across all decls for that field.
+          3. Store the union in ``cset.obs_cubes_by_bit`` (one entry per
+             output bit column, same key format as ``_cubes_by_bit``).
+
+        Fields with *no* ValidityDecl are skipped; they remain always
+        observable (no ODC exploitation).
+        """
+        assert self.cset is not None, "Call build_cubes() first"
+        assert hasattr(self, '_cubes_by_bit'), "Call build_cubes() first"
+
+        import warnings
+
+        def bit_col(fname: str, bit: int, width: int) -> str:
+            return fname if width == 1 else f"{fname}_bit{bit}"
+
+        # Group validity_decls by field name.
+        from collections import defaultdict
+        decls_by_field: Dict[str, List] = defaultdict(list)
+        for vd in self.cset.validity_decls:
+            decls_by_field[vd.field_name].append(vd)
+
+        obs_cubes_by_bit: Dict[str, List[Tuple[int, int]]] = {}
+
+        for fname, decls in decls_by_field.items():
+            # Union of resolved guard cubes.
+            obs_cubes: List[Tuple[int, int]] = []
+            for vd in decls:
+                if vd.guard is None:
+                    # Unconditionally observable — tautology cube (mask=0, value=0).
+                    obs_cubes.append((0, 0))
+                else:
+                    resolved = self._resolve_guard(vd.guard)
+                    if resolved is not None:
+                        obs_cubes.extend(resolved)
+                    else:
+                        warnings.warn(
+                            f"ODC: could not resolve guard for zdc.valid({fname}) "
+                            f"in {vd.source_method} — field treated as always observable",
+                            stacklevel=2,
+                        )
+                        obs_cubes.append((0, 0))  # conservative: always observable
+
+            fd = self.cset.field_by_name(fname)
+            if fd is None:
+                log.warning("ODC: zdc.valid() references unknown field '%s' — skipped", fname)
+                continue
+            for b in range(fd.width):
+                col = bit_col(fname, b, fd.width)
+                obs_cubes_by_bit[col] = obs_cubes
+
+        self.cset.obs_cubes_by_bit = obs_cubes_by_bit
+
+    def _resolve_guard(self, expr: Dict[str, Any]) -> Optional[List[Tuple[int, int]]]:
+        """Convert a guard expression to a list of (mask, value) support-space cubes.
+
+        Returns the ON-set of the guard as a cube list, or ``None`` if the
+        guard contains constructs that cannot be resolved (NOT, comparisons
+        with constants not in the cube algebra, etc.).
+
+        Supported patterns:
+          FieldRef (attribute/name)  → _cubes_by_bit[field]  (direct lookup)
+          BoolOp OR(a, b, ...)       → union of resolved lists  (free)
+          BoolOp AND(a, b, ...)      → pairwise cube intersection  (O(|A|×|B|))
+          Constant True / bool True  → [(0, 0)]  (tautology)
+
+        Unsupported (returns None with warning):
+          NOT expr                   → complement deferred to Sprint S4
+          Comparison                 → constant guard not supported in v1
+        """
+        import warnings
+        t = expr.get('type')
+
+        if t == 'attribute':
+            fname = expr.get('attr', '')
+            return self._get_field_cubes(fname)
+
+        if t == 'name':
+            fname = expr.get('id', '')
+            return self._get_field_cubes(fname)
+
+        if t == 'constant':
+            v = expr.get('value')
+            if v is True or v == 1:
+                return [(0, 0)]   # tautology
+            if v is False or v == 0:
+                return []         # empty (never)
+            return None
+
+        if t == 'bool_op':
+            op = expr.get('op')
+            children = expr.get('values', [])
+            if op == 'or':
+                result: List[Tuple[int, int]] = []
+                for child in children:
+                    sub = self._resolve_guard(child)
+                    if sub is None:
+                        return None
+                    result.extend(sub)
+                return result
+            if op == 'and':
+                result = [(0, 0)]   # start with tautology
+                for child in children:
+                    sub = self._resolve_guard(child)
+                    if sub is None:
+                        return None
+                    result = self._cube_list_intersect(result, sub)
+                return result
+
+        if t == 'unary_op' and expr.get('op') == 'not':
+            # S4: NOT guard — compute complement via De Morgan's laws.
+            # NOT(FieldRef) = OFF-set of the field (no solver needed).
+            # NOT(OR(a,b))  = AND(NOT(a), NOT(b)) = intersection.
+            # NOT(AND(a,b)) = OR(NOT(a), NOT(b))  = union.
+            return self._complement_guard(expr.get('operand', {}))
+
+        if t == 'compare':
+            warnings.warn(
+                "ODC: comparison guard in zdc.valid() not yet supported in v1 "
+                "— field treated as always observable",
+                stacklevel=3,
+            )
+            return None
+
+        return None
+
+    def _complement_guard(self, expr: Dict[str, Any]) -> Optional[List[Tuple[int, int]]]:
+        """Return the complement (NOT) of a guard expression as cube list.
+
+        Uses De Morgan's laws to push negation to the leaves, where the
+        complement of a boolean field is its OFF-set (already computed by
+        build_cubes()).  No external solver is required.
+
+        Rules:
+          NOT(FieldRef)      → _off_cubes_by_bit[field]
+          NOT(NOT(x))        → _resolve_guard(x)   (double negation)
+          NOT(OR(a, b, ...)) → intersection of NOT(a), NOT(b), ...
+          NOT(AND(a,b, ...)) → union of NOT(a), NOT(b), ...
+          NOT(True)          → []     (empty / never observable)
+          NOT(False)         → [(0,0)] (tautology / always observable)
+        """
+        import warnings
+        t = expr.get('type')
+
+        if t in ('attribute', 'name'):
+            fname = expr.get('attr') or expr.get('id', '')
+            return self._get_field_off_cubes(fname)
+
+        if t == 'unary_op' and expr.get('op') == 'not':
+            # NOT NOT x → x
+            return self._resolve_guard(expr.get('operand', {}))
+
+        if t == 'bool_op':
+            op = expr.get('op')
+            children = expr.get('values', [])
+            if op == 'or':
+                # NOT(a OR b) = NOT(a) AND NOT(b)
+                result: List[Tuple[int, int]] = [(0, 0)]  # tautology seed
+                for child in children:
+                    sub = self._complement_guard(child)
+                    if sub is None:
+                        return None
+                    result = self._cube_list_intersect(result, sub)
+                return result
+            if op == 'and':
+                # NOT(a AND b) = NOT(a) OR NOT(b)
+                result = []
+                for child in children:
+                    sub = self._complement_guard(child)
+                    if sub is None:
+                        return None
+                    result.extend(sub)
+                return result
+
+        if t == 'constant':
+            v = expr.get('value')
+            if v is True or v == 1:
+                return []        # NOT True = False
+            if v is False or v == 0:
+                return [(0, 0)]  # NOT False = True
+            return None
+
+        warnings.warn(
+            f"ODC: complement of '{t}' guard not supported "
+            "— field treated as always observable",
+            stacklevel=3,
+        )
+        return None
+
+    def _get_field_off_cubes(self, fname: str) -> Optional[List[Tuple[int, int]]]:
+        """Return the OFF-set cube list for a boolean field used as a NOT guard."""
+        cubes = self._off_cubes_by_bit.get(fname)
+        if cubes is None:
+            log.warning("ODC: guard field '%s' not found in OFF cube set", fname)
+            return None
+        return list(cubes)
+
+    def _get_field_cubes(self, fname: str) -> Optional[List[Tuple[int, int]]]:
+        """Return the ON-set cube list for a boolean field used as a guard.
+
+        Looks up `_cubes_by_bit[fname]` (for 1-bit fields the column name
+        equals the field name).  Returns None if the field is unknown.
+        """
+        cubes = self._cubes_by_bit.get(fname)
+        if cubes is None:
+            log.warning("ODC: guard field '%s' not found in cube set", fname)
+            return None
+        return list(cubes)
+
+    @staticmethod
+    def _cube_list_intersect(
+        a: List[Tuple[int, int]],
+        b: List[Tuple[int, int]],
+    ) -> List[Tuple[int, int]]:
+        """Pairwise intersection of two cube lists.
+
+        For each pair (m1, v1) from *a* and (m2, v2) from *b*:
+          conflict = m1 & m2 & (v1 ^ v2)   # bits constrained to different values
+          if conflict == 0:
+            result cube: mask = m1 | m2, value = v1 | v2
+        """
+        result: List[Tuple[int, int]] = []
+        for m1, v1 in a:
+            for m2, v2 in b:
+                conflict = m1 & m2 & (v1 ^ v2)
+                if not conflict:
+                    result.append((m1 | m2, v1 | v2))
+        return result
 
     # ------------------------------------------------------------------
     # Phase E — minimize
     # ------------------------------------------------------------------
 
     def minimize(self) -> None:
-        """Run SOP minimization via MultiOutputQM and store results in cset."""
+        """Run SOP minimization and store results in cset.
+
+        Selects the best available minimizer:
+          1. CubeExpandMinimizer (GROW): when both ON- and OFF-cubes are
+             available (i.e. after ``build_cubes()``).  Exploits the large
+             don't-care space without enumerating it.
+          2. MultiOutputQM (cube path): fallback when only ON-cubes are
+             available.
+          3. MultiOutputQM (minterm path): legacy fallback after
+             ``build_table()``.
+        """
         n = self._n_vars or self.cset.support_size()
 
-        if hasattr(self, '_cubes_by_bit') and self._cubes_by_bit is not None:
-            # Fast cube-based path (preferred): no minterm expansion.
+        if (hasattr(self, '_cubes_by_bit') and self._cubes_by_bit is not None
+                and hasattr(self, '_off_cubes_by_bit')):
+            # Preferred path: GROW minimizer with explicit OFF-cubes.
+            # Pass obs_cubes if available (from build_odc_cubes).
+            obs = self.cset.obs_cubes_by_bit if self.cset.obs_cubes_by_bit else None
+            per_output_cubes, shared_terms = CubeExpandMinimizer().minimize(
+                self._cubes_by_bit,
+                self._off_cubes_by_bit,
+                n,
+                obs_cubes=obs,
+            )
+        elif hasattr(self, '_cubes_by_bit') and self._cubes_by_bit is not None:
+            # Cube-based QM (no OFF-set available).
             per_output_cubes, shared_terms = MultiOutputQM().minimize_from_cube_sets(
                 self._cubes_by_bit, n
             )
         else:
-            # Fallback: minterm-based path (for small support sizes).
+            # Legacy: minterm-based path (after build_table()).
             assert hasattr(self, '_ones_by_bit'), "Call build_table() or build_cubes() first"
             outputs: Dict[str, Tuple[Set[int], Set[int]]] = {
                 name: (ones, self._dontcares_by_bit[name])
@@ -521,8 +1124,11 @@ class ConstraintCompiler:
             if br.msb == br.lsb:
                 lines.append(f"wire {vn} = {input_sig}[{br.msb}];")
             else:
+                # Declare with zero-based width so that [0], [1], ... accesses are
+                # in-range.  The RHS slice preserves the correct bit mapping.
+                w = br.msb - br.lsb + 1
                 lines.append(
-                    f"wire [{br.msb}:{br.lsb}] {vn} = "
+                    f"wire [{w-1}:0] {vn} = "
                     f"{input_sig}[{br.msb}:{br.lsb}];"
                 )
 
@@ -603,6 +1209,19 @@ class ConstraintCompiler:
                 wire = self.strategy.passthroughs[fd.name]
                 lines.append(f"wire {p}_{fd.name};")
                 lines.append(f"assign {p}_{fd.name} = {wire};")
+                continue
+
+            # Derived fields are direct wire aliases to bit-slices of the input.
+            if fd.name in self._derived_to_bitrange:
+                br = self._derived_to_bitrange[fd.name]
+                pfx = f"{p}_" if p else ""
+                if fd.width == 1:
+                    lines.append(f"wire {pfx}{fd.name} = {input_sig}[{br.msb}];")
+                else:
+                    lines.append(
+                        f"wire [{fd.width-1}:0] {pfx}{fd.name} = "
+                        f"{input_sig}[{br.msb}:{br.lsb}];"
+                    )
                 continue
 
             if fd.width == 1:

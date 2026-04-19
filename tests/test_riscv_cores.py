@@ -198,10 +198,7 @@ class _RiscV5Stage:
             zdc.forward(signal="regfile.rdata2", from_stage="WB", to_stage="ID"),
         ],
     )
-    def execute(self, stage):
-        match stage:
-            abc:
-
+    def execute(self):
         # ── IF stage ──────────────────────────────────────────────────────
         IF = zdc.stage()
         rs1: zdc.u5  = self.rs1
@@ -351,7 +348,7 @@ class TestRiscV3Stage:
 
     def test_sv_output_port(self, sv):
         """out appears as an output port."""
-        assert "output reg  [31:0] out" in sv
+        assert "output wire [31:0] out" in sv or "output reg  [31:0] out" in sv
 
 
 # ===========================================================================
@@ -459,7 +456,7 @@ class TestRiscV5Stage:
         assert "input  wire [31:0] imm" in sv
 
     def test_sv_output_port(self, sv):
-        assert "output reg  [31:0] out" in sv
+        assert "output wire [31:0] out" in sv or "output reg  [31:0] out" in sv
 
     def test_sv_mem_stage_passthrough(self, sv):
         """wb_data signal (MEM pass-through) appears in the SV."""

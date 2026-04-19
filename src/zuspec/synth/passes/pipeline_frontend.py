@@ -109,7 +109,7 @@ class PipelineFrontendPass(SynthPass):
             # Check by class name and by type
             simple_name = name.split('.')[-1]
             if simple_name == cls_name:
-                from zuspec.dataclasses.ir.data_type import DataTypeComponent
+                from zuspec.ir.core.data_type import DataTypeComponent
                 if isinstance(dt, DataTypeComponent):
                     return dt
         return None
@@ -227,7 +227,7 @@ class PipelineFrontendPass(SynthPass):
         - ``_orig_stage_name``  — the original method name (e.g. ``"EX"``).
         - ``_is_first_substage`` — True only for the first substage.
         """
-        from zuspec.dataclasses.ir.pipeline import StageCallNode
+        from zuspec.ir.core.pipeline import StageCallNode
 
         class _SubstageCall:
             """Lightweight substage call node."""

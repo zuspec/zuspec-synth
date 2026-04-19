@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "zuspec-dataclasses",
+    "zuspec-ir-core",
     "dv-flow-mgr",
 ]
 
@@ -34,6 +35,9 @@ dev = [
 
 [project.entry-points."dv_flow.mgr"]
 zuspec-synth = "zuspec.synth.__ext__"
+
+[project.entry-points."zuspec.ext"]
+zuspec_synth = "zuspec.synth.cli_plugin:SynthPlugin"
 
 [tool.setuptools.packages.find]
 where = ["src"]

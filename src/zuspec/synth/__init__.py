@@ -91,7 +91,7 @@ def _generate_sdc(cls, top=None) -> str:
     stage register.
     """
     from zuspec.dataclasses.data_model_factory import DataModelFactory
-    from zuspec.dataclasses.ir.data_type import DataTypeComponent
+    from zuspec.ir.core.data_type import DataTypeComponent
     from zuspec.synth.sprtl.fsm_ir import DomainBinding
 
     ctx = DataModelFactory().build(cls)
@@ -936,4 +936,164 @@ def _build_comb_module(component_ir, module_name: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-__all__ = ["sprtl", "synthesize"]
+__all__ = ["sprtl", "synthesize", "ActionSynthConfig", "synth_action"]
+
+
+# ---------------------------------------------------------------------------
+# Constraint-action synthesis API
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass as _dc, field as _field
+from typing import Optional as _Opt, List as _List, Tuple as _Tuple
+
+
+@_dc
+class ActionSynthConfig:
+    """Configuration for :func:`synth_action`.
+
+    Pass an instance to :func:`synth_action` to control which optimisation
+    passes run and how the output module is named.  All fields have sensible
+    defaults so the common case requires no arguments::
+
+        sv = synth_action(MyDecodeAction)                          # all passes
+        sv = synth_action(MyDecodeAction, ActionSynthConfig(odc=False))  # SOP only
+
+    Attributes
+    ----------
+    odc : bool
+        Enable Observability Don't-Care minimisation (``build_odc_cubes``).
+        Requires at least one ``zdc.valid()`` annotation on the action class to
+        have any effect; safe to enable even when none are present.
+        Default: ``True``.
+    top : str or None
+        Override the generated module name.  When ``None`` (default) the
+        module is named after the action class (``cls.__name__``).
+    prefix : str
+        RTL wire-name prefix used inside the generated module body.
+        Default: ``""`` (no prefix).
+    warn_only : bool
+        When ``True`` (default), validation problems are emitted as warnings
+        rather than raising an exception.
+    """
+    odc: bool = True
+    top: _Opt[str] = None
+    prefix: str = ""
+    warn_only: bool = True
+
+
+def synth_action(cls: type,
+                 config: _Opt[ActionSynthConfig] = None,
+                 *,
+                 output: _Opt[str] = None) -> str:
+    """Synthesize a constraint-action class to a stand-alone SystemVerilog module.
+
+    This is the primary entry point for the constraint-to-RTL pipeline.  It
+    runs the full pass chain (extract → compute_support → validate →
+    build_cubes → [build_odc_cubes] → minimize → emit_sv) and wraps the
+    result in a self-contained ``module … endmodule`` block.
+
+    Parameters
+    ----------
+    cls:
+        A Python class decorated with ``@zdc.dataclass`` that has
+        ``@constraint`` methods and ``zdc.rand()`` output fields.
+    config:
+        An :class:`ActionSynthConfig` instance.  When omitted all passes are
+        enabled with default settings.
+    output:
+        Optional file path.  When given the SV text is also written there.
+
+    Returns
+    -------
+    str
+        The complete SystemVerilog module text.
+
+    Example
+    -------
+    ::
+
+        from zuspec.synth import synth_action, ActionSynthConfig
+        import zuspec.dataclasses as zdc
+        from zuspec.dataclasses import constraint
+
+        @zdc.dataclass
+        class Decode(zdc.Action):
+            instr : zdc.u32 = zdc.input()
+            _op   : zdc.u7  = zdc.rand()   # internal: _ prefix
+            out   : zdc.u4  = zdc.rand()
+
+            @constraint
+            def c_op(self):
+                assert self._op == (self.instr & 0x7F)
+
+            @constraint
+            def c_out(self):
+                if self._op == 0x33:
+                    assert self.out == 0
+
+        print(synth_action(Decode))
+    """
+    from zuspec.synth.sprtl.constraint_compiler import ConstraintCompiler
+
+    if config is None:
+        config = ActionSynthConfig()
+
+    top_name = config.top or cls.__name__
+
+    cc = ConstraintCompiler(cls, prefix=config.prefix)
+    cc.extract()
+    cc.compute_support()
+    cc.validate(warn_only=config.warn_only)
+    cc.build_cubes()
+    if config.odc:
+        cc.build_odc_cubes()
+    cc.minimize()
+    body_lines = cc.emit_sv()
+
+    # Determine port lists from compiler state.
+    internal = set(cc.cset.internal_fields)
+
+    input_ports: _List[_Tuple[str, int]] = [(cc.cset.input_field, cc.cset.input_width)]
+    output_ports: _List[_Tuple[str, int]] = [
+        (f.name, f.width) for f in cc.cset.output_fields if f.name not in internal
+    ]
+
+    def _port_decl(ins: _List[_Tuple[str, int]], outs: _List[_Tuple[str, int]]) -> str:
+        lines = []
+        for name, w in ins:
+            if w == 1:
+                lines.append(f"    input  logic        {name}")
+            else:
+                lines.append(f"    input  logic [{w-1}:0]  {name}")
+        for name, w in outs:
+            if w == 1:
+                lines.append(f"    output logic        {name}")
+            else:
+                lines.append(f"    output logic [{w-1}:0]  {name}")
+        return ",\n".join(lines)
+
+    sv_lines = [
+        f"// {top_name} — constraint-synthesized by zuspec.synth.synth_action",
+        f"// odc={config.odc}",
+        "",
+        f"module {top_name} (",
+        _port_decl(input_ports, output_ports),
+        ");",
+        "",
+    ]
+    for line in body_lines:
+        sv_lines.append(f"    {line}")
+    sv_lines.append("")
+    sv_lines.append("    // Connect internal wires to output ports.")
+    for name, _ in output_ports:
+        sv_lines.append(f"    assign {name} = _{name};")
+    sv_lines.extend(["", "endmodule", ""])
+
+    sv_text = "\n".join(sv_lines)
+
+    if output is not None:
+        import pathlib
+        pathlib.Path(output).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(output).write_text(sv_text)
+
+    return sv_text

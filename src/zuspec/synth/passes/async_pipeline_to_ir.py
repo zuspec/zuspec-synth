@@ -1,6 +1,6 @@
 """AsyncPipelineToIrPass — translate IrPipeline to PipelineIR.
 
-Input:  ``SynthIR.async_pipeline_ir`` (an :class:`~zuspec.dataclasses.ir.pipeline_async.IrPipeline`)
+Input:  ``SynthIR.async_pipeline_ir`` (an :class:`~zuspec.ir.core.pipeline_async.IrPipeline`)
 Output: ``SynthIR.pipeline_ir``   (a :class:`~zuspec.synth.ir.pipeline_ir.PipelineIR`)
 
 The pass performs:
@@ -21,7 +21,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from zuspec.dataclasses.ir.pipeline_async import (
+from zuspec.ir.core.pipeline_async import (
     IrBubble, IrEgressOp, IrHazardOp, IrIngressOp, IrPipeline, IrStage, IrStall
 )
 

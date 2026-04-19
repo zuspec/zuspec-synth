@@ -31,9 +31,11 @@ else:
     sys.path.insert(1, _dc_src)
 
 from zuspec.synth.sprtl.sva_gen import (
-    SVAGenerator, SVAGenConfig, SVAProperty, AssertionType, PropertyKind, generate_sva
+    SVAGenerator, SVAGenConfig, SVAProperty, AssertionType, PropertyKind,
+    generate_sva, _ConstraintExprToSV,
 )
 from zuspec.synth.sprtl.fsm_ir import FSMModule, FSMStateKind
+from zuspec.dataclasses.decorators import constraint as _constraint
 
 
 class TestSVAGenConfig:
@@ -225,3 +227,155 @@ class TestSVAGeneratorIntegration:
         # Should have at least valid_state assertion
         names = [p.name for p in props]
         assert "valid_state" in names
+
+
+# ---------------------------------------------------------------------------
+# T-P7: generate_role_properties — contract roles → SVA assume/assert
+# ---------------------------------------------------------------------------
+
+class SimpleReqAction:
+    @_constraint.requires
+    def c_positive(self):
+        self.value > 0
+
+    @_constraint.ensures
+    def c_result_bounded(self):
+        self.value < 200
+
+
+class MultiRoleAction:
+    @_constraint.requires
+    def req_a_small(self):
+        self.a < 128
+
+    @_constraint.requires
+    def req_b_nonzero(self):
+        self.b > 0
+
+    @_constraint.ensures
+    def ens_sum_bounded(self):
+        self.a < 100
+
+
+class NoRoleAction:
+    @_constraint
+    def c_x(self):
+        self.x < 50
+
+
+class TestGenerateRoleProperties:
+    """T-P7: SVAGenerator.generate_role_properties() tests."""
+
+    def setup_method(self):
+        self.gen = SVAGenerator()
+
+    def test_requires_maps_to_assume(self):
+        props = self.gen.generate_role_properties(SimpleReqAction)
+        assume_props = [p for p in props if p.assertion_type == AssertionType.ASSUME]
+        assert len(assume_props) == 1
+        assert assume_props[0].name == "requires_c_positive"
+
+    def test_ensures_maps_to_assert(self):
+        props = self.gen.generate_role_properties(SimpleReqAction)
+        assert_props = [p for p in props if p.assertion_type == AssertionType.ASSERT]
+        assert len(assert_props) == 1
+        assert assert_props[0].name == "ensures_c_result_bounded"
+
+    def test_multiple_requires(self):
+        props = self.gen.generate_role_properties(MultiRoleAction)
+        assume_props = [p for p in props if p.assertion_type == AssertionType.ASSUME]
+        names = {p.name for p in assume_props}
+        assert "requires_req_a_small" in names
+        assert "requires_req_b_nonzero" in names
+
+    def test_expression_contains_clock(self):
+        props = self.gen.generate_role_properties(SimpleReqAction, clock="sys_clk")
+        for p in props:
+            assert "posedge sys_clk" in p.expression
+
+    def test_trigger_added_to_expression(self):
+        props = self.gen.generate_role_properties(
+            SimpleReqAction, trigger="action_valid"
+        )
+        for p in props:
+            assert "action_valid |-> " in p.expression
+
+    def test_no_trigger_no_implication(self):
+        props = self.gen.generate_role_properties(SimpleReqAction)
+        for p in props:
+            assert "|-> " not in p.expression
+
+    def test_no_role_constraints_returns_empty(self):
+        props = self.gen.generate_role_properties(NoRoleAction)
+        assert props == []
+
+    def test_description_contains_class_and_method(self):
+        props = self.gen.generate_role_properties(SimpleReqAction)
+        for p in props:
+            assert "SimpleReqAction" in p.description
+
+    def test_property_kind_is_safety(self):
+        props = self.gen.generate_role_properties(SimpleReqAction)
+        for p in props:
+            assert p.kind == PropertyKind.SAFETY
+
+    def test_expression_contains_field_name(self):
+        props = self.gen.generate_role_properties(SimpleReqAction)
+        exprs = [p.expression for p in props]
+        assert any("value" in e for e in exprs)
+
+
+class TestConstraintExprToSV:
+    """Unit tests for _ConstraintExprToSV translator."""
+
+    def _tr(self, node):
+        return _ConstraintExprToSV().translate(node)
+
+    def test_attribute(self):
+        assert self._tr({'type': 'attribute', 'value': 'self', 'attr': 'foo'}) == 'foo'
+
+    def test_constant(self):
+        assert self._tr({'type': 'constant', 'value': 42}) == '42'
+
+    def test_compare_eq(self):
+        node = {
+            'type': 'compare',
+            'left': {'type': 'attribute', 'attr': 'x'},
+            'ops': ['=='],
+            'comparators': [{'type': 'constant', 'value': 5}],
+        }
+        result = self._tr(node)
+        assert result == '(x == 5)'
+
+    def test_compare_lt(self):
+        node = {
+            'type': 'compare',
+            'left': {'type': 'attribute', 'attr': 'v'},
+            'ops': ['<'],
+            'comparators': [{'type': 'constant', 'value': 100}],
+        }
+        assert '< 100' in self._tr(node)
+
+    def test_bool_op_and(self):
+        node = {
+            'type': 'bool_op',
+            'op': 'and',
+            'values': [
+                {'type': 'attribute', 'attr': 'a'},
+                {'type': 'attribute', 'attr': 'b'},
+            ],
+        }
+        result = self._tr(node)
+        assert '&&' in result
+
+    def test_unary_not(self):
+        node = {
+            'type': 'unary_op',
+            'op': 'not',
+            'operand': {'type': 'attribute', 'attr': 'en'},
+        }
+        result = self._tr(node)
+        assert '!en' in result
+
+    def test_bad_node_returns_none(self):
+        assert self._tr({'type': 'unknown_xyz'}) is None

@@ -43,7 +43,7 @@ from zuspec.synth.passes import (
     AsyncPipelineElaboratePass,
     AsyncPipelineToIrPass,
 )
-from zuspec.dataclasses.ir.pipeline_async_pass import AsyncPipelineFrontendPass
+from zuspec.ir.core.pipeline_async_pass import AsyncPipelineFrontendPass
 
 # ---------------------------------------------------------------------------
 # Helper: parse source string with AsyncPipelineFrontendPass
@@ -391,7 +391,7 @@ class TestTier1FrontendPass:
                     async with pipeline.stage() as S:
                         await S.bubble()
         """)
-        from zuspec.dataclasses.ir.pipeline_async import IrBubble
+        from zuspec.ir.core.pipeline_async import IrBubble
         body = ip.stages[0].body
         assert any(isinstance(n, IrBubble) for n in body)
 
@@ -403,7 +403,7 @@ class TestTier1FrontendPass:
                     async with pipeline.stage() as ID:
                         v1: u32 = await pipeline.block(self.rf[rs1])
         """)
-        from zuspec.dataclasses.ir.pipeline_async import IrHazardOp
+        from zuspec.ir.core.pipeline_async import IrHazardOp
         ops = ip.stages[0].hazard_ops
         block_ops = [o for o in ops if o.op == "block"]
         assert len(block_ops) == 1

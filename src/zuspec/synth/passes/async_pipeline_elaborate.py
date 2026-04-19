@@ -14,8 +14,8 @@ import logging
 import textwrap
 from typing import Optional
 
-from zuspec.dataclasses.ir.pipeline_async import IrPipeline
-from zuspec.dataclasses.ir.pipeline_async_pass import AsyncPipelineFrontendPass
+from zuspec.ir.core.pipeline_async import IrPipeline
+from zuspec.ir.core.pipeline_async_pass import AsyncPipelineFrontendPass
 
 from .synth_pass import SynthPass
 from zuspec.synth.ir.synth_ir import SynthConfig, SynthIR

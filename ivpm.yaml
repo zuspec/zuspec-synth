@@ -1,0 +1,17 @@
+package:
+    name: zuspec-synth
+    version: 0.1.0
+
+    dep-sets:
+    - name: default-dev
+      uses: default
+      deps:
+      - name: pytest
+        src: pypi
+
+    - name: default
+      deps:
+      - name: zuspec-dataclasses
+        url: https://github.com/zuspec/zuspec-dataclasses.git
+      - name: zuspec-ir-core
+        url: https://github.com/zuspec/zuspec-ir-core.git

@@ -88,7 +88,7 @@ class _DslQueryRewriter(ast.NodeTransformer):
             if isinstance(target_ast, ast.Attribute):
                 target_name = target_ast.attr
             try:
-                from zuspec.dataclasses.ir.pipeline import FlushDeclNode
+                from zuspec.ir.core.pipeline import FlushDeclNode
                 self._flush_decls.append(FlushDeclNode(
                     target_stage=target_name,
                     cond_ast=cond_ast,

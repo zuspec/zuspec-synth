@@ -5,6 +5,14 @@ import dataclasses as dc
 import re
 from typing import Any, Dict, List, Optional
 
+from zuspec.synth.ir.protocol_ir import (  # noqa: F401 — re-exported for convenience
+    IfProtocolPortIR,
+    QueueIR,
+    SpawnIR,
+    SelectIR,
+    CompletionIR,
+)
+
 
 # ---------------------------------------------------------------------------
 # lowered_sv key convention
@@ -200,3 +208,20 @@ class SynthIR:
     """
     stage_sv: Dict[str, List[str]] = dc.field(default_factory=dict)
     model_context: Optional[Any] = dc.field(default=None)
+
+    # --- New Phase 5 fields -------------------------------------------------
+
+    protocol_ports: List[IfProtocolPortIR] = dc.field(default_factory=list)
+    """IfProtocol port/export nodes produced by ``IfProtocolLowerPass``."""
+
+    queue_nodes: List[QueueIR] = dc.field(default_factory=list)
+    """Queue synthesis IR nodes produced by ``QueueLowerPass``."""
+
+    spawn_nodes: List[SpawnIR] = dc.field(default_factory=list)
+    """Spawn synthesis IR nodes produced by ``SpawnLowerPass``."""
+
+    select_nodes: List[SelectIR] = dc.field(default_factory=list)
+    """Select synthesis IR nodes produced by ``SelectLowerPass``."""
+
+    completion_nodes: List[CompletionIR] = dc.field(default_factory=list)
+    """Analyzed Completion tokens produced by ``CompletionAnalysisPass``."""

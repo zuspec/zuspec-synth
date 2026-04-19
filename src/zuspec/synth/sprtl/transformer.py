@@ -36,6 +36,21 @@ from .fsm_ir import (
     FSMRegRead, FSMRegWrite, FSMMemRequest, FSMMemResponse,
 )
 
+# IR expression/statement types used for inline-method rewriting
+try:
+    from zuspec.ir.core.expr import (
+        ExprRefParam, ExprRefLocal, ExprRefField, ExprRefUnresolved,
+        ExprConstant, ExprCall, ExprAttribute, ExprAwait, ExprBin,
+        TypeExprRefSelf,
+    )
+    from zuspec.ir.core.stmt import (
+        StmtAssign, StmtAugAssign, StmtFor, StmtExpr, StmtReturn,
+        StmtWhile, StmtIf,
+    )
+    _HAVE_IR = True
+except ImportError:
+    _HAVE_IR = False
+
 
 @dataclass
 class TransformContext:
@@ -45,6 +60,8 @@ class TransformContext:
     state_counter: int = 0
     reset_operations: List[FSMOperation] = field(default_factory=list)
     in_reset_section: bool = True  # True until we hit 'while True'
+    # Set by _transform_await_method_call; read by _transform_return.
+    _inline_result_var: Optional[str] = None
     
     def new_state(self, name: str, kind: FSMStateKind = FSMStateKind.NORMAL,
                   **kwargs) -> FSMState:
@@ -69,6 +86,7 @@ class SPRTLTransformer:
     def __init__(self):
         self._ctx: Optional[TransformContext] = None
         self._field_names: Dict[int, str] = {}  # ExprRefField.index → field name
+        self._component_ir: Any = None           # saved for function lookup in inlining
 
     def transform(self, component_ir: Any, process_ir: Any) -> FSMModule:
         """Transform a sync process to an FSM module.
@@ -88,6 +106,7 @@ class SPRTLTransformer:
 
         # Set up transformation context
         self._ctx = TransformContext(module=module)
+        self._component_ir = component_ir
 
         # Build field-index → name map for ExprRefField resolution
         fields = getattr(component_ir, 'fields', [])
@@ -190,6 +209,8 @@ class SPRTLTransformer:
             self._transform_expr_stmt(stmt)
         elif stmt_type == 'StmtFor':
             self._transform_for(stmt)
+        elif stmt_type == 'StmtReturn':
+            self._transform_return(stmt)
         # Add more statement types as needed
     
     def _transform_while(self, stmt: Any):
@@ -448,6 +469,12 @@ class SPRTLTransformer:
                     return
                 elif self._is_cycles_call(func):
                     self._transform_await_cycles(await_value)
+                    return
+                elif (attr is not None and attr.startswith('_')
+                      and not attr.startswith('__')
+                      and type(getattr(func, 'value', None)).__name__ == 'TypeExprRefSelf'):
+                    # Private async helper on self — inline it.
+                    self._transform_await_method_call(await_value, result_var)
                     return
 
         if await_type == 'ExprCompare':
@@ -807,7 +834,179 @@ class SPRTLTransformer:
         wait_state.add_transition(wait_state.id, priority=1)  # Lower priority = fallback
         
         self._ctx.current_state = next_state
-    
+
+    # ------------------------------------------------------------------
+    # Private async method inlining
+    # ------------------------------------------------------------------
+
+    def _rewrite_expr(self, expr: Any, bindings: Dict[str, Any], prefix: str) -> Any:
+        """Recursively rewrite an IR expression for method inlining.
+
+        * ``ExprRefParam(name)``  → the bound argument expression from *bindings*
+        * ``ExprRefLocal(name)``  → ``ExprRefLocal(name=prefix + name)``
+        * All other nodes        → same type with rewritten children
+        """
+        if not _HAVE_IR or expr is None:
+            return expr
+
+        etype = type(expr).__name__
+
+        if etype == 'ExprRefParam':
+            return bindings.get(expr.name, expr)
+
+        if etype == 'ExprRefLocal':
+            import copy
+            node = copy.copy(expr)
+            node.name = prefix + expr.name
+            return node
+
+        if etype == 'ExprCall':
+            import copy
+            node = copy.copy(expr)
+            node.func = self._rewrite_expr(expr.func, bindings, prefix)
+            node.args = [self._rewrite_expr(a, bindings, prefix) for a in (expr.args or [])]
+            return node
+
+        if etype == 'ExprAttribute':
+            import copy
+            node = copy.copy(expr)
+            node.value = self._rewrite_expr(expr.value, bindings, prefix)
+            return node
+
+        if etype == 'ExprAwait':
+            import copy
+            node = copy.copy(expr)
+            node.value = self._rewrite_expr(expr.value, bindings, prefix)
+            return node
+
+        if etype == 'ExprBin':
+            import copy
+            node = copy.copy(expr)
+            node.lhs = self._rewrite_expr(expr.lhs, bindings, prefix)
+            node.rhs = self._rewrite_expr(expr.rhs, bindings, prefix)
+            return node
+
+        # ExprConstant, ExprRefField, TypeExprRefSelf, ExprRefUnresolved — unchanged
+        return expr
+
+    def _rewrite_stmt(self, stmt: Any, bindings: Dict[str, Any], prefix: str) -> Any:
+        """Rewrite a single statement for method inlining."""
+        if not _HAVE_IR or stmt is None:
+            return stmt
+
+        import copy
+        stype = type(stmt).__name__
+
+        if stype == 'StmtAssign':
+            node = copy.copy(stmt)
+            node.targets = [self._rewrite_expr(t, bindings, prefix) for t in (stmt.targets or [])]
+            node.value = self._rewrite_expr(stmt.value, bindings, prefix)
+            return node
+
+        if stype == 'StmtAugAssign':
+            node = copy.copy(stmt)
+            node.target = self._rewrite_expr(stmt.target, bindings, prefix)
+            node.value = self._rewrite_expr(stmt.value, bindings, prefix)
+            return node
+
+        if stype == 'StmtFor':
+            node = copy.copy(stmt)
+            node.target = self._rewrite_expr(stmt.target, bindings, prefix)
+            node.iter = self._rewrite_expr(stmt.iter, bindings, prefix)
+            node.body = [self._rewrite_stmt(s, bindings, prefix) for s in (stmt.body or [])]
+            node.orelse = [self._rewrite_stmt(s, bindings, prefix) for s in (stmt.orelse or [])]
+            return node
+
+        if stype == 'StmtExpr':
+            node = copy.copy(stmt)
+            node.expr = self._rewrite_expr(stmt.expr, bindings, prefix)
+            return node
+
+        if stype == 'StmtReturn':
+            node = copy.copy(stmt)
+            node.value = self._rewrite_expr(stmt.value, bindings, prefix)
+            return node
+
+        if stype == 'StmtWhile':
+            node = copy.copy(stmt)
+            node.test = self._rewrite_expr(stmt.test, bindings, prefix)
+            node.body = [self._rewrite_stmt(s, bindings, prefix) for s in (stmt.body or [])]
+            return node
+
+        if stype == 'StmtIf':
+            node = copy.copy(stmt)
+            node.test = self._rewrite_expr(stmt.test, bindings, prefix)
+            node.body = [self._rewrite_stmt(s, bindings, prefix) for s in (stmt.body or [])]
+            node.orelse = [self._rewrite_stmt(s, bindings, prefix) for s in (stmt.orelse or [])]
+            return node
+
+        return stmt
+
+    def _transform_await_method_call(self, call_expr: Any, result_var: Optional[str]) -> None:
+        """Inline an ``await self._helper(args)`` call into the FSM.
+
+        Looks up the function by name in ``self._component_ir.functions``,
+        builds a parameter→argument binding, prefixes all local variables with
+        ``_{func_name}_`` to avoid name clashes with the outer scope, rewrites
+        the body, then transforms it as if it were inlined at the call site.
+        ``StmtReturn`` in the inlined body assigns to *result_var*.
+        """
+        func_name = getattr(call_expr.func, 'attr', None)
+        if func_name is None:
+            return
+
+        # Locate the function IR in the component
+        helper_fn = None
+        for fn in getattr(self._component_ir, 'functions', []):
+            if getattr(fn, 'name', None) == func_name:
+                helper_fn = fn
+                break
+        if helper_fn is None:
+            return
+
+        # Build param→arg bindings: map each parameter name to the call argument expr
+        param_names = [a.arg for a in getattr(helper_fn.args, 'args', [])]
+        call_args = getattr(call_expr, 'args', [])
+        bindings: Dict[str, Any] = {}
+        for pname, arg_expr in zip(param_names, call_args):
+            bindings[pname] = arg_expr
+
+        # Local variable prefix keeps names unique and avoids leading-double-underscore:
+        # func_name already starts with '_', so just append '_'.
+        prefix = f"{func_name}_"
+
+        # Rewrite the function body with the bindings applied
+        rewritten_body = [
+            self._rewrite_stmt(s, bindings, prefix)
+            for s in getattr(helper_fn, 'body', [])
+        ]
+
+        # Save and set the inline return target so StmtReturn knows where to put it
+        saved_return_var = getattr(self._ctx, '_inline_result_var', None)
+        self._ctx._inline_result_var = result_var
+
+        # Transform the rewritten body — this creates FSM states for the helper
+        self._transform_body(rewritten_body)
+
+        # Restore context
+        self._ctx._inline_result_var = saved_return_var
+
+    def _transform_return(self, stmt: Any) -> None:
+        """Transform a ``return`` statement inside an inlined helper.
+
+        Assigns the return value to the variable recorded in
+        ``self._ctx._inline_result_var`` (set by :meth:`_transform_await_method_call`).
+        """
+        result_var = getattr(self._ctx, '_inline_result_var', None)
+        if result_var is None or self._ctx.current_state is None:
+            return
+
+        value = getattr(stmt, 'value', None)
+        if value is not None:
+            self._ctx.current_state.add_operation(
+                FSMAssign(target=result_var, value=value, is_nonblocking=True)
+            )
+
     def _transform_for(self, stmt: Any):
         """Transform a for loop into LOOP_CHK / LOOP_BODY FSM states.
 

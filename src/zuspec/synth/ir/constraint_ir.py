@@ -14,6 +14,26 @@ class FieldDecl:
     name: str
     width: int
     soft_default: Optional[int] = None  # None → always computed; int → ODC when gating flag=0
+    # DEPRECATED: soft_default is superseded by ValidityDecl / zdc.valid().
+    # Retained for backward compatibility only; do not use in new code.
+    internal: bool = False  # set by zdc.internal() — field excluded from port list
+
+
+@dataclass
+class ValidityDecl:
+    """One ``zdc.valid(field)`` declaration from a constraint method.
+
+    Records that *field_name* is observable (has a meaningful value) when
+    *guard* is true.  Multiple ValidityDecls for the same field are unioned
+    to form the observability ON-set; the complement is the ODC region.
+
+    The *guard* is a parsed expression dict (same format as constraint
+    antecedents) or ``None`` to indicate "always observable" (equivalent to
+    no ValidityDecl but explicit).
+    """
+    field_name: str                   # output field this declaration applies to
+    guard: Optional[Dict]             # antecedent expression dict, or None (always)
+    source_method: str                # constraint method name (for diagnostics)
 
 
 @dataclass(frozen=True, eq=True)
@@ -92,16 +112,25 @@ class ConstraintBlockSet:
     """All ConstraintBlocks for one class, plus supporting metadata.
 
     Fields are populated incrementally by pipeline phases:
-      - ``constraints``    filled by Phase A (extract)
-      - ``support_bits``   filled by Phase B (compute_support)
-      - ``sop_functions``  filled by Phase E (minimize)
-      - ``shared_terms``   filled by Phase E (minimize)
+      - ``constraints``      filled by Phase A (extract)
+      - ``validity_decls``   filled by Phase A (extract) — from zdc.valid() calls
+      - ``internal_fields``  filled by Phase A (extract) — from zdc.internal() calls
+      - ``support_bits``     filled by Phase B (compute_support)
+      - ``obs_cubes_by_bit`` filled by Phase D-ODC (build_odc_cubes)
+      - ``sop_functions``    filled by Phase E (minimize)
+      - ``shared_terms``     filled by Phase E (minimize)
     """
     input_field: str                       # name of the single input field
     input_width: int                       # bit-width of that field
     output_fields: List[FieldDecl]
     constraints: List[ConstraintBlock] = field(default_factory=list)
+    validity_decls: List[ValidityDecl] = field(default_factory=list)
+    internal_fields: List[str] = field(default_factory=list)
     support_bits: List[BitRange] = field(default_factory=list)
+    # Per-output-bit observability cubes (mask, value) — filled by build_odc_cubes().
+    # Key: bit-column name (e.g. "alu_op_bit2"); value: list of (mask, value) cubes.
+    # Empty list means "always observable" (no ODC exploitation for that bit).
+    obs_cubes_by_bit: Dict[str, List[Tuple[int, int]]] = field(default_factory=dict)
     sop_functions: List[SOPFunction] = field(default_factory=list)
     shared_terms: List[SharedTerm] = field(default_factory=list)
 
