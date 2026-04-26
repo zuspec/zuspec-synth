@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from zuspec.dataclasses.constraint_parser import ConstraintParser, extract_rand_fields
 from ..ir.constraint_ir import (
-    BitRange, ConstraintBlock, ConstraintBlockSet, FieldDecl,
+    BitRange, ConstraintBlock, ConstraintBlockSet, ExprAssignment, FieldDecl,
     SOPCube, SOPFunction, SharedTerm, ValidityDecl,
 )
 from .qm_minimizer import MultiOutputQM
@@ -59,6 +59,9 @@ class ConstraintCompiler:
         self.strategy = None
         # Map from derived-field name → BitRange in the input word (built by pre-pass).
         self._derived_to_bitrange: Dict[str, BitRange] = {}
+        # Set of output field names that have expression (non-constant) assignments.
+        # These are excluded from the SOP pipeline and emitted via structural mux.
+        self._expr_fields: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Phase A-alt — from_sv_action
@@ -108,6 +111,7 @@ class ConstraintCompiler:
         cc._dontcares_by_bit = {}
         cc._n_vars = 0
         cc.strategy = None
+        cc._expr_fields = set()
 
         # Build the derived-field → BitRange map from extraction constraints.
         cc._derived_to_bitrange = {
@@ -268,9 +272,8 @@ class ConstraintCompiler:
                 log.warning("Skipping constraint %s.%s: %s", self._cls.__name__, attr_name, exc)
                 continue
             for expr in parsed.get('exprs', []):
-                block = self._build_block(attr_name, expr)
-                if block is not None:
-                    blocks.append(block)
+                new_blocks = self._build_blocks(attr_name, expr)
+                blocks.extend(new_blocks)
                 # Extract validity_decl / internal_decl from consequents of implies.
                 if expr.get('type') == 'implies':
                     guard = expr.get('antecedent')
@@ -346,7 +349,14 @@ class ConstraintCompiler:
             internal_fields=internal_fields,
         )
 
-    # -- Phase A helpers ---------------------------------------------------
+        # Build the set of fields that have expression assignments — these bypass SOP.
+        self._expr_fields = {
+            ea.field_name
+            for block in blocks
+            for ea in block.expr_assignments
+        }
+
+
 
     def _field_name_from_expr(self, expr: Dict[str, Any]) -> Optional[str]:
         """Extract an output field name from a parsed attribute/name expression."""
@@ -356,31 +366,89 @@ class ConstraintCompiler:
             return expr.get('id')
         return None
 
-    def _build_block(self, method_name: str, expr: Dict[str, Any]) -> Optional[ConstraintBlock]:
-        """Convert a single 'implies' expression dict into a ConstraintBlock."""
+    def _build_blocks(self, method_name: str, expr: Dict[str, Any]) -> List[ConstraintBlock]:
+        """Convert one 'implies' expression dict into one or more ConstraintBlocks.
+
+        OR-condition antecedents are expanded: each OR arm becomes a separate
+        block with the same consequent assignments.  This allows the SOP
+        minimizer to correctly handle guards like::
+
+            if opcode == 0x03 or opcode == 0x13 or opcode == 0x67:
+                assert imm == sext(instr[31:20], 12)
+        """
         if expr.get('type') != 'implies':
-            return None
+            return []
 
         antecedent = expr.get('antecedent', {})
         consequent = expr.get('consequent', [])
-        # consequent may be a list (from if-statement) or a single dict (from implies() call)
         if isinstance(consequent, dict):
             consequent = [consequent]
 
-        conditions = self._parse_conditions(antecedent)
-        if not conditions:
-            return None
+        # Expand OR antecedents into one block per arm.
+        if antecedent.get('type') == 'bool_op' and antecedent.get('op') == 'or':
+            arms = antecedent.get('values', [])
+        else:
+            arms = [antecedent]
 
+        result: List[ConstraintBlock] = []
+        for i, arm in enumerate(arms):
+            conditions = self._parse_conditions(arm)
+            if not conditions:
+                log.warning(
+                    "Constraint %s.%s arm %d: unsupported guard pattern %r — skipping",
+                    self._cls.__name__, method_name, i, arm.get('type'),
+                )
+                continue
+            block = self._build_block_from_conditions(
+                method_name if len(arms) == 1 else f"{method_name}_or{i}",
+                conditions, consequent,
+            )
+            if block is not None:
+                result.append(block)
+        return result
+
+    def _build_block(self, method_name: str, expr: Dict[str, Any]) -> Optional[ConstraintBlock]:
+        """Convert a single 'implies' expression dict with a non-OR guard into a ConstraintBlock.
+
+        Use ``_build_blocks`` for the general case (which handles OR antecedents).
+        This method is retained for internal callers that have already split arms.
+        """
+        blocks = self._build_blocks(method_name, expr)
+        return blocks[0] if len(blocks) == 1 else None
+
+    def _build_block_from_conditions(
+        self,
+        method_name: str,
+        conditions: Dict[BitRange, int],
+        consequent: List[Dict[str, Any]],
+    ) -> Optional[ConstraintBlock]:
+        """Build a ConstraintBlock from pre-parsed conditions + raw consequent list."""
         assignments: Dict[str, int] = {}
+        expr_assignments: List[ExprAssignment] = []
+
         for cons in consequent:
             fname, val = self._parse_assignment(cons)
             if fname is not None:
                 assignments[fname] = val
+            else:
+                ea = self._try_parse_expr_assignment(cons)
+                if ea is not None:
+                    expr_assignments.append(ea)
+                elif cons.get('type') == 'compare':
+                    log.warning(
+                        "Constraint %s: unsupported RHS in assignment %r — skipping",
+                        method_name, cons,
+                    )
 
-        if not assignments:
+        if not assignments and not expr_assignments:
             return None
 
-        return ConstraintBlock(name=method_name, conditions=conditions, assignments=assignments)
+        return ConstraintBlock(
+            name=method_name,
+            conditions=conditions,
+            assignments=assignments,
+            expr_assignments=expr_assignments,
+        )
 
     def _parse_conditions(self, node: Dict[str, Any]) -> Dict[BitRange, int]:
         """Recursively parse an antecedent AST node → {BitRange: required_value}."""
@@ -440,11 +508,14 @@ class ConstraintCompiler:
         return None
 
     def _extract_int(self, node: Dict[str, Any]) -> Optional[int]:
-        """Extract a Python int from a constant or name AST node.
+        """Extract a Python int from a constant, name, or attribute AST node.
 
         Handles:
           - ``{'type': 'constant', 'value': N}``  — inline integer literal.
           - ``{'type': 'name', 'id': 'SOME_CONST'}`` — module-level name;
+            resolved via the action class's module globals.
+          - ``{'type': 'attribute', 'value': {'type': 'name', 'id': 'Cls'}, 'attr': 'X'}``
+            — enum/class attribute (e.g. ``InstrKind.ALU_REG``);
             resolved via the action class's module globals.
         """
         if node.get('type') == 'constant':
@@ -469,6 +540,25 @@ class ConstraintCompiler:
                 if name in frame.f_locals and isinstance(frame.f_locals[name], int):
                     return frame.f_locals[name]
                 frame = frame.f_back
+        if node.get('type') == 'attribute':
+            # Resolve Class.ATTR style enum/constant lookups.
+            obj_node = node.get('value', {})
+            attr = node.get('attr', '')
+            if obj_node.get('type') == 'name' and attr:
+                import sys
+                cls_name = obj_node.get('id', '')
+                mod = sys.modules.get(getattr(self._cls, '__module__', ''), None)
+                if mod is not None:
+                    cls_obj = getattr(mod, cls_name, None)
+                    if cls_obj is not None:
+                        val = getattr(cls_obj, attr, None)
+                        if val is not None:
+                            if isinstance(val, int):
+                                return val
+                            try:
+                                return int(val)
+                            except (TypeError, ValueError):
+                                pass
         return None
 
     def _parse_assignment(self, node: Dict[str, Any]) -> Tuple[Optional[str], int]:
@@ -488,6 +578,175 @@ class ConstraintCompiler:
         if left.get('type') == 'name':
             return left.get('id'), val
         return None, 0
+
+    def _try_parse_expr_assignment(self, node: Dict[str, Any]) -> Optional[ExprAssignment]:
+        """Try to parse ``self.field == expr`` where *expr* is a synthesizable expression.
+
+        Recognises patterns like::
+
+            assert self.imm == zdc.sext(self.instr[31:20], 12) & MASK32
+            assert self.imm == zdc.sext(zdc.concat((0, 1), self.instr[31:20]), 12)
+
+        Returns an ``ExprAssignment`` if the pattern is recognised, ``None`` otherwise.
+        The ``sv_expr`` field is left ``None`` here; it is rendered at Phase F
+        (emit time) when the input signal name is fully known.
+        """
+        if node.get('type') != 'compare':
+            return None
+        ops = node.get('ops', [])
+        comps = node.get('comparators', [])
+        if ops != ['=='] or not comps:
+            return None
+        # LHS must be a field reference (attribute or name).
+        left = node.get('left', {})
+        if left.get('type') == 'attribute':
+            fname = left.get('attr')
+        elif left.get('type') == 'name':
+            fname = left.get('id')
+        else:
+            return None
+        if not fname:
+            return None
+        # RHS must contain a function call or subscript (i.e., not a plain int).
+        rhs = comps[0]
+        if self._extract_int(rhs) is not None:
+            return None
+        # Validate by doing a trial render with a dummy input name.
+        # We use a temporary cset placeholder to avoid cset-not-set issues.
+        _saved = self.cset
+        try:
+            sv = self._dict_expr_to_sv(rhs)
+        finally:
+            self.cset = _saved
+        if sv is None:
+            return None
+        return ExprAssignment(field_name=fname, expr=rhs, sv_expr=None)
+
+    def _dict_expr_to_sv(self, node: Dict[str, Any]) -> Optional[str]:
+        """Render a parsed expression dict to a SystemVerilog expression string.
+
+        Handles the synthesizable subset used in decode-stage constraints:
+
+        * ``sext(inner, n)``       → ``{{W-n{inner[n-1]}}, inner[n-1:0]}``
+        * ``concat((val,w), ...)`` → ``{W'hVAL, ...}`` (tuple zero-fill pairs)
+        * ``field[msb:lsb]``       → ``<input_sig>[msb:lsb]``
+        * ``expr & 0xFFFFFFFF``    → ``expr``  (no-op mask in 32-bit context)
+        * ``expr & mask``          → ``(expr & 32'hMASK)``
+        * integer constants        → ``W'hVAL``
+
+        Returns ``None`` for unsupported patterns.
+        """
+        t = node.get('type')
+        cs = self.cset
+        p = self._prefix
+        input_sig = f"{p}_{cs.input_field}" if (cs is not None and p) else (
+            cs.input_field if cs is not None else 'in')
+
+        if t == 'constant':
+            v = node.get('value')
+            if isinstance(v, int):
+                return f"32'h{v & 0xFFFFFFFF:08X}"
+            return None
+
+        if t == 'subscript':
+            # field[msb:lsb] or field[idx]
+            sl = node.get('slice', {})
+            if sl.get('type') == 'slice':
+                lower = self._extract_int(sl.get('lower'))
+                upper = self._extract_int(sl.get('upper'))
+                if lower is None or upper is None:
+                    return None
+                msb, lsb = lower, upper  # Python slice lower=MSB, upper=LSB
+                return f"{input_sig}[{msb}:{lsb}]"
+            elif sl.get('type') == 'index':
+                idx = self._extract_int(sl.get('value', {}))
+                if idx is None:
+                    return None
+                return f"{input_sig}[{idx}]"
+            return None
+
+        if t == 'tuple':
+            # (value, width) zero-fill pair used in zdc.concat args.
+            elts = node.get('elts', [])
+            if len(elts) == 2:
+                val = self._extract_int(elts[0])
+                width = self._extract_int(elts[1])
+                if val is not None and width is not None:
+                    return f"{width}'h{val & ((1 << width) - 1):X}"
+            return None
+
+        if t == 'call':
+            func = node.get('func', '')
+            args = node.get('args', [])
+
+            if func == 'sext':
+                # sext(inner_expr, n) → {{{(W-n){inner[n-1]}}, inner[n-1:0]}}
+                if len(args) < 2:
+                    return None
+                n = self._extract_int(args[1])
+                if n is None:
+                    return None
+                inner = self._dict_expr_to_sv(args[0])
+                if inner is None:
+                    return None
+                # Width of the output field; default 32 if we don't know yet.
+                out_fd = None
+                if cs is not None:
+                    # We may not have fname in scope here, but we can infer width
+                    # from context — emit the generic form.
+                    pass
+                W = 32  # standard extension to 32 bits
+                sign_bit = f"({inner})[{n-1}]"
+                return f"{{{{{W-n}{{{sign_bit}}}}}, ({inner})[{n-1}:0]}}"
+
+            if func == 'concat':
+                # concat(arg0, arg1, ...) → {sv0, sv1, ...}
+                parts: List[str] = []
+                for arg in args:
+                    sv = self._dict_expr_to_sv(arg)
+                    if sv is None:
+                        return None
+                    parts.append(sv)
+                return "{" + ", ".join(parts) + "}"
+
+            return None  # unsupported function
+
+        if t == 'bin_op':
+            op = node.get('op')
+            left_sv = self._dict_expr_to_sv(node.get('left', {}))
+            right = node.get('right', {})
+            if left_sv is None:
+                return None
+
+            if op == '&':
+                mask_val = self._extract_int(right)
+                if mask_val == 0xFFFFFFFF:
+                    return left_sv  # no-op mask
+                if mask_val is not None:
+                    return f"({left_sv} & 32'h{mask_val:08X})"
+                right_sv = self._dict_expr_to_sv(right)
+                if right_sv is None:
+                    return None
+                return f"({left_sv} & {right_sv})"
+
+            if op == '|':
+                right_sv = self._dict_expr_to_sv(right)
+                if right_sv is None:
+                    return None
+                return f"({left_sv} | {right_sv})"
+
+            if op == '<<':
+                n = self._extract_int(right)
+                if n is not None:
+                    return f"({left_sv} << {n})"
+            if op == '>>':
+                n = self._extract_int(right)
+                if n is not None:
+                    return f"({left_sv} >> {n})"
+
+            return None
+
+        return None
 
     def _collect_subscript_fields(self, node: Dict[str, Any]) -> List[str]:
         """Return field names referenced in subscript nodes (recursively)."""
@@ -727,6 +986,8 @@ class ConstraintCompiler:
                         idx |= 1 << fi
 
                 for fd in self.cset.output_fields:
+                    if fd.name in self._expr_fields:
+                        continue  # expr-assigned fields bypass SOP pipeline
                     assigned_val = block.assignments.get(fd.name)
                     for b in range(fd.width):
                         col = bit_col(fd.name, b, fd.width)
@@ -797,6 +1058,8 @@ class ConstraintCompiler:
 
             # Distribute to output bits.
             for fd in self.cset.output_fields:
+                if fd.name in self._expr_fields:
+                    continue  # expr-assigned fields bypass SOP pipeline
                 assigned_val = block.assignments.get(fd.name)
                 if assigned_val is None:
                     continue  # Not assigned — DC by omission; no cube added.
@@ -1224,6 +1487,11 @@ class ConstraintCompiler:
                     )
                 continue
 
+            # Fields with any expression assignment → structural priority-mux.
+            if fd.name in self._expr_fields:
+                lines.extend(self._emit_structural_mux(fd, input_sig))
+                continue
+
             if fd.width == 1:
                 sop_fn = sop_by_name.get(fd.name)
                 expr = sop_expr(sop_fn.cubes if sop_fn else [])
@@ -1248,4 +1516,83 @@ class ConstraintCompiler:
                 else:
                     lines.append(f"assign {p}_{fd.name} = {concat};")
 
+        return lines
+
+    def _emit_structural_mux(self, fd: FieldDecl, input_sig: str) -> List[str]:
+        """Emit a structural priority-mux for one expression-assigned output field.
+
+        For each ConstraintBlock that assigns ``fd.name`` (either as a constant or
+        as an expression), we emit:
+          1. A per-block named intermediate wire that holds the RHS value.
+          2. A single priority-mux ``assign`` that selects among the wires based
+             on the block's guard condition.
+
+        Constant assignments are rendered as ``W'hVAL`` expression wires.
+        Expression assignments use the pre-rendered ``sv_expr`` from ``ExprAssignment``.
+        """
+        p = self._prefix
+        cs = self.cset
+        lines: List[str] = []
+        W = fd.width
+
+        def cond_sv(conditions: Dict[BitRange, int]) -> str:
+            """Render a conditions dict as a SV guard expression."""
+            parts: List[str] = []
+            for br, req_val in sorted(conditions.items(), key=lambda kv: kv[0].lsb):
+                w = br.width()
+                sig = f"{input_sig}[{br.msb}:{br.lsb}]" if w > 1 else f"{input_sig}[{br.msb}]"
+                parts.append(f"({sig} == {w}'h{req_val:X})")
+            return " && ".join(parts) if parts else "1'b1"
+
+        # Collect all blocks (from any method) that assign this field.
+        relevant_blocks: List[ConstraintBlock] = []
+        for block in cs.constraints:
+            has_const = fd.name in block.assignments
+            has_expr = any(ea.field_name == fd.name for ea in block.expr_assignments)
+            if has_const or has_expr:
+                relevant_blocks.append(block)
+
+        if not relevant_blocks:
+            # No assignments found; emit a constant-zero wire.
+            lines.append(f"wire [{W-1}:0] {p}_{fd.name} = {W}'h0;")
+            return lines
+
+        # Emit per-block intermediate wires.
+        wire_names: List[str] = []
+        cond_strs: List[str] = []
+        for i, block in enumerate(relevant_blocks):
+            wire_name = f"{p}_{fd.name}_c{i}"
+            # Look for an expression assignment for this field in this block.
+            ea = next((x for x in block.expr_assignments if x.field_name == fd.name), None)
+            if ea is not None:
+                rhs_sv = ea.sv_expr or self._dict_expr_to_sv(ea.expr) or f"{W}'h0"
+            else:
+                const_val = block.assignments[fd.name]
+                rhs_sv = f"{W}'h{const_val & ((1 << W) - 1):X}"
+            if W == 1:
+                lines.append(f"wire {wire_name} = {rhs_sv};")
+            else:
+                lines.append(f"wire [{W-1}:0] {wire_name} = {rhs_sv};")
+            wire_names.append(wire_name)
+            cond_strs.append(cond_sv(block.conditions))
+
+        # Build priority mux.
+        if W == 1:
+            lines.append(f"wire {p}_{fd.name};")
+        else:
+            lines.append(f"wire [{W-1}:0] {p}_{fd.name};")
+
+        mux = ""
+        for cond, wire in zip(cond_strs, wire_names):
+            mux = f"{cond} ? {wire} : {mux}" if mux else wire
+        # Build right-to-left so highest-priority condition is outermost.
+        mux_parts: List[str] = []
+        for cond, wire in zip(cond_strs, wire_names):
+            mux_parts.append((cond, wire))
+        # Assemble: cond0 ? w0 : cond1 ? w1 : ... : default
+        default = f"{W}'h0"
+        rhs = default
+        for cond, wire in reversed(mux_parts):
+            rhs = f"{cond} ? {wire} : {rhs}"
+        lines.append(f"assign {p}_{fd.name} = {rhs};")
         return lines
