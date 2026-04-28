@@ -34,6 +34,7 @@ from .fsm_ir import (
     FSMModule, FSMState, FSMStateKind, FSMTransition,
     FSMOperation, FSMAssign, FSMCond, FSMPort, FSMRegister,
     FSMRegRead, FSMRegWrite, FSMMemRequest, FSMMemResponse,
+    FSMPortCall, FSMPortOutput,
 )
 
 # IR expression/statement types used for inline-method rewriting
@@ -86,6 +87,7 @@ class SPRTLTransformer:
     def __init__(self):
         self._ctx: Optional[TransformContext] = None
         self._field_names: Dict[int, str] = {}  # ExprRefField.index → field name
+        self._field_kinds: Dict[int, Any] = {}  # ExprRefField.index → FieldKind
         self._component_ir: Any = None           # saved for function lookup in inlining
 
     def transform(self, component_ir: Any, process_ir: Any) -> FSMModule:
@@ -108,12 +110,26 @@ class SPRTLTransformer:
         self._ctx = TransformContext(module=module)
         self._component_ir = component_ir
 
-        # Build field-index → name map for ExprRefField resolution
+        # Build field-index → name map and field-index → kind map
         fields = getattr(component_ir, 'fields', [])
         self._field_names = {
             i: getattr(f, 'name', f'field_{i}')
             for i, f in enumerate(fields)
         }
+        self._field_kinds = {
+            i: getattr(f, 'kind', None)
+            for i, f in enumerate(fields)
+        }
+
+        # Store field names and array fields in the module for sv_codegen
+        module.field_names = dict(self._field_names)
+        for i, f in enumerate(fields):
+            dt = getattr(f, 'datatype', None)
+            if dt is not None and type(dt).__name__ == 'DataTypeArray':
+                depth = getattr(dt, 'size', 0)
+                name = self._field_names.get(i, f'field_{i}')
+                if depth and depth > 0:
+                    module.array_fields[name] = depth
         
         # Extract clock and reset from process metadata
         metadata = getattr(process_ir, 'metadata', {})
@@ -150,6 +166,18 @@ class SPRTLTransformer:
             return expr.name
         return default
     
+    def _is_protocol_port_field(self, field_idx: int) -> bool:
+        """Return True if the field at *field_idx* is a ProtocolPort or ProtocolExport."""
+        try:
+            from zuspec.ir.core.fields import FieldKind
+            kind = self._field_kinds.get(field_idx)
+            return kind in (
+                FieldKind.ProtocolPort, FieldKind.ProtocolExport,
+                FieldKind.CallablePort, FieldKind.CallableExport,
+            )
+        except ImportError:
+            return False
+
     def _extract_ports(self, component_ir: Any):
         """Extract port declarations from component fields."""
         fields = getattr(component_ir, 'fields', [])
@@ -211,7 +239,52 @@ class SPRTLTransformer:
             self._transform_for(stmt)
         elif stmt_type == 'StmtReturn':
             self._transform_return(stmt)
+        elif stmt_type == 'StmtAnnAssign':
+            self._transform_ann_assign(stmt)
         # Add more statement types as needed
+    
+    def _transform_ann_assign(self, stmt: Any):
+        """Transform an annotated assignment (``name: type = value``).
+
+        In the reset section these declare registers; skip them here (already
+        handled at finalize time).  Outside the reset section they arise from
+        inlined helper bodies where the DMF emits tuple temporaries:
+
+            _tu_0: _zsp_tuple = (expr0, expr1, ...)
+
+        We expand each such tuple into flat scalar assignments:
+
+            _tu_0_v0 <= expr0
+            _tu_0_v1 <= expr1
+            ...
+
+        Plain scalar annotated assignments (e.g. ``pc: int = 0``) are treated
+        as ordinary non-blocking assignments.
+        """
+        if self._ctx.in_reset_section:
+            return
+        if not self._ctx.current_state:
+            return
+
+        target = getattr(stmt, 'target', None)
+        value  = getattr(stmt, 'value', None)
+        if target is None or value is None:
+            return
+
+        target_name = self._expr_to_name(target)
+
+        # Tuple binding: ExprTuple value -> expand to _v0, _v1, ...
+        if type(value).__name__ == 'ExprTuple':
+            for i, elt in enumerate(getattr(value, 'elts', [])):
+                flat_name = f"{target_name}_v{i}"
+                self._ctx.current_state.add_operation(
+                    FSMAssign(target=flat_name, value=elt, is_nonblocking=True)
+                )
+        else:
+            # Scalar annotated assignment
+            self._ctx.current_state.add_operation(
+                FSMAssign(target=target_name, value=value, is_nonblocking=True)
+            )
     
     def _transform_while(self, stmt: Any):
         """Transform a while statement.
@@ -272,41 +345,108 @@ class SPRTLTransformer:
         if self._ctx.current_state:
             self._ctx.current_state.add_transition(loop_state.id, condition=test)
     
+    def _branch_has_await(self, stmts: List[Any]) -> bool:
+        """Return True if any statement in *stmts* (recursively) contains ExprAwait."""
+        for s in stmts:
+            t = type(s).__name__
+            if t == 'StmtAssign':
+                val = getattr(s, 'value', None)
+                if type(val).__name__ == 'ExprAwait':
+                    return True
+            elif t == 'StmtExpr':
+                # StmtExpr uses .expr, not .value
+                val = getattr(s, 'expr', None)
+                if type(val).__name__ == 'ExprAwait':
+                    return True
+            if t in ('StmtIf', 'StmtWhile', 'StmtFor'):
+                if self._branch_has_await(getattr(s, 'body', [])):
+                    return True
+                if self._branch_has_await(getattr(s, 'orelse', [])):
+                    return True
+        return False
+
     def _transform_if(self, stmt: Any):
-        """Transform an if statement."""
+        """Transform an if statement.
+
+        All branches of an if/else must be *symmetric* with respect to ``await``:
+        either every branch contains an await (multi-cycle) or none do (single-cycle
+        combinational).  An asymmetric if/else is a synthesis error.
+
+        * No-await branches → single :class:`FSMCond` op in the current state.
+        * All-await branches → FSM fork/join: separate state chains per branch that
+          reconverge at a common join state.
+        """
         test = getattr(stmt, 'test', None)
         then_body = getattr(stmt, 'body', [])
         else_body = getattr(stmt, 'orelse', [])
         
         if self._ctx.in_reset_section:
-            # In reset section, if statements become conditional reset logic
-            # For now, skip - reset values come from port declarations
             return
         
         if not self._ctx.current_state:
             return
-        
-        # Create conditional operation in current state
-        then_ops = []
-        else_ops = []
-        
-        # Transform then branch
-        for s in then_body:
-            ops = self._stmt_to_operations(s)
-            then_ops.extend(ops)
-        
-        # Transform else branch
-        for s in else_body:
-            ops = self._stmt_to_operations(s)
-            else_ops.extend(ops)
-        
-        if then_ops or else_ops:
-            cond_op = FSMCond(
-                condition=test,
-                then_ops=then_ops,
-                else_ops=else_ops
+
+        then_has_await = self._branch_has_await(then_body)
+        else_has_await = self._branch_has_await(else_body)
+
+        # Asymmetric branches (one arm awaits, the other doesn't) are allowed.
+        # We treat the non-awaiting arm as a pass-through state that transitions
+        # immediately to the join, consuming one clock cycle.  This keeps the
+        # FSM flat and correct without requiring the user to add dummy ticks.
+        either_has_await = then_has_await or else_has_await
+
+        if not either_has_await:
+            # ── Pure combinational ─────────────────────────────────────────
+            then_ops: List[FSMOperation] = []
+            else_ops: List[FSMOperation] = []
+            for s in then_body:
+                then_ops.extend(self._stmt_to_operations(s))
+            for s in else_body:
+                else_ops.extend(self._stmt_to_operations(s))
+            if then_ops or else_ops:
+                self._ctx.current_state.add_operation(
+                    FSMCond(condition=test, then_ops=then_ops, else_ops=else_ops)
+                )
+        else:
+            # ── Multi-cycle: fork/join ─────────────────────────────────────
+            # fork_state holds the conditional transition; its then/else arms
+            # are separate state chains that both converge to join_state.
+            fork_state = self._ctx.current_state
+
+            # Transform then-branch into its own state chain
+            then_entry = self._ctx.new_state(
+                self._ctx.make_state_name("S_IF"), FSMStateKind.NORMAL
             )
-            self._ctx.current_state.add_operation(cond_op)
+            fork_state.add_transition(then_entry.id, condition=test)
+            self._ctx.current_state = then_entry
+            self._transform_body(then_body)
+            then_end = self._ctx.current_state  # last state after then-chain
+
+            # Transform else-branch (if present) into its own state chain
+            if else_body:
+                else_entry = self._ctx.new_state(
+                    self._ctx.make_state_name("S_ELSE"), FSMStateKind.NORMAL
+                )
+                fork_state.add_transition(else_entry.id)  # unconditional → else
+                self._ctx.current_state = else_entry
+                self._transform_body(else_body)
+                else_end = self._ctx.current_state
+            else:
+                else_end = None
+
+            # Create common join state and wire both arms to it
+            join_state = self._ctx.new_state(
+                self._ctx.make_state_name("S_JOIN"), FSMStateKind.NORMAL
+            )
+            if then_end:
+                then_end.add_transition(join_state.id)
+            if else_end:
+                else_end.add_transition(join_state.id)
+            else:
+                # No else branch: fork goes directly to join on the else arm
+                fork_state.add_transition(join_state.id)
+
+            self._ctx.current_state = join_state
     
     def _stmt_to_operations(self, stmt: Any) -> List[FSMOperation]:
         """Convert a statement to FSM operations."""
@@ -320,6 +460,17 @@ class SPRTLTransformer:
                 target_name = self._expr_to_name(target)
                 ops.append(FSMAssign(target=target_name, value=value))
         
+        elif stmt_type == 'StmtAnnAssign':
+            target = getattr(stmt, 'target', None)
+            value  = getattr(stmt, 'value', None)
+            if target is not None and value is not None:
+                target_name = self._expr_to_name(target)
+                if type(value).__name__ == 'ExprTuple':
+                    for i, elt in enumerate(getattr(value, 'elts', [])):
+                        ops.append(FSMAssign(target=f"{target_name}_v{i}", value=elt))
+                else:
+                    ops.append(FSMAssign(target=target_name, value=value))
+
         elif stmt_type == 'StmtAugAssign':
             target = getattr(stmt, 'target', None)
             op = getattr(stmt, 'op', None)
@@ -344,14 +495,41 @@ class SPRTLTransformer:
         return ops
     
     def _expr_to_name(self, expr: Any) -> str:
-        """Convert an expression to a signal name."""
+        """Convert an expression to a signal name.
+
+        For simple locals/params this returns the identifier name.
+        For array-field subscripts (``self.arr[idx]``) it returns
+        ``arr_name[idx_repr]`` so the FSMAssign target can be
+        rendered as an indexed write in SV.
+        """
+        if expr is None:
+            return "unknown"
+        t = type(expr).__name__
         if hasattr(expr, 'name'):
             return expr.name
+        if t == 'ExprSubscript':
+            val_expr = getattr(expr, 'value', None)
+            slc = getattr(expr, 'slice', None)
+            if (val_expr is not None
+                    and type(val_expr).__name__ == 'ExprRefField'
+                    and type(getattr(val_expr, 'base', None)).__name__ == 'TypeExprRefSelf'):
+                arr_name = self._field_names.get(val_expr.index, f'field_{val_expr.index}')
+                idx_name = self._expr_to_name(slc) if slc is not None else '?'
+                return f"{arr_name}[{idx_name}]"
         if hasattr(expr, 'attr'):
+            # ExprAttribute: for local-variable attribute access (e.g. dec.rd)
+            # flatten to base_attr so the register name matches what the
+            # synthesiser assigned.  For self-field chains (e.g. self.mem) the
+            # value is ExprRefField which has an 'index' attribute rather than
+            # a 'name', so this branch is not taken.
+            value = getattr(expr, 'value', None)
+            if value is not None and type(value).__name__ == 'ExprRefLocal':
+                base_name = getattr(value, 'name', '')
+                return f"{base_name}_{expr.attr}" if base_name else expr.attr
             return expr.attr
         if hasattr(expr, 'index'):
-            # ExprRefField - would need to look up by index
-            return f"field_{expr.index}"
+            # ExprRefField — look up by index
+            return self._field_names.get(expr.index, f'field_{expr.index}')
         return "unknown"
     
     def _transform_assign(self, stmt: Any):
@@ -412,18 +590,31 @@ class SPRTLTransformer:
         )
     
     def _transform_expr_stmt(self, stmt: Any):
-        """Transform an expression statement (e.g., await)."""
+        """Transform an expression statement (e.g., await or bare port call)."""
         expr = getattr(stmt, 'expr', None)
         if not expr:
             return
-        
+
         expr_type = type(expr).__name__
-        
+
         if expr_type == 'ExprAwait':
             self._transform_await(expr)
-    
+        elif expr_type == 'ExprCall':
+            # Non-awaited call — check if it's a port-method output
+            func = getattr(expr, 'func', None)
+            receiver = getattr(func, 'value', None) if func else None
+            if (receiver is not None
+                    and type(receiver).__name__ == 'ExprRefField'
+                    and self._is_protocol_port_field(receiver.index)):
+                self._transform_port_output(expr)
+
     def _transform_await(self, expr: Any, result_var=None):
         """Transform an await expression.
+
+        Dispatch is receiver-kind-based:
+        - ExprRefField whose kind is ProtocolPort/ProtocolExport → generic port-method handler
+        - ExprRefField whose kind is Field/Reg → zdc framework method dispatch (read/write/…)
+        - TypeExprRefSelf → self.wait / zdc.cycles / private helper inlining
 
         ``result_var`` carries the name (str) or names (list[str]) of the
         local variable(s) that receive the awaited value.
@@ -441,40 +632,50 @@ class SPRTLTransformer:
             func = getattr(await_value, 'func', None)
             if func:
                 attr = getattr(func, 'attr', None)
-                if attr == 'read':
-                    self._transform_await_reg_read(await_value, result_var)
-                    return
-                elif attr == 'write':
-                    self._transform_await_reg_write(await_value)
-                    return
-                elif attr == 'request':
-                    self._transform_await_mem_request(await_value)
-                    return
-                elif attr == 'response':
-                    self._transform_await_mem_response(await_value, result_var)
-                    return
-                elif attr == 'read_all':
-                    self._transform_await_read_all(await_value, result_var)
-                    return
-                elif attr == 'wait':
-                    # Distinguish self.wait(Time) from self.regs.wait(regs, cond).
-                    # When the receiver is TypeExprRefSelf it is a component-level
-                    # idle wait; when it is an ExprRefField it is a bulk register
-                    # poll that stalls until a condition on register values is met.
-                    receiver_type = type(getattr(func, 'value', None)).__name__
-                    if receiver_type == 'TypeExprRefSelf':
-                        self._transform_await_idle(await_value)
+                receiver = getattr(func, 'value', None)
+                receiver_type = type(receiver).__name__ if receiver is not None else ''
+
+                if receiver_type == 'ExprRefField':
+                    # Dispatch by field kind
+                    if self._is_protocol_port_field(receiver.index):
+                        # Generic protocol port-method call
+                        self._transform_await_port_method(await_value, result_var)
+                        return
                     else:
-                        self._transform_await_reg_wait(await_value, result_var)
-                    return
+                        # Register or other framework field — dispatch by method name
+                        if attr == 'read':
+                            self._transform_await_reg_read(await_value, result_var)
+                            return
+                        elif attr == 'write':
+                            self._transform_await_reg_write(await_value)
+                            return
+                        elif attr == 'read_all':
+                            self._transform_await_read_all(await_value, result_var)
+                            return
+                        elif attr == 'wait':
+                            self._transform_await_reg_wait(await_value, result_var)
+                            return
+
+                elif receiver_type == 'TypeExprRefSelf':
+                    if attr == 'wait':
+                        self._transform_await_idle(await_value)
+                        return
+                    elif self._is_cycles_call(func):
+                        self._transform_await_cycles(await_value)
+                        return
+                    elif attr is not None and (
+                        (attr.startswith('_') and not attr.startswith('__'))
+                        or any(
+                            getattr(fn, 'name', None) == attr
+                            for fn in getattr(self._component_ir, 'functions', [])
+                        )
+                    ):
+                        # Private or public async helper on self — inline it.
+                        self._transform_await_method_call(await_value, result_var)
+                        return
+
                 elif self._is_cycles_call(func):
                     self._transform_await_cycles(await_value)
-                    return
-                elif (attr is not None and attr.startswith('_')
-                      and not attr.startswith('__')
-                      and type(getattr(func, 'value', None)).__name__ == 'TypeExprRefSelf'):
-                    # Private async helper on self — inline it.
-                    self._transform_await_method_call(await_value, result_var)
                     return
 
         if await_type == 'ExprCompare':
@@ -548,8 +749,72 @@ class SPRTLTransformer:
         self._ctx.current_state = reg_state
 
     # ------------------------------------------------------------------
-    # Await handlers: memory-interface request / response
+    # Await handler: generic protocol-port method call
     # ------------------------------------------------------------------
+
+    def _transform_await_port_method(self, call_expr: Any,
+                                      result_var: Optional[str] = None):
+        """Transform ``result = await self.PORT.METHOD(args)`` → WAIT_COND state.
+
+        Creates a handshake state that:
+        - Asserts PORT_METHOD_valid and drives PORT_METHOD_argN outputs
+        - Stays in the state (self-loop) while PORT_METHOD_ack is not asserted
+        - On ack: latches PORT_METHOD_rdata into result_var (if non-void)
+        - Advances to a DONE state after the handshake
+        """
+        func = getattr(call_expr, 'func', None)
+        receiver = getattr(func, 'value', None)
+        method_name = getattr(func, 'attr', 'call')
+        field_idx = getattr(receiver, 'index', 0)
+        port_name = self._field_names.get(field_idx, f'port_{field_idx}')
+        args = getattr(call_expr, 'args', [])
+
+        state_name = f"{port_name.upper()}_{method_name.upper()}_REQ"
+        ack_signal = f"{port_name}_{method_name}_ack"
+
+        req_state = self._ctx.new_state(
+            state_name, FSMStateKind.WAIT_COND, wait_condition=ack_signal
+        )
+        req_state.add_operation(FSMPortCall(
+            port_name=port_name,
+            method_name=method_name,
+            arg_exprs=list(args),
+            result_var=result_var or '',
+        ))
+        req_state.add_transition(req_state.id, priority=1)  # self-loop while !ack
+
+        if self._ctx.current_state:
+            self._ctx.current_state.add_transition(req_state.id)
+
+        # Advance to a post-handshake NORMAL state on ack
+        done_state = self._ctx.new_state(f"{state_name}_DONE", FSMStateKind.NORMAL)
+        req_state.add_transition(done_state.id, condition=ack_signal)
+
+        self._ctx.current_state = done_state
+
+    def _transform_port_output(self, call_expr: Any):
+        """Transform a non-awaited ``self.PORT.METHOD(args)`` → FSMPortOutput op.
+
+        Emits the port output signals in the current FSM state for one clock
+        cycle with no ack/wait (fire-and-forget / void output).
+        """
+        if self._ctx.current_state is None:
+            return
+        func = getattr(call_expr, 'func', None)
+        receiver = getattr(func, 'value', None)
+        method_name = getattr(func, 'attr', 'call')
+        field_idx = getattr(receiver, 'index', 0)
+        port_name = self._field_names.get(field_idx, f'port_{field_idx}')
+        args = getattr(call_expr, 'args', [])
+
+        self._ctx.current_state.add_operation(FSMPortOutput(
+            port_name=port_name,
+            method_name=method_name,
+            arg_exprs=list(args),
+        ))
+
+    # ------------------------------------------------------------------
+    # Await handlers: memory-interface request / response (legacy)
 
     def _transform_await_mem_request(self, call_expr: Any):
         """Transform ``await port.request(req)`` → WAIT_COND state.
@@ -781,10 +1046,10 @@ class SPRTLTransformer:
         )
     
     def _is_cycles_call(self, func: Any) -> bool:
-        """Check if a function call is zdc.cycles()."""
-        if hasattr(func, 'attr') and func.attr == 'cycles':
+        """Check if a function call is zdc.cycles() or zdc.tick()."""
+        if hasattr(func, 'attr') and func.attr in ('cycles', 'tick'):
             return True
-        if hasattr(func, 'name') and func.name == 'cycles':
+        if hasattr(func, 'name') and func.name in ('cycles', 'tick'):
             return True
         return False
     
@@ -886,6 +1151,54 @@ class SPRTLTransformer:
             node.rhs = self._rewrite_expr(expr.rhs, bindings, prefix)
             return node
 
+        if etype == 'ExprCompare':
+            import copy
+            node = copy.copy(expr)
+            node.left = self._rewrite_expr(expr.left, bindings, prefix)
+            node.comparators = [self._rewrite_expr(c, bindings, prefix)
+                                 for c in (expr.comparators or [])]
+            return node
+
+        if etype == 'ExprBool':
+            import copy
+            node = copy.copy(expr)
+            node.values = [self._rewrite_expr(v, bindings, prefix)
+                           for v in (expr.values or [])]
+            return node
+
+        if etype == 'ExprUnary':
+            import copy
+            node = copy.copy(expr)
+            node.operand = self._rewrite_expr(expr.operand, bindings, prefix)
+            return node
+
+        if etype == 'ExprTuple':
+            import copy
+            node = copy.copy(expr)
+            node.elts = [self._rewrite_expr(e, bindings, prefix)
+                         for e in (expr.elts or [])]
+            return node
+
+        if etype == 'ExprSubscript':
+            import copy
+            node = copy.copy(expr)
+            node.value = self._rewrite_expr(expr.value, bindings, prefix)
+            node.slice = self._rewrite_expr(expr.slice, bindings, prefix)
+            return node
+
+        if etype in ('ExprSext', 'ExprZext'):
+            import copy
+            node = copy.copy(expr)
+            node.value = self._rewrite_expr(expr.value, bindings, prefix)
+            # bits is int (compile-time constant), not an Expr — no rewrite needed
+            return node
+
+        if etype in ('ExprCbit', 'ExprSigned'):
+            import copy
+            node = copy.copy(expr)
+            node.value = self._rewrite_expr(expr.value, bindings, prefix)
+            return node
+
         # ExprConstant, ExprRefField, TypeExprRefSelf, ExprRefUnresolved — unchanged
         return expr
 
@@ -940,6 +1253,12 @@ class SPRTLTransformer:
             node.orelse = [self._rewrite_stmt(s, bindings, prefix) for s in (stmt.orelse or [])]
             return node
 
+        if stype == 'StmtAnnAssign':
+            node = copy.copy(stmt)
+            node.target = self._rewrite_expr(stmt.target, bindings, prefix)
+            node.value = self._rewrite_expr(stmt.value, bindings, prefix)
+            return node
+
         return stmt
 
     def _transform_await_method_call(self, call_expr: Any, result_var: Optional[str]) -> None:
@@ -971,8 +1290,7 @@ class SPRTLTransformer:
         for pname, arg_expr in zip(param_names, call_args):
             bindings[pname] = arg_expr
 
-        # Local variable prefix keeps names unique and avoids leading-double-underscore:
-        # func_name already starts with '_', so just append '_'.
+        # Local variable prefix keeps names unique across inlined helpers.
         prefix = f"{func_name}_"
 
         # Rewrite the function body with the bindings applied

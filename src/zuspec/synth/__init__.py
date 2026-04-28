@@ -231,6 +231,7 @@ def _synthesize_sprtl(cls, *, reset_style: str = "sync_low", top=None) -> str:
         SPRTLTransformer,
         generate_sv,
         SVGenConfig,
+        FSMOptimizer,
     )
 
     ctx = DataModelFactory().build(cls)
@@ -261,6 +262,7 @@ def _synthesize_sprtl(cls, *, reset_style: str = "sync_low", top=None) -> str:
             transformer = SPRTLTransformer()
             fsm = transformer.transform(component_ir, proc)
             fsm.name = module_name
+            FSMOptimizer(minimize_states=False, merge_operations=False).optimize(fsm)
             sv = generate_sv(fsm, config=reset_cfg)
         else:
             # Plain-def one-cycle sync path — emit always_ff directly from IR.
@@ -269,10 +271,22 @@ def _synthesize_sprtl(cls, *, reset_style: str = "sync_low", top=None) -> str:
                 ctx=ctx, py_cls=cls,
             )
     elif proc_processes:
-        # @zdc.proc Process nodes (e.g. Counter pattern)
+        # @zdc.proc Process nodes.
+        # Route through SPRTLTransformer if any field is a protocol port
+        # (needs full FSM/handshake lowering). Otherwise use the simple
+        # register-process path (e.g. Counter pattern).
         reg_proc_nodes = [p for p in proc_processes if type(p).__name__ == 'Process']
-        if reg_proc_nodes:
-            sv = _synthesize_reg_process(component_ir, reg_proc_nodes[0], module_name)
+        if reg_proc_nodes and (_has_protocol_port(component_ir)
+                               or _proc_has_await(reg_proc_nodes[0])):
+            proc = reg_proc_nodes[0]
+            reset_cfg = SVGenConfig(reset_style=_reset_style_enum(reset_style))
+            transformer = SPRTLTransformer()
+            fsm = transformer.transform(component_ir, proc)
+            fsm.name = module_name
+            FSMOptimizer(minimize_states=False, merge_operations=False).optimize(fsm)
+            sv = generate_sv(fsm, config=reset_cfg)
+        elif reg_proc_nodes:
+            sv = _synthesize_reg_process(component_ir, reg_proc_nodes[0], module_name, py_cls=cls)
         else:
             sv = _build_comb_module(component_ir, module_name)
     else:
@@ -306,7 +320,26 @@ def _ir_expr_to_sv(expr, idx_to_name: dict) -> str:
         base = _ir_expr_to_sv(expr.value, idx_to_name)
         return f"{base}_{expr.attr}"
     if t == "ExprConstant":
-        return str(expr.value)
+        v = expr.value
+        if isinstance(v, int) and not isinstance(v, bool) and (v > 0xFFFF or v < -0x8000):
+            return f"32'h{v & 0xFFFFFFFF:08X}"
+        return str(v)
+    # Typed zdc built-in nodes
+    if t == "ExprSext":
+        val_sv = _ir_expr_to_sv(expr.value, idx_to_name)
+        n = expr.bits
+        shift = 32 - n
+        return f"($signed(({val_sv}) << {shift}) >>> {shift})"
+    if t == "ExprZext":
+        val_sv = _ir_expr_to_sv(expr.value, idx_to_name)
+        return f"{val_sv}[{expr.bits - 1}:0]"
+    if t == "ExprCbit":
+        inner_sv = _ir_expr_to_sv(expr.value, idx_to_name)
+        if type(expr.value).__name__ == "ExprCompare":
+            return inner_sv
+        return f"({inner_sv}[0])"
+    if t == "ExprSigned":
+        return f"$signed({_ir_expr_to_sv(expr.value, idx_to_name)})"
     if t == "ExprCall":
         # Reg.read() call: ExprCall(ExprAttribute(ExprRefField[i], 'read'), [])
         func = expr.func
@@ -315,11 +348,50 @@ def _ir_expr_to_sv(expr, idx_to_name: dict) -> str:
                 base = func.value
                 if base is not None and type(base).__name__ == "ExprRefField":
                     return idx_to_name.get(base.index, f"_f{base.index}")
+        # zdc built-in lowering
+        if func is not None and type(func).__name__ == "ExprRefUnresolved":
+            fname = func.name
+            args = getattr(expr, 'args', [])
+            if fname == "zdc.sext" and len(args) == 2:
+                val_sv = _ir_expr_to_sv(args[0], idx_to_name)
+                bits_val = getattr(args[1], 'value', None)
+                if isinstance(bits_val, int) and bits_val > 0:
+                    n = bits_val
+                    shift = 32 - n
+                    return f"($signed(({val_sv}) << {shift}) >>> {shift})"
+                bits_sv = _ir_expr_to_sv(args[1], idx_to_name)
+                return f"($signed(({val_sv}) << (32-{bits_sv})) >>> (32-{bits_sv}))"
+            if fname == "zdc.zext" and len(args) == 2:
+                val_sv = _ir_expr_to_sv(args[0], idx_to_name)
+                bits_val = getattr(args[1], 'value', None)
+                if isinstance(bits_val, int) and bits_val > 0:
+                    return f"{val_sv}[{bits_val-1}:0]"
+                bits_sv = _ir_expr_to_sv(args[1], idx_to_name)
+                return f"{val_sv}[{bits_sv}-1:0]"
+            if fname == "zdc.cbit" and len(args) == 1:
+                inner = args[0]
+                inner_sv = _ir_expr_to_sv(inner, idx_to_name)
+                # Comparison already produces 1-bit in SV — elide the cast.
+                if type(inner).__name__ == "ExprCompare":
+                    return inner_sv
+                return f"({inner_sv}[0])"
+            if fname == "zdc.signed" and len(args) == 1:
+                val_sv = _ir_expr_to_sv(args[0], idx_to_name)
+                return f"$signed({val_sv})"
+            if fname == "_illegal":
+                return "/* illegal */"
         # General call — emit as function call (fallback)
         if func is not None:
             fn_str = _ir_expr_to_sv(func, idx_to_name)
             args_str = ", ".join(_ir_expr_to_sv(a, idx_to_name) for a in getattr(expr, 'args', []))
             return f"{fn_str}({args_str})"
+    if t == "ExprBool":
+        op = getattr(expr, 'op', None)
+        op_name = getattr(op, 'name', str(op)) if op else 'And'
+        sv_op = '&&' if 'And' in str(op_name) else '||'
+        values = getattr(expr, 'values', [])
+        parts = [_ir_expr_to_sv(v, idx_to_name) for v in values]
+        return f"({f' {sv_op} '.join(parts)})"
     if t == "ExprBin":
         lhs = _ir_expr_to_sv(expr.lhs, idx_to_name)
         rhs = _ir_expr_to_sv(expr.rhs, idx_to_name)
@@ -330,6 +402,13 @@ def _ir_expr_to_sv(expr, idx_to_name: dict) -> str:
         operand = _ir_expr_to_sv(expr.operand, idx_to_name)
         op_name = expr.op.name if hasattr(expr.op, "name") else str(expr.op)
         sv_op = _UNOP_SV.get(op_name, op_name)
+        # Constant-fold invert: ~N → hex constant
+        if op_name == "Invert" and t == "ExprUnary":
+            inner = getattr(expr, 'operand', None)
+            if inner is not None and type(inner).__name__ == "ExprConstant":
+                v = getattr(inner, 'value', None)
+                if isinstance(v, int) and not isinstance(v, bool):
+                    return f"32'h{(~v) & 0xFFFFFFFF:08X}"
         return f"({sv_op}{operand})"
     if t == "ExprCompare":
         parts = [_ir_expr_to_sv(expr.left, idx_to_name)]
@@ -602,6 +681,42 @@ def _synthesize_simple_sync(
 # Hierarchical synthesis helpers
 # ---------------------------------------------------------------------------
 
+def _proc_has_await(proc) -> bool:
+    """Return True if *proc*'s body contains any ExprAwait statement."""
+    def _check_stmts(stmts):
+        for s in stmts or []:
+            t = type(s).__name__
+            if t == 'StmtExpr':
+                if type(getattr(s, 'expr', None)).__name__ == 'ExprAwait':
+                    return True
+            elif t == 'StmtAssign':
+                if type(getattr(s, 'value', None)).__name__ == 'ExprAwait':
+                    return True
+            # Recurse into body of while/for/if
+            for attr in ('body', 'orelse'):
+                sub = getattr(s, attr, None)
+                if isinstance(sub, list) and _check_stmts(sub):
+                    return True
+        return False
+    return _check_stmts(getattr(proc, 'body', []))
+
+
+def _has_protocol_port(component_ir) -> bool:
+    """Return True if the component has any ProtocolPort or ProtocolExport field."""
+    try:
+        from zuspec.ir.core.fields import FieldKind
+        port_kinds = (
+            FieldKind.ProtocolPort, FieldKind.ProtocolExport,
+            FieldKind.CallablePort, FieldKind.CallableExport,
+        )
+        for f in getattr(component_ir, 'fields', []):
+            if getattr(f, 'kind', None) in port_kinds:
+                return True
+    except ImportError:
+        pass
+    return False
+
+
 def _is_hierarchical(component_ir, ctx) -> bool:
     """Return True if the component has sub-component instance fields."""
     for f in component_ir.fields:
@@ -614,7 +729,25 @@ def _is_hierarchical(component_ir, ctx) -> bool:
     return False
 
 
-def _decode_bind_ref_h(expr, top_fields, ctx):
+def _bind_proxy_nested_index_to_name(sub_py_cls, bind_index: int):
+    """Map a bind-expression index to a field name for a sub-instance class.
+
+    ``_BindProxy`` builds nested field indices by iterating
+    ``field_type.__dataclass_fields__`` and skipping names that start with ``_``.
+    This function reproduces that mapping so that ``_decode_bind_ref_h`` can
+    correctly resolve sub-instance field references even when non-dataclass
+    fields such as ``clock_domain`` precede the user-visible fields.
+    """
+    idx = 0
+    for fname in sub_py_cls.__dataclass_fields__:
+        if not fname.startswith('_'):
+            if idx == bind_index:
+                return fname
+            idx += 1
+    return None
+
+
+def _decode_bind_ref_h(expr, top_fields, ctx, py_fields_meta=None):
     """Decode one side of a bind_map entry.
 
     Returns ``(inst_name, port_name, field_ir, is_bundle, struct_ir)``:
@@ -623,6 +756,11 @@ def _decode_bind_ref_h(expr, top_fields, ctx):
     - ``field_ir``: the IR field object.
     - ``is_bundle``: True when the field type is a struct (bundle/mirror).
     - ``struct_ir``: the struct IR if is_bundle, else None.
+
+    ``py_fields_meta`` is an optional dict mapping top-level field name →
+    ``(metadata, py_type)``.  When provided it is used to resolve sub-instance
+    field indices via ``_bind_proxy_nested_index_to_name`` so that the index
+    scheme matches the one used by ``_BindProxy`` during ``__bind__`` evaluation.
     """
     t = type(expr).__name__
     if t != "ExprRefField":
@@ -643,18 +781,555 @@ def _decode_bind_ref_h(expr, top_fields, ctx):
             sub_ir = ctx.type_m.get(dt.ref_name)
             if sub_ir:
                 sub_fields = list(sub_ir.fields)
-                sf = sub_fields[expr.index]
-                sf_dt = getattr(sf, "datatype", None)
-                is_bundle = False
-                struct_ir = None
-                if sf_dt and type(sf_dt).__name__ == "DataTypeRef":
-                    cand = ctx.type_m.get(sf_dt.ref_name)
-                    if cand and type(cand).__name__ == "DataTypeStruct":
-                        is_bundle = True
-                        struct_ir = cand
-                return (inst_name, sf.name, sf, is_bundle, struct_ir)
+
+                # Resolve the field name using the same index scheme that
+                # _BindProxy applies when building nested_indices: iterate
+                # __dataclass_fields__ and skip names starting with '_'.
+                # This handles classes where non-dataclass attributes like
+                # clock_domain shift the IR-vs-bind-index alignment.
+                sf_name = None
+                if py_fields_meta is not None:
+                    meta, sub_py_cls = py_fields_meta.get(inst_name, ({}, None))
+                    if sub_py_cls is not None and hasattr(sub_py_cls, '__dataclass_fields__'):
+                        sf_name = _bind_proxy_nested_index_to_name(sub_py_cls, expr.index)
+                if sf_name is not None:
+                    sf = next((f for f in sub_fields if f.name == sf_name), None)
+                else:
+                    # Fallback: direct IR index (works when clock_domain absent)
+                    sf = sub_fields[expr.index] if expr.index < len(sub_fields) else None
+
+                if sf is not None:
+                    sf_dt = getattr(sf, "datatype", None)
+                    is_bundle = False
+                    struct_ir = None
+                    if sf_dt and type(sf_dt).__name__ == "DataTypeRef":
+                        cand = ctx.type_m.get(sf_dt.ref_name)
+                        if cand and type(cand).__name__ == "DataTypeStruct":
+                            is_bundle = True
+                            struct_ir = cand
+                    return (inst_name, sf.name, sf, is_bundle, struct_ir)
 
     return (None, "?", None, False, None)
+
+
+# ---------------------------------------------------------------------------
+# Transactor-binding synthesis helpers (ProtocolFlattenPass)
+# ---------------------------------------------------------------------------
+
+def _get_protocol_signals(dut_py_cls, port_name: str) -> list:
+    """Return the protocol signal list for a protocol port on a DUT class.
+
+    Inspects the Python protocol class carried by the port annotation — the same
+    semantic source that IfProtocolLowerPass and the SPRTL sv_codegen use to
+    derive signal names.  This avoids parsing any generated text.
+
+    Returns a list of ``(signal_name, role, bits, method_name, param_idx)`` tuples:
+      ``role`` is one of:
+        'req_valid'  — async DUT-driven valid / request signal (SPRTL FSMPortCall)
+        'req_arg'    — async DUT-driven argument signal (param_idx = 0-based position)
+        'resp_ack'   — transactor-driven acknowledgement signal
+        'resp_data'  — transactor-driven response-data signal
+        'sync_valid' — sync DUT-driven valid for fire-and-forget (SPRTL FSMPortOutput)
+        'sync_arg'   — sync DUT-driven argument signal for fire-and-forget
+
+    Argument signals use ``arg{N}`` suffixes to match the naming emitted by the
+    SPRTL sv_codegen (``{prefix}_arg{i}``).  Parameter names are NOT used so that
+    the signal names align exactly with the synthesized DUT port declarations.
+
+    Sync (non-async) protocol methods map to ``FSMPortOutput`` in the SPRTL:
+    the DUT asserts ``valid`` and ``arg{i}`` for one cycle with no handshake
+    (no ack, no rdata).  Transactors observe these signals but must not drive
+    them.
+    """
+    import dataclasses as _dc
+    import inspect
+
+    from zuspec.synth.passes.if_protocol_lower import _annotation_bits
+
+    proto_cls = None
+    if hasattr(dut_py_cls, '__dataclass_fields__'):
+        for pf in _dc.fields(dut_py_cls):
+            if pf.name == port_name:
+                proto_cls = pf.type
+                break
+    if proto_cls is None:
+        return []
+
+    signals = []
+    all_methods = sorted([
+        (name, member)
+        for name, member in inspect.getmembers(proto_cls, predicate=inspect.isfunction)
+        if not name.startswith('_')
+    ])
+    for method_name, method in all_methods:
+        try:
+            sig = inspect.signature(method)
+        except (ValueError, TypeError):
+            continue
+        prefix = f"{port_name}_{method_name}"
+        if inspect.iscoroutinefunction(method):
+            # Async request/response handshake (FSMPortCall).
+            signals.append((f"{prefix}_valid", 'req_valid', 1, method_name, None))
+            arg_idx = 0
+            for pname, param in sig.parameters.items():
+                if pname == 'self':
+                    continue
+                bits = _annotation_bits(param.annotation)
+                signals.append((f"{prefix}_arg{arg_idx}", 'req_arg', bits, method_name, arg_idx))
+                arg_idx += 1
+            signals.append((f"{prefix}_ack", 'resp_ack', 1, method_name, None))
+            ret = sig.return_annotation
+            if ret is not inspect.Parameter.empty and ret is not type(None) and ret is not None:
+                signals.append((f"{prefix}_rdata", 'resp_data', _annotation_bits(ret), method_name, None))
+        else:
+            # Sync fire-and-forget method (FSMPortOutput): DUT drives valid+args
+            # for one cycle; there is no handshake, no ack, no rdata.
+            # Transactors observe but must NOT drive these signals.
+            signals.append((f"{prefix}_valid", 'sync_valid', 1, method_name, None))
+            arg_idx = 0
+            for pname, param in sig.parameters.items():
+                if pname == 'self':
+                    continue
+                bits = _annotation_bits(param.annotation)
+                signals.append((f"{prefix}_arg{arg_idx}", 'sync_arg', bits, method_name, arg_idx))
+                arg_idx += 1
+    return signals
+
+
+def _infer_sync_method_roles(func_def, method_name: str,
+                              param_idx_map: dict, field_roles: dict) -> None:
+    """Populate *field_roles* from a synchronous (non-async) protocol method body.
+
+    Inference rules (assignments anywhere in the body):
+    * ``self.field = 1``          → sync_valid:method_name
+    * ``self.field = param_name`` → sync_arg:method_name:N  (N = parameter index)
+    """
+    import ast as _ast
+    for node in _ast.walk(func_def):
+        if not isinstance(node, _ast.Assign):
+            continue
+        for target in node.targets:
+            if not (isinstance(target, _ast.Attribute)
+                    and isinstance(target.value, _ast.Name)
+                    and target.value.id == 'self'):
+                continue
+            fname = target.attr
+            val = node.value
+            if fname in field_roles:
+                continue
+            if isinstance(val, _ast.Constant) and val.value == 1:
+                field_roles[fname] = f'sync_valid:{method_name}'
+            elif isinstance(val, _ast.Name) and val.id in param_idx_map:
+                field_roles[fname] = f'sync_arg:{method_name}:{param_idx_map[val.id]}'
+
+
+def _infer_async_method_roles(func_def, method_name: str,
+                               param_idx_map: dict, field_roles: dict) -> None:
+    """Populate *field_roles* from an async protocol method body.
+
+    Inference rules (top-level statements only):
+    * ``self.field = 1``                  → req_valid:method_name
+    * ``self.field = param_name``         → req_arg:method_name:N
+    * ``while not self.field: await ...`` → resp_ack:method_name
+    * ``return self.field``               → resp_data:method_name
+    * ``self.field = 0``                  → ignored (cleanup assignment)
+    """
+    import ast as _ast
+    for stmt in func_def.body:
+        if isinstance(stmt, _ast.Assign):
+            for target in stmt.targets:
+                if not (isinstance(target, _ast.Attribute)
+                        and isinstance(target.value, _ast.Name)
+                        and target.value.id == 'self'):
+                    continue
+                fname = target.attr
+                val = stmt.value
+                if fname in field_roles:
+                    continue
+                if isinstance(val, _ast.Constant) and val.value == 1:
+                    field_roles[fname] = f'req_valid:{method_name}'
+                elif isinstance(val, _ast.Name) and val.id in param_idx_map:
+                    field_roles[fname] = f'req_arg:{method_name}:{param_idx_map[val.id]}'
+        elif isinstance(stmt, _ast.While):
+            # while not self.field: await ... → resp_ack
+            test = stmt.test
+            if (isinstance(test, _ast.UnaryOp)
+                    and isinstance(test.op, _ast.Not)
+                    and isinstance(test.operand, _ast.Attribute)
+                    and isinstance(test.operand.value, _ast.Name)
+                    and test.operand.value.id == 'self'):
+                fname = test.operand.attr
+                if fname not in field_roles:
+                    field_roles[fname] = f'resp_ack:{method_name}'
+        elif isinstance(stmt, _ast.Return):
+            # return self.field → resp_data
+            val = stmt.value
+            if (isinstance(val, _ast.Attribute)
+                    and isinstance(val.value, _ast.Name)
+                    and val.value.id == 'self'):
+                fname = val.attr
+                if fname not in field_roles:
+                    field_roles[fname] = f'resp_data:{method_name}'
+
+
+def _infer_field_roles_from_protocol_methods(xactor_py_cls, method_types: dict) -> dict:
+    """Return a field-name → role-spec dict by parsing protocol method bodies.
+
+    *method_types* maps method_name → ``'async'`` | ``'sync'``.  Each method
+    is retrieved from *xactor_py_cls*, its source is parsed with ``ast``, and
+    inference rules are applied to assign protocol roles to self-fields.
+
+    Roles are strings in the same format used by ``_build_transactor_rename_map``
+    (e.g. ``'req_valid:read_word'``, ``'sync_arg:on_retire:2'``).
+    """
+    import ast as _ast
+    import inspect as _inspect
+    import textwrap as _textwrap
+
+    field_roles: dict[str, str] = {}
+    for method_name, kind in method_types.items():
+        fn = getattr(xactor_py_cls, method_name, None)
+        if fn is None:
+            continue
+        try:
+            src = _textwrap.dedent(_inspect.getsource(fn))
+            func_def = _ast.parse(src).body[0]
+            params = [a.arg for a in func_def.args.args if a.arg != 'self']
+            param_idx_map = {p: i for i, p in enumerate(params)}
+            if kind == 'async':
+                _infer_async_method_roles(func_def, method_name, param_idx_map, field_roles)
+            else:
+                _infer_sync_method_roles(func_def, method_name, param_idx_map, field_roles)
+        except Exception:
+            pass  # gracefully skip methods that cannot be parsed
+    return field_roles
+
+
+def _build_transactor_rename_map(xactor_py_cls, xactor_fields, protocol_signals: list,
+                                 xactor_inst_name: str) -> dict:
+    """Build field-name → SV-signal-name map for a transactor component.
+
+    Infers which fields correspond to DUT protocol signals by analyzing the
+    transactor's protocol method implementations — no explicit annotations needed.
+
+    For each protocol method the transactor implements:
+
+    * **Async methods** (``async def read_word``, etc.):
+      - ``self.field = 1`` before any ``await``  → req_valid
+      - ``self.field = param``                   → req_arg:N  (N = parameter index)
+      - ``while not self.field: await ...``       → resp_ack
+      - ``return self.field``                    → resp_data
+
+    * **Sync methods** (``def on_retire``, etc.):
+      - ``self.field = 1``          → sync_valid
+      - ``self.field = param``      → sync_arg:N
+
+    Fields that do not appear in any protocol method body are treated as
+    internal state and prefixed with the transactor instance name.
+
+    ``protocol_signals`` is the list returned by ``_get_protocol_signals``
+    (5-tuples: ``(sig_name, role, bits, method_name, param_idx)``).
+
+    Returns a plain dict mapping each field's Python name to its SV signal name.
+    """
+    # Determine which methods are async vs sync from the protocol signal roles.
+    method_types: dict[str, str] = {}
+    for _sig, role, _bits, method_name, _pidx in protocol_signals:
+        if role in ('sync_valid', 'sync_arg'):
+            method_types[method_name] = 'sync'
+        else:
+            method_types[method_name] = 'async'
+
+    # Infer field → role-spec from protocol method bodies via AST analysis.
+    field_roles = _infer_field_roles_from_protocol_methods(xactor_py_cls, method_types)
+
+    # Build lookup: (role, method_name, param_idx) → signal_name
+    signal_lookup: dict[tuple, str] = {}
+    for sig_name, role, _bits, method_name, param_idx in protocol_signals:
+        signal_lookup[(role, method_name, param_idx)] = sig_name
+
+    rename_map: dict[str, str] = {}
+    for f in xactor_fields:
+        role_spec = field_roles.get(f.name)
+        if role_spec:
+            parts = role_spec.split(':')
+            role = parts[0]
+            if len(parts) == 2:
+                sig_name = signal_lookup.get((role, parts[1], None))
+                if sig_name:
+                    rename_map[f.name] = sig_name
+                    continue
+            elif len(parts) == 3:
+                try:
+                    param_idx = int(parts[2])
+                except ValueError:
+                    param_idx = None
+                sig_name = signal_lookup.get((role, parts[1], param_idx))
+                if sig_name:
+                    rename_map[f.name] = sig_name
+                    continue
+        # No inferred role → internal state register
+        rename_map[f.name] = f"{xactor_inst_name}_{f.name}"
+
+    return rename_map
+
+
+def _synthesize_with_transactor_binding(
+    cls, component_ir, ctx, module_name: str,
+    dut_inst_name: str, dut_entry,
+    transactor_bindings: list,
+    bundle_forwarding: dict = None,
+) -> str:
+    """Generate a flat SV module with DUT sub-instance + one inlined transactor FSM per binding.
+
+    ``transactor_bindings`` is a list of ``(dut_port_name, xactor_inst_name, xactor_entry)``
+    tuples — one per bound (DUT protocol port, transactor instance) pair.
+
+    All bindings must reference the same DUT instance (``dut_inst_name``).
+
+    For each transactor, the ``@zdc.sync`` FSM is inlined as an ``always_ff`` block.
+    Transactor fields are categorised as:
+
+    * **Protocol wires** (``mb_role`` annotation) — DUT ↔ transactor handshake;
+      declared as ``logic`` internal wires.
+    * **External output ports** (``is_out=True`` on the IR field, no ``mb_role``) —
+      become output ports of the wrapper module.
+    * **External input ports** (``is_out=False`` on the IR field, no ``mb_role``) —
+      become input ports of the wrapper module.
+    * **Internal state** (all others) — declared as ``logic`` internal wires prefixed
+      with the transactor instance name.
+
+    DUT-driven signals (``req_valid``, ``req_arg``, ``sync_valid``, ``sync_arg``)
+    are excluded from the transactor reset clause; they are driven by the DUT only.
+    External input ports are also excluded — they are driven from outside the module.
+    """
+    import dataclasses as _dc
+
+    _dut_name, dut_type_name, dut_ir, dut_py_cls = dut_entry
+
+    # DUT-driven roles: the transactor observes these but never resets or assigns them.
+    _DUT_DRIVEN_ROLES = frozenset({'req_valid', 'req_arg', 'sync_valid', 'sync_arg'})
+
+    # ------------------------------------------------------------------ #
+    # 1. Per-binding: protocol signals, rename map, sync process body.   #
+    # ------------------------------------------------------------------ #
+    binding_data = []   # (dut_port_name, xactor_inst_name, protocol_signals, rename_map,
+                        #  xactor_fields, xactor_defaults, xactor_idx_to_name, process_ir)
+    all_protocol_signals = []
+
+    for dut_port_name, xactor_inst_name, xactor_entry in transactor_bindings:
+        _xn, _xt, xactor_ir, xactor_py_cls = xactor_entry
+
+        protocol_signals = _get_protocol_signals(dut_py_cls, dut_port_name)
+        if not protocol_signals:
+            raise ValueError(
+                f"Could not determine protocol signals for {dut_type_name}.{dut_port_name}; "
+                f"ensure the field is typed as a typing.Protocol or IfProtocol subclass."
+            )
+        all_protocol_signals.extend(protocol_signals)
+
+        xactor_fields = list(xactor_ir.fields)
+        rename_map = _build_transactor_rename_map(
+            xactor_py_cls, xactor_fields, protocol_signals, xactor_inst_name
+        )
+
+        # Apply bundle forwarding overrides: for bundle fields on this transactor
+        # that are forwarded to a top-level port (e.g. self.mem_xactor.bus → self.mem),
+        # rename the bundle field to the top-level wire base so that IR attribute
+        # accesses (ExprAttribute(bus, 'addr')) resolve to 'mem_addr' not 'mem_xactor_bus_addr'.
+        if bundle_forwarding:
+            for f in xactor_fields:
+                key = (xactor_inst_name, f.name)
+                if key in bundle_forwarding:
+                    top_wire_base, _ = bundle_forwarding[key]
+                    rename_map[f.name] = top_wire_base
+
+        xactor_idx_to_name = {i: rename_map[f.name] for i, f in enumerate(xactor_fields)}
+
+        sync_processes = getattr(xactor_ir, 'sync_processes', [])
+        if not sync_processes:
+            raise ValueError(
+                f"Transactor for {dut_port_name} has no @zdc.sync process; "
+                f"cannot generate inlined FSM."
+            )
+        xactor_process_ir = sync_processes[0]
+
+        xactor_defaults: dict[str, int] = {}
+        if xactor_py_cls and hasattr(xactor_py_cls, '__dataclass_fields__'):
+            for pf in _dc.fields(xactor_py_cls):
+                if pf.default is not _dc.MISSING and pf.default is not None:
+                    try:
+                        xactor_defaults[pf.name] = int(pf.default)
+                    except (TypeError, ValueError):
+                        pass
+
+        binding_data.append((
+            dut_port_name, xactor_inst_name, protocol_signals,
+            rename_map, xactor_fields, xactor_defaults, xactor_idx_to_name,
+            xactor_process_ir, xactor_py_cls,
+        ))
+
+    # ------------------------------------------------------------------ #
+    # 2. Build name sets for quick categorisation.                        #
+    # ------------------------------------------------------------------ #
+    all_proto_names = {s[0] for s in all_protocol_signals}
+    dut_driven_names = {s[0] for s in all_protocol_signals if s[1] in _DUT_DRIVEN_ROLES}
+
+    # ------------------------------------------------------------------ #
+    # 3. Synthesize the DUT sub-module.                                   #
+    # ------------------------------------------------------------------ #
+    dut_sv = _synthesize_sprtl(dut_py_cls, reset_style="sync_low")
+    module_start = dut_sv.find('\nmodule ')
+    stripped_dut = dut_sv[module_start + 1:] if module_start >= 0 else dut_sv
+
+    # DUT port connections: clk, rst_n + all protocol signals.
+    dut_port_connections = [("clk", "clk"), ("rst_n", "rst_n")]
+    for sig_name, _role, _bits, _mname, _pidx in all_protocol_signals:
+        dut_port_connections.append((sig_name, sig_name))
+
+    # ------------------------------------------------------------------ #
+    # 4. Categorise all transactor fields across all bindings.            #
+    # ------------------------------------------------------------------ #
+    # Per binding: build (reset_clause, always_ff_body, ext_outputs, ext_inputs, internals)
+    all_ext_outputs = []   # (sig_name, bits)  — wrapper output ports
+    all_ext_inputs  = []   # (sig_name, bits)  — wrapper input ports
+    all_internals   = []   # (sig_name, bits)  — internal logic wires/regs
+    per_binding_reset_and_body = []
+
+    for (dut_port_name, xactor_inst_name, protocol_signals,
+         rename_map, xactor_fields, xactor_defaults, xactor_idx_to_name,
+         xactor_process_ir, xactor_py_cls) in binding_data:
+
+        reset_clause = []
+        for f in xactor_fields:
+            new_name = rename_map[f.name]
+            bits = _field_bits(f)
+            f_is_out = getattr(f, 'is_out', None)
+
+            if new_name in all_proto_names:
+                # Protocol wire: DUT↔transactor handshake.
+                # DUT-driven signals must not appear in the transactor reset clause.
+                if new_name not in dut_driven_names:
+                    reset_val = xactor_defaults.get(f.name, 0)
+                    reset_clause.append((new_name, reset_val))
+                # Wire declared below from all_protocol_signals (don't add to internals).
+            elif f_is_out is True:
+                # External output port: add to wrapper ports + reset clause.
+                all_ext_outputs.append((new_name, bits))
+                reset_val = xactor_defaults.get(f.name, 0)
+                reset_clause.append((new_name, reset_val))
+            elif f_is_out is False:
+                # External input port: add to wrapper ports; never reset by transactor.
+                all_ext_inputs.append((new_name, bits))
+            elif bundle_forwarding and (xactor_inst_name, f.name) in bundle_forwarding:
+                # Bundle field forwarded to a top-level port group: expand struct fields
+                # into individual input/output ports using the top-level name prefix.
+                top_wire_base, struct_ir_fwd = bundle_forwarding[(xactor_inst_name, f.name)]
+                if struct_ir_fwd is None:
+                    dt = getattr(f, 'datatype', None)
+                    if dt and type(dt).__name__ == "DataTypeRef":
+                        struct_ir_fwd = ctx.type_m.get(dt.ref_name)
+                if struct_ir_fwd is None:
+                    raise ValueError(
+                        f"Cannot resolve struct IR for bundle field {f.name!r} on "
+                        f"transactor {xactor_inst_name!r}. Ensure the bundle type "
+                        f"is registered in the DataModelFactory context."
+                    )
+                # Check if this field is declared as a mirror on the transactor,
+                # which would invert output/input directions.
+                is_mirror = False
+                if xactor_py_cls and hasattr(xactor_py_cls, '__dataclass_fields__'):
+                    for pf in _dc.fields(xactor_py_cls):
+                        if pf.name == f.name:
+                            is_mirror = pf.metadata.get('kind') == 'mirror'
+                            break
+                for sf in struct_ir_fwd.fields:
+                    port_name = f"{top_wire_base}_{sf.name}"
+                    port_bits = _field_bits(sf)
+                    sf_is_out = getattr(sf, 'is_out', True)
+                    if is_mirror:
+                        sf_is_out = not sf_is_out
+                    if sf_is_out:
+                        all_ext_outputs.append((port_name, port_bits))
+                        reset_clause.append((port_name, 0))
+                    else:
+                        all_ext_inputs.append((port_name, port_bits))
+                # Bundle expanded into ports — do not add a single-wire internal.
+            else:
+                # Internal state register.
+                all_internals.append((new_name, bits))
+                reset_val = xactor_defaults.get(f.name, 0)
+                reset_clause.append((new_name, reset_val))
+
+        body_lines = list(_ir_stmts_to_sv(
+            getattr(xactor_process_ir, 'body', []), xactor_idx_to_name, 4
+        ))
+        per_binding_reset_and_body.append((reset_clause, body_lines))
+
+    # ------------------------------------------------------------------ #
+    # 5. Emit the flat module.                                            #
+    # ------------------------------------------------------------------ #
+    lines = ["// Generated by zuspec-synth", "`timescale 1ns/1ps", ""]
+    lines.append(stripped_dut.rstrip())
+    lines.append("")
+
+    # Module port list: clk/rst_n + external transactor ports.
+    port_lines = [
+        "  input  logic        clk,",
+        "  input  logic        rst_n",
+    ]
+    for sig_name, bits in all_ext_inputs:
+        port_lines.append(f"  input  logic {_width_str(bits)}{sig_name},")
+    for sig_name, bits in all_ext_outputs:
+        port_lines.append(f"  output logic {_width_str(bits)}{sig_name},")
+
+    # Build module header: last port has no trailing comma.
+    # (Current port_lines already has comma-free clk/rst_n and commas on all others)
+    # Re-emit correctly: add commas to all-but-last.
+    all_ports = [p.rstrip(',') for p in port_lines]
+    lines.append(f"module {module_name} (")
+    for i, pl in enumerate(all_ports):
+        comma = "," if i < len(all_ports) - 1 else ""
+        lines.append(f"{pl}{comma}")
+    lines.append(");")
+    lines.append("")
+
+    # Internal wire declarations for all protocol signals.
+    for sig_name, _role, bits, _mname, _pidx in all_protocol_signals:
+        lines.append(f"  logic {_width_str(bits)}{sig_name};")
+
+    # Internal state declarations.
+    for sig_name, bits in all_internals:
+        lines.append(f"  logic {_width_str(bits)}{sig_name};")
+    lines.append("")
+
+    # DUT sub-instance.
+    port_conn_sv = ",\n".join(f"    .{p}({w})" for p, w in dut_port_connections)
+    lines.append(f"  {dut_type_name} {dut_inst_name}_inst (")
+    lines.append(port_conn_sv)
+    lines.append("  );")
+    lines.append("")
+
+    # One always_ff per transactor binding.
+    for (reset_clause, body_lines) in per_binding_reset_and_body:
+        lines.append("  always_ff @(posedge clk) begin")
+        if reset_clause:
+            lines.append("    if (!rst_n) begin")
+            for sig_name, reset_val in reset_clause:
+                lines.append(f"      {sig_name} <= {reset_val};")
+            lines.append("    end else begin")
+            for sv_line in body_lines:
+                lines.append(sv_line)
+            lines.append("    end")
+        else:
+            for sv_line in body_lines:
+                lines.append("  " + sv_line)
+        lines.append("  end")
+        lines.append("")
+
+    lines.append("endmodule")
+
+    return "\n".join(lines) + "\n"
 
 
 def _synthesize_hierarchical(cls, component_ir, ctx, module_name: str) -> str:
@@ -701,8 +1376,8 @@ def _synthesize_hierarchical(cls, component_ir, ctx, module_name: str) -> str:
     bundle_wire_groups = []
 
     for bind in component_ir.bind_map:
-        lhs_info = _decode_bind_ref_h(bind.lhs, top_fields, ctx)
-        rhs_info = _decode_bind_ref_h(bind.rhs, top_fields, ctx)
+        lhs_info = _decode_bind_ref_h(bind.lhs, top_fields, ctx, py_fields_meta)
+        rhs_info = _decode_bind_ref_h(bind.rhs, top_fields, ctx, py_fields_meta)
         lhs_inst, lhs_port, _lf, lhs_is_bundle, lhs_struct = lhs_info
         rhs_inst, rhs_port, _rf, rhs_is_bundle, rhs_struct = rhs_info
 
@@ -728,6 +1403,58 @@ def _synthesize_hierarchical(cls, component_ir, ctx, module_name: str) -> str:
         elif rhs_inst and not lhs_inst:
             bound_ports.add((rhs_inst, rhs_port))
             inst_port_to_top[(rhs_inst, rhs_port)] = lhs_port
+
+    # ------------------------------------------------------------------ #
+    # 2b. Detect transactor bindings                                       #
+    #                                                                      #
+    # A transactor binding exists when a sub-instance's protocol port is  #
+    # bound to ANOTHER sub-instance component (not a top-level scalar).   #
+    # e.g. {self.core.mem: self.mem_xactor} gives                         #
+    # inst_port_to_top[('core','mem')] = 'mem_xactor'                     #
+    # and 'mem_xactor' is in sub_inst_names.                              #
+    #                                                                      #
+    # Collect ALL such bindings, validate a single DUT instance, then     #
+    # delegate to _synthesize_with_transactor_binding.                    #
+    # ------------------------------------------------------------------ #
+    sub_inst_names = {inst_name for inst_name, _, _, _ in sub_insts}
+    transactor_bindings = []  # (dut_port_name, xactor_inst_name, xactor_entry)
+    dut_inst_for_binding = None
+
+    for (inst_name, port_name), top_name in inst_port_to_top.items():
+        if top_name in sub_inst_names:
+            if dut_inst_for_binding is None:
+                dut_inst_for_binding = inst_name
+            elif dut_inst_for_binding != inst_name:
+                raise ValueError(
+                    f"Multiple DUT instances ({dut_inst_for_binding!r}, {inst_name!r}) "
+                    f"have transactor bindings — only one DUT per transactor wrapper "
+                    f"is supported."
+                )
+            dut_entry = next(e for e in sub_insts if e[0] == inst_name)
+            xactor_entry = next(e for e in sub_insts if e[0] == top_name)
+            transactor_bindings.append((port_name, top_name, xactor_entry))
+
+    if transactor_bindings:
+        dut_entry = next(e for e in sub_insts if e[0] == dut_inst_for_binding)
+
+        # Collect bundle forwarding info: bindings like (self.mem, self.mem_xactor.bus)
+        # where one side is a top-level bundle and the other is a sub-instance bundle.
+        # Maps (xactor_inst_name, bundle_field_name) → (top_wire_base, struct_ir).
+        xactor_bundle_forwarding = {}
+        for wire_base, struct_ir, lhs_inst, lhs_port, rhs_inst, rhs_port in bundle_wire_groups:
+            if lhs_inst is None and rhs_inst is not None:
+                top_wire_base = lhs_port
+                xactor_bundle_forwarding[(rhs_inst, rhs_port)] = (top_wire_base, struct_ir)
+            elif rhs_inst is None and lhs_inst is not None:
+                top_wire_base = rhs_port
+                xactor_bundle_forwarding[(lhs_inst, lhs_port)] = (top_wire_base, struct_ir)
+
+        return _synthesize_with_transactor_binding(
+            cls, component_ir, ctx, module_name,
+            dut_inst_for_binding, dut_entry,
+            transactor_bindings,
+            bundle_forwarding=xactor_bundle_forwarding,
+        )
 
     # ------------------------------------------------------------------ #
     # 3. Collect unbound sub-instance ports → expose at top level          #
@@ -840,21 +1567,50 @@ def _synthesize_hierarchical(cls, component_ir, ctx, module_name: str) -> str:
     return header + "\n".join(sub_sv_parts) + "\n" + "\n".join(wrapper_lines) + "\n"
 
 
-def _synthesize_reg_process(component_ir, process_ir, module_name: str) -> str:
+def _synthesize_reg_process(component_ir, process_ir, module_name: str, py_cls=None) -> str:
     """Emit an always @(posedge clock or posedge reset) module for a @zdc.proc register process.
 
-    Handles the 'while True: await reg.write(...)' pattern. Uses Verilog-2005
-    style (reg, always, <=) for Yosys compatibility.
+    Handles both the old ``zdc.Reg``-based pattern and the new ``zdc.field``
+    proc-owned register pattern (``while True: self.x = ...; await zdc.tick()``).
+    Uses Verilog-2005 style (reg, always, <=) for Yosys compatibility.
     """
+    import dataclasses as _dc
     fields = list(component_ir.fields)
     idx_to_name = {i: f.name for i, f in enumerate(fields)}
 
-    # Collect Reg output fields
-    reg_fields = [f for f in fields if getattr(f, 'is_reg', False)]
+    # Collect Python field defaults so we can generate reset values.
+    py_defaults = {}
+    if py_cls and hasattr(py_cls, "__dataclass_fields__"):
+        for pf in _dc.fields(py_cls):
+            if pf.default is not _dc.MISSING:
+                py_defaults[pf.name] = pf.default
+            elif pf.default_factory is not _dc.MISSING:
+                try:
+                    py_defaults[pf.name] = pf.default_factory()
+                except Exception:
+                    pass
+
+    # Collect state registers:
+    # 1) Old-style: zdc.Reg fields (is_reg=True on FieldInOut)
+    # 2) New-style: plain Field objects (proc-owned zdc.field) that are not ports
+    reg_fields = []
+    for f in fields:
+        ft = type(f).__name__
+        if ft == "FieldInOut" and getattr(f, "is_reg", False):
+            rv = getattr(f, "reset_value", None)
+            if rv is None:
+                rv = py_defaults.get(f.name, 0)
+            reg_fields.append((f, rv))
+        elif ft == "Field" and getattr(f, "is_out", None) is None:
+            # Proc-owned state field — expose as output reg for observability.
+            rv = getattr(f, "reset_value", None)
+            if rv is None:
+                rv = py_defaults.get(f.name, 0)
+            reg_fields.append((f, rv))
 
     # --- Port list ---
     port_lines = ["    input clock", "    input reset"]
-    for f in reg_fields:
+    for f, _rv in reg_fields:
         bits = _field_bits(f)
         w = f"[{bits-1}:0] " if bits > 1 else ""
         port_lines.append(f"    output reg {w}{f.name}")
@@ -867,8 +1623,7 @@ def _synthesize_reg_process(component_ir, process_ir, module_name: str) -> str:
     # --- always block ---
     lines.append("  always @(posedge clock or posedge reset) begin")
     lines.append("    if (reset) begin")
-    for f in reg_fields:
-        rv = f.reset_value if f.reset_value is not None else 0
+    for f, rv in reg_fields:
         lines.append(f"      {f.name} <= {rv};")
     lines.append("    end else begin")
 
