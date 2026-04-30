@@ -317,3 +317,249 @@ def test_inheritance_override_replaces_parent():
     override_val = list(override_blocks[0].conditions.values())
     assert base_val != override_val, (
         f"Base and override should encode different values: {base_val} vs {override_val}")
+
+
+# ---------------------------------------------------------------------------
+# OR-guard splitting tests
+# ---------------------------------------------------------------------------
+
+@zdc.dataclass
+class _OrGuardAction:
+    """Instruction class with OR-condition guards (e.g. immediate decode)."""
+    instr  : zdc.u8 = zdc.input()
+
+    is_ld  : zdc.u1 = zdc.rand()
+    is_st  : zdc.u1 = zdc.rand()
+    kind   : zdc.u2 = zdc.rand()
+
+    @constraint
+    def c_ld_st(self):
+        # Opcode 1 or opcode 2 → is_ld=1
+        if self.instr[3:2] == 1 or self.instr[3:2] == 2:
+            assert self.is_ld == 1
+
+    @constraint
+    def c_store(self):
+        if self.instr[3:2] == 3:
+            assert self.is_st == 1
+
+    @constraint
+    def c_kind(self):
+        if self.instr[1:0] == 0:
+            assert self.kind == 0
+        if self.instr[1:0] == 1:
+            assert self.kind == 1
+        if self.instr[1:0] == 2:
+            assert self.kind == 2
+
+
+def test_or_guard_splits_into_two_blocks():
+    """OR-condition guard produces two ConstraintBlocks, one per arm."""
+    cc = ConstraintCompiler(_OrGuardAction)
+    cc.extract()
+    ld_blocks = [b for b in cc.cset.constraints if b.name.startswith('c_ld_st')]
+    assert len(ld_blocks) == 2, f"Expected 2 blocks for OR guard, got {len(ld_blocks)}"
+    # Each arm should have a different condition value.
+    vals = sorted([list(b.conditions.values())[0] for b in ld_blocks])
+    assert vals == [1, 2], f"Expected condition values [1, 2], got {vals}"
+
+
+def test_or_guard_blocks_have_same_assignment():
+    """All blocks from an OR expansion share the same assignments."""
+    cc = ConstraintCompiler(_OrGuardAction)
+    cc.extract()
+    ld_blocks = [b for b in cc.cset.constraints if b.name.startswith('c_ld_st')]
+    for b in ld_blocks:
+        assert b.assignments.get('is_ld') == 1
+
+
+def test_or_guard_full_pipeline():
+    """OR-guard action runs through full pipeline without errors."""
+    cc = ConstraintCompiler(_OrGuardAction)
+    cc.extract()
+    cc.compute_support()
+    cc.build_cubes()
+    cc.minimize()
+    sv = '\n'.join(cc.emit_sv())
+    assert 'is_ld' in sv
+    assert 'is_st' in sv
+    assert 'kind' in sv
+
+
+# ---------------------------------------------------------------------------
+# Tuple parsing tests
+# ---------------------------------------------------------------------------
+
+def test_tuple_parses_in_constraint_parser():
+    """ast.Tuple nodes are parsed to {'type': 'tuple', ...} without raising."""
+    import ast
+    from zuspec.dataclasses.constraint_parser import ConstraintParser
+
+    src = "x == zdc.concat((0, 4), y)"
+    tree = ast.parse(src, mode='eval')
+    # The tuple (0, 4) is an argument to concat; parse_expr should not raise.
+    parser = ConstraintParser()
+    # Extract the concat call argument
+    call = tree.body.comparators[0]
+    result = parser.parse_expr(call.args[0])  # (0, 4)
+    assert result['type'] == 'tuple', f"Expected 'tuple', got {result['type']}"
+    assert len(result['elts']) == 2
+
+
+# ---------------------------------------------------------------------------
+# Expression assignment (sext/concat) tests
+# ---------------------------------------------------------------------------
+
+MASK32 = 0xFFFFFFFF
+
+
+@zdc.dataclass
+class _ImmDecodeAction:
+    """Minimal immediate-decode pattern: sext with subscript RHS."""
+    instr : zdc.u32 = zdc.input()
+    imm   : zdc.u32 = zdc.rand()
+
+    @constraint
+    def c_itype(self):
+        if self.instr[6:0] == 0x13:
+            assert self.imm == zdc.sext(self.instr[31:20], 12) & MASK32
+
+    @constraint
+    def c_utype(self):
+        if self.instr[6:0] == 0x37:
+            assert self.imm == 0  # constant block alongside expression blocks
+
+
+def test_expr_assignment_detected_as_expr_field():
+    """imm field is detected as an expression field (bypasses SOP)."""
+    cc = ConstraintCompiler(_ImmDecodeAction)
+    cc.extract()
+    assert 'imm' in cc._expr_fields, "imm should be in _expr_fields"
+
+
+def test_constant_block_alongside_expr_block_coerced_to_expr_path():
+    """Block with constant assignment for an expr field is treated as expr path."""
+    cc = ConstraintCompiler(_ImmDecodeAction)
+    cc.extract()
+    # Both blocks should be in constraints
+    itype_blocks = [b for b in cc.cset.constraints if 'itype' in b.name]
+    utype_blocks = [b for b in cc.cset.constraints if 'utype' in b.name]
+    assert len(itype_blocks) == 1
+    assert len(utype_blocks) == 1
+    # The constant block should still have its assignment recorded
+    assert utype_blocks[0].assignments.get('imm') == 0
+
+
+def test_expr_field_excluded_from_sop_cubes():
+    """imm field produces no cubes in the SOP pipeline."""
+    cc = ConstraintCompiler(_ImmDecodeAction)
+    cc.extract()
+    cc.compute_support()
+    cc.build_cubes()
+    # imm is an expr field — no cubes should exist for it
+    imm_cube_keys = [k for k in cc._cubes_by_bit if 'imm' in k]
+    for key in imm_cube_keys:
+        assert cc._cubes_by_bit[key] == [], f"Expected empty cubes for {key}"
+
+
+def test_expr_field_emits_structural_mux():
+    """emit_sv generates structural priority-mux wires for imm."""
+    cc = ConstraintCompiler(_ImmDecodeAction)
+    cc.extract()
+    cc.compute_support()
+    cc.build_cubes()
+    cc.minimize()
+    sv = '\n'.join(cc.emit_sv())
+    # Should have per-block wires
+    assert 'd_imm_c0' in sv, f"Expected d_imm_c0 wire in:\n{sv}"
+    assert 'd_imm_c1' in sv, f"Expected d_imm_c1 wire in:\n{sv}"
+    # Should have assign d_imm = ...
+    assert 'assign d_imm' in sv, f"Expected assign d_imm in:\n{sv}"
+    # Should contain sext-style bit-replication pattern
+    assert '{' in sv
+
+
+def test_sext_renders_correct_sv():
+    """_dict_expr_to_sv renders sext(instr[31:20], 12) to the correct SV."""
+    cc = ConstraintCompiler(_ImmDecodeAction)
+    cc.extract()
+    cc.compute_support()  # populates cset.input_field
+    # Manually render the sext expression
+    sext_expr = {
+        'type': 'call',
+        'func': 'sext',
+        'args': [
+            {'type': 'subscript',
+             'value': {'type': 'attribute', 'attr': 'instr'},
+             'slice': {'type': 'slice',
+                       'lower': {'type': 'constant', 'value': 31},
+                       'upper': {'type': 'constant', 'value': 20}}},
+            {'type': 'constant', 'value': 12}
+        ]
+    }
+    sv = cc._dict_expr_to_sv(sext_expr)
+    assert sv is not None, "sext expression should render to non-None"
+    # Should contain sign-extension: {20{bit[11]}} pattern
+    assert '20{' in sv, f"Expected sign extension fill in: {sv}"
+    assert '11' in sv, f"Expected bit 11 (n-1=12-1) in: {sv}"
+
+
+# ---------------------------------------------------------------------------
+# OR-guard + expression RHS combined (realistic immediate decode)
+# ---------------------------------------------------------------------------
+
+@zdc.dataclass
+class _FullImmDecodeAction:
+    """More realistic immediate decode with OR guards + expression RHS."""
+    instr : zdc.u32 = zdc.input()
+    imm   : zdc.u32 = zdc.rand()
+    kind  : zdc.u2  = zdc.rand()
+
+    @constraint
+    def c_itype_imm(self):
+        # OR guard: opcodes 0x03 or 0x13
+        if self.instr[6:0] == 0x03 or self.instr[6:0] == 0x13:
+            assert self.imm == zdc.sext(self.instr[31:20], 12) & MASK32
+
+    @constraint
+    def c_utype_imm(self):
+        if self.instr[6:0] == 0x37:
+            assert self.imm == 0
+            assert self.kind == 0
+
+    @constraint
+    def c_itype_kind(self):
+        if self.instr[6:0] == 0x03:
+            assert self.kind == 1
+
+    @constraint
+    def c_rtype_kind(self):
+        if self.instr[6:0] == 0x33:
+            assert self.kind == 2
+
+
+def test_full_imm_decode_pipeline():
+    """Full pipeline with OR guards + expression RHS runs without errors."""
+    cc = ConstraintCompiler(_FullImmDecodeAction)
+    cc.extract()
+    cc.compute_support()
+    cc.build_cubes()
+    cc.minimize()
+    sv = '\n'.join(cc.emit_sv())
+    # imm uses structural mux path
+    assert 'imm' in cc._expr_fields
+    assert 'assign d_imm' in sv
+    # kind uses SOP path (no expression assignments for kind)
+    assert 'kind' not in cc._expr_fields
+    assert 'd_kind' in sv
+
+
+def test_or_guard_expr_produces_two_itype_blocks():
+    """c_itype_imm with two OR arms produces two ConstraintBlocks."""
+    cc = ConstraintCompiler(_FullImmDecodeAction)
+    cc.extract()
+    itype_blocks = [b for b in cc.cset.constraints if 'itype_imm' in b.name]
+    assert len(itype_blocks) == 2, (
+        f"Expected 2 blocks for c_itype_imm OR guard, got {len(itype_blocks)}")
+    cond_vals = sorted([list(b.conditions.values())[0] for b in itype_blocks])
+    assert cond_vals == [0x03, 0x13]

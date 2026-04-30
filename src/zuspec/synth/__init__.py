@@ -263,6 +263,7 @@ def _synthesize_sprtl(cls, *, reset_style: str = "sync_low", top=None) -> str:
             fsm = transformer.transform(component_ir, proc)
             fsm.name = module_name
             FSMOptimizer(minimize_states=False, merge_operations=False).optimize(fsm)
+            _apply_struct_ir(fsm, ctx)
             sv = generate_sv(fsm, config=reset_cfg)
         else:
             # Plain-def one-cycle sync path — emit always_ff directly from IR.
@@ -284,6 +285,7 @@ def _synthesize_sprtl(cls, *, reset_style: str = "sync_low", top=None) -> str:
             fsm = transformer.transform(component_ir, proc)
             fsm.name = module_name
             FSMOptimizer(minimize_states=False, merge_operations=False).optimize(fsm)
+            _apply_struct_ir(fsm, ctx)
             sv = generate_sv(fsm, config=reset_cfg)
         elif reg_proc_nodes:
             sv = _synthesize_reg_process(component_ir, reg_proc_nodes[0], module_name, py_cls=cls)
@@ -680,6 +682,22 @@ def _synthesize_simple_sync(
 # ---------------------------------------------------------------------------
 # Hierarchical synthesis helpers
 # ---------------------------------------------------------------------------
+
+def _apply_struct_ir(fsm, ctx) -> None:
+    """Best-effort: annotate *fsm* with struct types derived from Buffer[T] fields.
+
+    Silently skips if annotation or rewriting fails so that synthesis still
+    succeeds and falls back to flat register names.
+    """
+    try:
+        from zuspec.synth.sprtl.struct_annotator import build_struct_metadata
+        from zuspec.synth.sprtl.struct_ir_rewriter import rewrite_struct_ir
+        struct_defs, flat_to_struct = build_struct_metadata(ctx)
+        if flat_to_struct:
+            rewrite_struct_ir(fsm, struct_defs, flat_to_struct)
+    except Exception:
+        pass
+
 
 def _proc_has_await(proc) -> bool:
     """Return True if *proc*'s body contains any ExprAwait statement."""

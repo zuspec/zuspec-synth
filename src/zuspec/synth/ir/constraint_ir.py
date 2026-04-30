@@ -61,16 +61,38 @@ class BitRange:
 
 
 @dataclass
+class ExprAssignment:
+    """An output field assignment whose RHS is a synthesizable expression (not a constant).
+
+    Produced by Phase A when ``_try_parse_expr_assignment`` recognises patterns
+    like ``sext(concat(...))`` or ``field[msb:lsb]`` on the RHS of an assertion.
+
+    ``expr`` holds the parsed expression dict (same format as ``ConstraintParser``
+    produces).  ``sv_expr`` is pre-rendered SV if available; otherwise the
+    ``_dict_expr_to_sv`` helper will render it at Phase F time.
+    """
+    field_name: str          # output field being assigned
+    expr: Dict               # parsed expression dict
+    sv_expr: Optional[str] = None  # pre-rendered SV string (filled by _dict_expr_to_sv)
+
+
+@dataclass
 class ConstraintBlock:
     """Normalised form of one @zdc.constraint method.
 
     ``conditions`` maps each BitRange that appears in the guard to the
     integer value it must equal.  ``assignments`` maps output field names
     to the values assigned when the guard is satisfied.
+
+    ``expr_assignments`` holds any expression-valued (non-constant) output
+    assignments found in the same block.  Fields appearing in ``expr_assignments``
+    are *excluded* from the SOP pipeline and are emitted via a structural mux
+    in Phase F instead.
     """
-    name: str                            # e.g. "c_add" — method name
-    conditions: Dict[BitRange, int]      # {bit_range: required_value}
-    assignments: Dict[str, int]          # {field_name: value}
+    name: str                                   # e.g. "c_add" — method name
+    conditions: Dict[BitRange, int]             # {bit_range: required_value}
+    assignments: Dict[str, int]                 # {field_name: constant_value}
+    expr_assignments: List[ExprAssignment] = field(default_factory=list)
 
 
 @dataclass

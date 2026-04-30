@@ -38,6 +38,8 @@ from .fsm_ir import (
     FSMRegWrite,
     FSMMemRequest,
     FSMMemResponse,
+    FSMPortCall,
+    FSMPortOutput,
     FSMAddrDecode,
     FSMPort,
     FSMRegister,
@@ -99,6 +101,7 @@ from .sva_gen import (
 from .optimizer import (
     OptimizationStats,
     DeadStateEliminator,
+    PassThroughEliminator,
     StateMinimizer,
     TransitionOptimizer,
     OperationMerger,
@@ -159,6 +162,8 @@ __all__ = [
     'FSMRegWrite',
     'FSMMemRequest',
     'FSMMemResponse',
+    'FSMPortCall',
+    'FSMPortOutput',
     'FSMAddrDecode',
     'FSMPort',
     'FSMRegister',
@@ -207,6 +212,7 @@ __all__ = [
     # FSM Optimizer
     'OptimizationStats',
     'DeadStateEliminator',
+    'PassThroughEliminator',
     'StateMinimizer',
     'TransitionOptimizer',
     'OperationMerger',

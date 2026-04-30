@@ -13,12 +13,13 @@ def counter_sv():
 
     @zdc.dataclass
     class Counter(zdc.Component):
-        count: zdc.Reg[zdc.b32] = zdc.output()
+        count: zdc.u32 = zdc.field(default=0)
 
         @zdc.proc
         async def _count(self):
             while True:
-                await self.count.write(self.count.read() + 1)
+                self.count = self.count + 1
+                await zdc.tick()
 
     return synthesize(Counter)
 

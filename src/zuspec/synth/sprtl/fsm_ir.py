@@ -40,9 +40,36 @@ class FSMOperation:
 
 
 @dc.dataclass
+class ExprStructField:
+    """Struct field reference: instance_name.field_name (e.g. dec_out.funct3)."""
+    instance_name: str
+    field_name: str
+
+
+@dc.dataclass
+class ExprStructRef:
+    """Whole-struct reference: instance_name (e.g. dec_out as an lvalue or rvalue)."""
+    instance_name: str
+
+
+@dc.dataclass
+class FSMStructDef:
+    """Packed struct type definition: typedef struct packed { ... } name;"""
+    name: str                          # e.g. "DecodeResult_t"
+    fields: List[tuple]                # list of (field_name: str, width: int)
+
+
+@dc.dataclass
+class FSMStructInstance:
+    """Struct instance declaration: struct_type instance_name;"""
+    instance_name: str                 # e.g. "dec_out"
+    struct_type: str                   # e.g. "DecodeResult_t"
+
+
+@dc.dataclass
 class FSMAssign(FSMOperation):
     """Assignment operation: target = value."""
-    target: str           # Target signal/register name
+    target: Any           # Target: str for plain signals, ExprStructField/ExprStructRef for structs
     value: Any            # Expression for the value (can be IR Expr)
     is_nonblocking: bool = True  # True for <= (register), False for = (wire)
 
@@ -134,16 +161,44 @@ class FSMRegWrite(FSMOperation):
 
 @dc.dataclass
 class FSMMemRequest(FSMOperation):
-    """Memory-interface request drive: port.request(req)."""
+    """Memory-interface request drive: port.request(req).
+    Kept for backward compatibility; new code uses FSMPortCall."""
     port_name: str   # Port name (e.g. "mem")
     req_var: str = ""  # Local variable holding the MemReq struct
 
 
 @dc.dataclass
 class FSMMemResponse(FSMOperation):
-    """Memory-interface response latch: result_var = port.response()."""
+    """Memory-interface response latch: result_var = port.response().
+    Kept for backward compatibility; new code uses FSMPortCall."""
     port_name: str    # Port name (e.g. "mem")
     result_var: str = ""  # Local variable that receives the MemRsp struct
+
+
+@dc.dataclass
+class FSMPortCall(FSMOperation):
+    """Awaited protocol-port method call: result = await self.PORT.METHOD(args).
+
+    Lowers to a WAIT_COND state that asserts PORT_METHOD_valid, drives
+    PORT_METHOD_argN outputs, waits for PORT_METHOD_ack, then latches
+    PORT_METHOD_rdata into result_var.
+    """
+    port_name: str        # e.g. "mem"
+    method_name: str      # e.g. "read_word"
+    arg_exprs: list       # IR expression per argument
+    result_var: str = ""  # local variable that receives the return value (empty = void)
+
+
+@dc.dataclass
+class FSMPortOutput(FSMOperation):
+    """Non-awaited protocol-port method call: self.PORT.METHOD(args).
+
+    Combinatorial output assertion for one FSM state — no ack, no result.
+    Lowers to PORT_METHOD_valid=1 and PORT_METHOD_argN outputs driven in that state.
+    """
+    port_name: str    # e.g. "monitor"
+    method_name: str  # e.g. "on_retire"
+    arg_exprs: list   # IR expression per argument
 
 
 @dc.dataclass
@@ -276,9 +331,22 @@ class FSMModule:
     # User-defined @zdc.enum types referenced by this module.
     # Each entry is a dict with keys: name, width, items (name→value OrderedDict).
     user_enums: List[Dict[str, Any]] = dc.field(default_factory=list)
+
+    # Packed struct type definitions derived from Buffer[T] payload classes.
+    user_structs: List['FSMStructDef'] = dc.field(default_factory=list)
+
+    # Struct register instances (one per Buffer field occurrence in activity loop).
+    struct_instances: List['FSMStructInstance'] = dc.field(default_factory=list)
     
     # Optional address-decode block (emitted as always @(*) combinational logic)
     addr_decode: Optional['FSMAddrDecode'] = None
+
+    # Array fields: name → depth  (e.g. {'gpr': 32})
+    # Emitted as  logic [31:0] name [0:depth-1];
+    array_fields: Dict[str, int] = dc.field(default_factory=dict)
+
+    # Field name map: ExprRefField.index → field name
+    field_names: Dict[int, str] = dc.field(default_factory=dict)
 
     # State encoding
     state_width: int = 0  # Computed from number of states

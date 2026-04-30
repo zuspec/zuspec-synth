@@ -315,6 +315,65 @@ class OperationMerger:
         return merged
 
 
+class PassThroughEliminator:
+    """Eliminates empty unconditional pass-through states.
+
+    A pass-through state has no output operations and exactly one
+    unconditional transition.  Every predecessor that targets such a state
+    can be redirected straight to the pass-through's successor, saving one
+    clock cycle per traversal.
+
+    The initial state is never removed (it has a special semantic meaning
+    on reset).
+
+    The pass runs to fixpoint: chains like A→B→C where B and C are both
+    pass-throughs are fully collapsed in a single call to ``optimize``.
+    """
+
+    def optimize(self, fsm: FSMModule) -> OptimizationStats:
+        stats = OptimizationStats()
+
+        # Build bypass map: state_id → direct successor for pass-throughs
+        bypass: Dict[int, int] = {}
+        for state in fsm.states:
+            if state.id == fsm.initial_state:
+                continue  # keep the reset/IDLE state
+            if (len(state.operations) == 0
+                    and len(state.transitions) == 1
+                    and state.transitions[0].is_unconditional):
+                bypass[state.id] = state.transitions[0].target_state
+
+        if not bypass:
+            return stats
+
+        # Resolve chains to their final non-pass-through destination
+        def _resolve(sid: int) -> int:
+            visited: Set[int] = set()
+            while sid in bypass:
+                if sid in visited:
+                    break  # cycle guard (shouldn't happen in acyclic FSMs)
+                visited.add(sid)
+                sid = bypass[sid]
+            return sid
+
+        # Redirect all transitions that point to a pass-through state
+        for state in fsm.states:
+            for trans in state.transitions:
+                if trans.target_state in bypass:
+                    trans.target_state = _resolve(trans.target_state)
+
+        # Also fix the initial_state pointer if it ever pointed to a pass-through
+        if fsm.initial_state in bypass:
+            fsm.initial_state = _resolve(fsm.initial_state)
+
+        # Remove now-unreachable pass-through states
+        before = len(fsm.states)
+        DeadStateEliminator().optimize(fsm)
+        stats.states_removed = before - len(fsm.states)
+
+        return stats
+
+
 class FSMOptimizer:
     """High-level FSM optimizer that runs multiple passes.
     
@@ -325,6 +384,7 @@ class FSMOptimizer:
     
     def __init__(self, 
                  eliminate_dead: bool = True,
+                 eliminate_pass_through: bool = True,
                  minimize_states: bool = True,
                  optimize_transitions: bool = True,
                  merge_operations: bool = True):
@@ -332,11 +392,13 @@ class FSMOptimizer:
         
         Args:
             eliminate_dead: Run dead state elimination
+            eliminate_pass_through: Run pass-through state elimination
             minimize_states: Run state minimization
             optimize_transitions: Run transition optimization
             merge_operations: Run operation merging
         """
         self.eliminate_dead = eliminate_dead
+        self.eliminate_pass_through = eliminate_pass_through
         self.minimize_states = minimize_states
         self.optimize_transitions = optimize_transitions
         self.merge_operations = merge_operations
@@ -355,6 +417,10 @@ class FSMOptimizer:
         # Run passes in order
         if self.eliminate_dead:
             stats = DeadStateEliminator().optimize(fsm)
+            total_stats.states_removed += stats.states_removed
+
+        if self.eliminate_pass_through:
+            stats = PassThroughEliminator().optimize(fsm)
             total_stats.states_removed += stats.states_removed
         
         if self.minimize_states:
