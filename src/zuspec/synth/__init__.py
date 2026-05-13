@@ -771,17 +771,19 @@ def _is_hierarchical(component_ir, ctx) -> bool:
 def _bind_proxy_nested_index_to_name(sub_py_cls, bind_index: int):
     """Map a bind-expression index to a field name for a sub-instance class.
 
-    ``_BindProxy`` builds nested field indices by iterating
-    ``field_type.__dataclass_fields__`` and skipping names that start with ``_``.
-    This function reproduces that mapping so that ``_decode_bind_ref_h`` can
-    correctly resolve sub-instance field references even when non-dataclass
-    fields such as ``clock_domain`` precede the user-visible fields.
+    ``_BindProxy`` builds nested field indices by iterating ``dataclasses.fields()``
+    and skipping names that start with ``_``.  Using ``dc.fields()`` (rather than
+    ``__dataclass_fields__``) excludes inherited class-level descriptors such as
+    ``clock_domain`` and ``reset_domain`` that are not real instance fields, keeping
+    the index scheme stable regardless of how many parent-class descriptors precede
+    the user-visible ports.
     """
+    import dataclasses as _dc_mod
     idx = 0
-    for fname in sub_py_cls.__dataclass_fields__:
-        if not fname.startswith('_'):
+    for f in _dc_mod.fields(sub_py_cls):
+        if not f.name.startswith('_'):
             if idx == bind_index:
-                return fname
+                return f.name
             idx += 1
     return None
 
