@@ -1046,6 +1046,8 @@ class SVCodeGenerator:
         
         if hasattr(op, 'name'):
             result = op_map.get(op.name, str(op.name))
+            # Return the SV operator if found; otherwise try value-based lookup
+            # for BinOp enum members that have numeric .value fields.
             if result != str(op.name):
                 return result
             # Also try value-based lookup for enum types like BinOp
@@ -1057,8 +1059,11 @@ class SVCodeGenerator:
                     13: '==', 14: '!=', 15: '<', 16: '<=', 17: '>', 18: '>=',
                     19: '&&', 20: '||',
                 }
-                return val_map.get(val, str(op.name))
-            return result
+                vresult = val_map.get(val)
+                if vresult is not None:
+                    return vresult
+            # Final fallback for unknown ops
+            return getattr(op, 'name', str(op))
         
         return op_map.get(str(op), str(op))
 
