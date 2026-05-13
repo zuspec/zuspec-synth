@@ -36,7 +36,7 @@ from typing import List, Optional
 
 from .synth_pass import SynthPass
 from .expr_lowerer import ExprLowerer
-from zuspec.synth.ir.pipeline_ir import HazardPair, PipelineIR
+from zuspec.synth.ir.pipeline_ir import HazardPair, HazardResolution, PipelineIR
 from zuspec.synth.ir.synth_ir import SynthConfig, SynthIR
 
 _log = logging.getLogger(__name__)
@@ -162,7 +162,7 @@ class StallGenPass(SynthPass):
             return ir
 
         pip = ir.pipeline_ir
-        stall_hazards = [h for h in pip.hazards if h.resolved_by == "stall"]
+        stall_hazards = [h for h in pip.hazards if h.resolved_by == HazardResolution.STALL]
 
         # Build stage-declared stalls and cancels (new API)
         decl_stalls = self._build_decl_stalls(pip)

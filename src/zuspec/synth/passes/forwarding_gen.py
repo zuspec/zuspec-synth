@@ -13,15 +13,15 @@ For each :class:`~zuspec.synth.ir.pipeline_ir.HazardPair` in
    - ``True``  → auto-create ``ForwardingDecl(suppressed=False)`` (bypass mux).
    - ``False`` → auto-create ``ForwardingDecl(suppressed=True)`` (stall).
 
-Updates ``HazardPair.resolved_by`` to ``"forward"`` or ``"stall"`` and
-appends any auto-generated ``ForwardingDecl`` entries to
-``PipelineIR.forwarding``.
+Updates ``HazardPair.resolved_by`` to :class:`HazardResolution.FORWARD` or
+:class:`HazardResolution.STALL` and appends any auto-generated
+``ForwardingDecl`` entries to ``PipelineIR.forwarding``.
 
 WAW hazards are always resolved by suppressing the earlier write (noted in
-``resolved_by="suppress"``); no forwarding declaration is needed.
+``resolved_by=HazardResolution.SUPPRESS``); no forwarding declaration is needed.
 
 WAR hazards for plain scalars are structural in a feed-forward pipeline and
-resolved by reordering (``resolved_by="reorder"``).
+resolved by reordering (``resolved_by=HazardResolution.REORDER``).
 """
 from __future__ import annotations
 
@@ -29,7 +29,14 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 from .synth_pass import SynthPass
-from zuspec.synth.ir.pipeline_ir import ForwardingDecl, HazardPair, PipelineIR
+from zuspec.synth.ir.pipeline_ir import (
+    ForwardingDecl,
+    HazardKind,
+    HazardPair,
+    HazardResolution,
+    LockType,
+    PipelineIR,
+)
 from zuspec.synth.ir.synth_ir import SynthConfig, SynthIR
 
 _log = logging.getLogger(__name__)
@@ -91,11 +98,11 @@ class ForwardingGenPass(SynthPass):
         no_forward_stages = {s.name for s in pip.stages if getattr(s, 'no_forward', False)}
 
         for hazard in pip.hazards:
-            if hazard.kind == "WAW":
-                hazard.resolved_by = "suppress"
+            if hazard.kind == HazardKind.WAW:
+                hazard.resolved_by = HazardResolution.SUPPRESS
                 continue
-            if hazard.kind == "WAR":
-                hazard.resolved_by = "reorder"
+            if hazard.kind == HazardKind.WAR:
+                hazard.resolved_by = HazardResolution.REORDER
                 continue
 
             # RAW hazard
@@ -103,7 +110,9 @@ class ForwardingGenPass(SynthPass):
             decl = decl_map.get(key)
 
             if decl is not None:
-                hazard.resolved_by = "stall" if decl.suppressed else "forward"
+                hazard.resolved_by = (
+                    HazardResolution.STALL if decl.suppressed else HazardResolution.FORWARD
+                )
             elif hazard.producer_stage in no_forward_stages:
                 # Stage-level no_forward: auto-stall all outputs of this stage
                 auto = ForwardingDecl(
@@ -114,7 +123,7 @@ class ForwardingGenPass(SynthPass):
                 )
                 auto_decls.append(auto)
                 decl_map[key] = auto
-                hazard.resolved_by = "stall"
+                hazard.resolved_by = HazardResolution.STALL
             elif forward_default is None:
                 unresolved.append(hazard)
             elif forward_default:
@@ -127,7 +136,7 @@ class ForwardingGenPass(SynthPass):
                 )
                 auto_decls.append(auto)
                 decl_map[key] = auto
-                hazard.resolved_by = "forward"
+                hazard.resolved_by = HazardResolution.FORWARD
             else:
                 # Auto-stall
                 auto = ForwardingDecl(
@@ -138,7 +147,7 @@ class ForwardingGenPass(SynthPass):
                 )
                 auto_decls.append(auto)
                 decl_map[key] = auto
-                hazard.resolved_by = "stall"
+                hazard.resolved_by = HazardResolution.STALL
 
         pip.forwarding.extend(auto_decls)
 
@@ -148,7 +157,7 @@ class ForwardingGenPass(SynthPass):
             except ImportError:
                 PipelineError = ValueError
             lines = [
-                f"  {h.kind} hazard: '{h.signal}' written in stage '{h.producer_stage}', "
+                f"  {h.kind.value} hazard: '{h.signal}' written in stage '{h.producer_stage}', "
                 f"read in stage '{h.consumer_stage}'"
                 for h in unresolved
             ]
@@ -167,10 +176,10 @@ class ForwardingGenPass(SynthPass):
         # Resolve regfile hazards using the same forward_default policy
         self._resolve_regfile_hazards(pip, forward_default)
 
-        fwd_count   = sum(1 for h in pip.hazards if h.resolved_by == "forward")
-        stall_count = sum(1 for h in pip.hazards if h.resolved_by == "stall")
-        rf_fwd   = sum(1 for h in pip.regfile_hazards if h.resolved_by == "forward")
-        rf_stall = sum(1 for h in pip.regfile_hazards if h.resolved_by == "stall")
+        fwd_count   = sum(1 for h in pip.hazards if h.resolved_by == HazardResolution.FORWARD)
+        stall_count = sum(1 for h in pip.hazards if h.resolved_by == HazardResolution.STALL)
+        rf_fwd   = sum(1 for h in pip.regfile_hazards if h.resolved_by == HazardResolution.FORWARD)
+        rf_stall = sum(1 for h in pip.regfile_hazards if h.resolved_by == HazardResolution.STALL)
         _log.info(
             "[ForwardingGenPass] %s: %d forward, %d stall, %d auto-generated; "
             "regfile: %d forward, %d stall",
@@ -191,7 +200,7 @@ class ForwardingGenPass(SynthPass):
         # Build a lookup from field_name → lock_type for quick access
         decl_lock = {d.field_name: d.lock_type for d in getattr(pip, "regfile_decls", [])}
         for rfh in pip.regfile_hazards:
-            if rfh.resolved_by != "unresolved":
+            if rfh.resolved_by != HazardResolution.UNRESOLVED:
                 continue
             # 1. Explicit forwarding declaration override
             signal_key = f"{rfh.field_name}.{rfh.read_result_var}"
@@ -201,21 +210,23 @@ class ForwardingGenPass(SynthPass):
                     decl = d
                     break
             if decl is not None:
-                rfh.resolved_by = "stall" if decl.suppressed else "forward"
+                rfh.resolved_by = (
+                    HazardResolution.STALL if decl.suppressed else HazardResolution.FORWARD
+                )
                 rfh.suppressed  = decl.suppressed
                 continue
             # 2. Per-regfile lock_type
             lt = decl_lock.get(rfh.field_name)
-            if lt == "bypass":
-                rfh.resolved_by = "forward"
-            elif lt == "queue":
-                rfh.resolved_by = "stall"
+            if lt == LockType.BYPASS:
+                rfh.resolved_by = HazardResolution.FORWARD
+            elif lt == LockType.QUEUE:
+                rfh.resolved_by = HazardResolution.STALL
                 rfh.suppressed  = True
             # 3. Global forward_default fallback
             elif forward_default is True:
-                rfh.resolved_by = "forward"
+                rfh.resolved_by = HazardResolution.FORWARD
             elif forward_default is False:
-                rfh.resolved_by = "stall"
+                rfh.resolved_by = HazardResolution.STALL
                 rfh.suppressed  = True
             else:
-                rfh.resolved_by = "forward"
+                rfh.resolved_by = HazardResolution.FORWARD

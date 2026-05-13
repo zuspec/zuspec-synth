@@ -40,7 +40,13 @@ try:
 except ImportError:
     PipelineError = ValueError
 from zuspec.synth.ir.synth_ir import SynthIR, SynthConfig
-from zuspec.synth.ir.pipeline_ir import PipelineIR, StageIR, HazardPair
+from zuspec.synth.ir.pipeline_ir import (
+    HazardKind,
+    HazardPair,
+    PipelineIR,
+    RegFileAccessKind,
+    StageIR,
+)
 from zuspec.synth.passes import (
     PipelineAnnotationPass,
     HazardAnalysisPass,
@@ -229,7 +235,7 @@ class TestHazardAnalysisPass:
         # Simple non-looping pipeline should have no hazards
         # (all defs flow forward only)
         for h in pip.hazards:
-            assert h.kind in ("RAW", "WAW", "WAR")
+            assert h.kind in (HazardKind.RAW, HazardKind.WAW, HazardKind.WAR)
 
     def test_hazards_are_hazard_pairs(self):
         cfg = SynthConfig()
@@ -258,7 +264,7 @@ class TestForwardingGenPass:
         ir = HazardAnalysisPass(cfg).run(ir)
         # Inject a synthetic hazard to guarantee unresolved path
         ir.pipeline_ir.hazards.append(
-            HazardPair(kind="RAW", signal="injected",
+            HazardPair(kind=HazardKind.RAW, signal="injected",
                        producer_stage="EX", consumer_stage="IF")
         )
         with pytest.raises(PipelineError):
@@ -665,18 +671,18 @@ class TestRegFileModeling:
         pip = ir.pipeline_ir
         assert len(pip.regfile_accesses) == 2
         kinds = {a.kind for a in pip.regfile_accesses}
-        assert kinds == {"read", "write"}
+        assert kinds == {RegFileAccessKind.READ, RegFileAccessKind.WRITE}
 
     def test_regfile_read_in_id_stage(self):
         ir = _run_rf_chain(_RfPipe)
-        reads = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == "read"]
+        reads = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == RegFileAccessKind.READ]
         assert len(reads) == 1
         assert reads[0].stage == "ID"
         assert reads[0].field_name == "regfile"
 
     def test_regfile_write_in_wb_stage(self):
         ir = _run_rf_chain(_RfPipe)
-        writes = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == "write"]
+        writes = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == RegFileAccessKind.WRITE]
         assert len(writes) == 1
         assert writes[0].stage == "WB"
 

@@ -17,7 +17,7 @@ from zuspec.synth.verify.structural import (
     check_forwarding_completeness,
     StructuralError,
 )
-from zuspec.synth.ir.pipeline_ir import RegFileHazard, ForwardingDecl
+from zuspec.synth.ir.pipeline_ir import ForwardingDecl, HazardResolution, RegFileHazard
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +98,7 @@ def test_structural_injected_fwd_missing():
         read_addr_var="rs1",
         write_data_var="result",
         read_result_var="rdata",
-        resolved_by="forward",
+        resolved_by=HazardResolution.FORWARD,
     )
     pip.regfile_hazards.append(synthetic_hz)
     # Do NOT add a matching ForwardingDecl → should trigger FWD_MISSING

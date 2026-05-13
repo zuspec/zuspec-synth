@@ -28,8 +28,10 @@ from zuspec.ir.core.pipeline_async import (
 from zuspec.synth.ir.pipeline_ir import (
     ChannelDecl,
     HazardPair,
+    LockType,
     PipelineIR,
     RegFileAccess,
+    RegFileAccessKind,
     RegFileDeclInfo,
     StageIR,
 )
@@ -688,11 +690,9 @@ class AsyncPipelineToIrPass(SynthPass):
             seen_fields[field_name] = decl
 
         kind_map = {
-            "reserve": "reserve",
-            "block": "read",
-            "acquire": "read",
-            "write": "write",
-            "release": "release",
+            "block": RegFileAccessKind.READ,
+            "acquire": RegFileAccessKind.READ,
+            "write": RegFileAccessKind.WRITE,
         }
         kind = kind_map.get(op.op)
         if kind is None:
@@ -753,7 +753,7 @@ class AsyncPipelineToIrPass(SynthPass):
         depth = 32
         addr_width = 5
         data_width = 32
-        lock_type = "bypass"  # default: forward hazards via bypass mux
+        lock_type = LockType.BYPASS  # default: forward hazards via bypass mux
 
         if comp_cls is not None:
             # --- PipelineResource instance (class-level attribute) ---
@@ -765,9 +765,9 @@ class AsyncPipelineToIrPass(SynthPass):
                     depth = inst.size
                     addr_width = max(1, int(math.ceil(math.log2(max(depth, 2)))))
                     if isinstance(inst.lock, BypassLock):
-                        lock_type = "bypass"
+                        lock_type = LockType.BYPASS
                     elif isinstance(inst.lock, QueueLock):
-                        lock_type = "queue"
+                        lock_type = LockType.QUEUE
                     return RegFileDeclInfo(
                         field_name=field_name,
                         depth=depth,

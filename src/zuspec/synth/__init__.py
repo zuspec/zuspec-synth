@@ -24,6 +24,7 @@ This package provides:
 """
 
 from . import sprtl
+from .pcf_gen import gen_pcf
 
 
 def synthesize(cls, *, output=None, top=None, reset_style="sync_low",
@@ -320,7 +321,16 @@ def _ir_expr_to_sv(expr, idx_to_name: dict) -> str:
         return idx_to_name.get(expr.index, f"_f{expr.index}")
     if t == "ExprAttribute":
         base = _ir_expr_to_sv(expr.value, idx_to_name)
+        # ExprAttribute(TypeExprRefSelf, attr) → just the field name
+        if base == "" or type(expr.value).__name__ == "TypeExprRefSelf":
+            return expr.attr
         return f"{base}_{expr.attr}"
+    if t == "ExprSubscript":
+        base = _ir_expr_to_sv(expr.value, idx_to_name)
+        sl = expr.slice
+        if type(sl).__name__ == "ExprConstant":
+            return f"{base}[{sl.value}]"
+        return f"{base}[{_ir_expr_to_sv(sl, idx_to_name)}]"
     if t == "ExprConstant":
         v = expr.value
         if isinstance(v, int) and not isinstance(v, bool) and (v > 0xFFFF or v < -0x8000):
@@ -350,6 +360,17 @@ def _ir_expr_to_sv(expr, idx_to_name: dict) -> str:
                 base = func.value
                 if base is not None and type(base).__name__ == "ExprRefField":
                     return idx_to_name.get(base.index, f"_f{base.index}")
+            # zdc.bv(N) / zdc.bit(N) / zdc.uN(val) → lower to the constant value
+            _ZDC_CTOR_ATTRS = ('bv', 'bit', 'u1', 'u2', 'u4', 'u8', 'u16', 'u32', 'u64',
+                               's8', 's16', 's32', 's64')
+            if func.attr in _ZDC_CTOR_ATTRS:
+                base_val = func.value
+                if (base_val is not None
+                        and type(base_val).__name__ == "ExprRefUnresolved"
+                        and base_val.name == "zdc"):
+                    args = getattr(expr, 'args', [])
+                    if len(args) == 1:
+                        return _ir_expr_to_sv(args[0], idx_to_name)
         # zdc built-in lowering
         if func is not None and type(func).__name__ == "ExprRefUnresolved":
             fname = func.name
@@ -1365,15 +1386,19 @@ def _synthesize_hierarchical(cls, component_ir, ctx, module_name: str) -> str:
     # ------------------------------------------------------------------ #
     # 1. Classify top-level fields                                         #
     # ------------------------------------------------------------------ #
-    top_scalar_ports = []  # (name, bits, is_out)
-    sub_insts = []         # (field_name, type_name, sub_ir, sub_py_cls)
+    top_scalar_ports = []   # (name, bits, is_out)  — direction already known
+    top_inout_ports = {}    # name → (bits, ir_field)  — direction TBD from binds
+    sub_insts = []          # (field_name, type_name, sub_ir, sub_py_cls)
 
     for f in top_fields:
         ft = type(f).__name__
         if ft == "FieldInOut":
             bits = _field_bits(f)
-            is_out = getattr(f, "is_out", False)
-            top_scalar_ports.append((f.name, bits, is_out))
+            if getattr(f, "is_inout", False):
+                top_inout_ports[f.name] = (bits, f)
+            else:
+                is_out = getattr(f, "is_out", False)
+                top_scalar_ports.append((f.name, bits, is_out))
         elif ft == "Field":
             dt = getattr(f, "datatype", None)
             if dt and type(dt).__name__ == "DataTypeRef":
@@ -1421,6 +1446,39 @@ def _synthesize_hierarchical(cls, component_ir, ctx, module_name: str) -> str:
         elif rhs_inst and not lhs_inst:
             bound_ports.add((rhs_inst, rhs_port))
             inst_port_to_top[(rhs_inst, rhs_port)] = lhs_port
+
+    # ------------------------------------------------------------------ #
+    # 2c. Resolve inout port directions from bindings                      #
+    #                                                                      #
+    # An inout port's direction is determined by what it is bound to:     #
+    # if the connected sub-instance port is an output, the inout becomes  #
+    # an output; if the sub-instance port is an input, it becomes input.  #
+    # Unbound top-level inout ports are simply unused pads — omitted.     #
+    # ------------------------------------------------------------------ #
+    # Build a lookup: sub-instance field name → IR fields indexed by name
+    sub_ir_port_map = {}  # inst_name → {port_name: FieldInOut}
+    for inst_name, _type_name, sub_ir, _sub_py_cls in sub_insts:
+        sub_ir_port_map[inst_name] = {
+            sf.name: sf for sf in sub_ir.fields if type(sf).__name__ == "FieldInOut"
+        }
+
+    for top_port_name, (bits, _f) in top_inout_ports.items():
+        # Find which (inst, port) this top port is connected to
+        resolved = None
+        for (inst_name, port_name), mapped_top in inst_port_to_top.items():
+            if mapped_top == top_port_name:
+                inst_ports = sub_ir_port_map.get(inst_name, {})
+                sub_field = inst_ports.get(port_name)
+                if sub_field is not None:
+                    # Direction of the inout pin = direction seen from the sub-instance
+                    # A sub-instance OUTPUT drives the pin → pin is output
+                    # A sub-instance INPUT receives from the pin → pin is input
+                    resolved = getattr(sub_field, "is_out", False)
+                break
+        if resolved is not None:
+            # Bound — include with resolved direction
+            top_scalar_ports.append((top_port_name, bits, resolved))
+        # else: unbound inout → unused pad, omit silently
 
     # ------------------------------------------------------------------ #
     # 2b. Detect transactor bindings                                       #
@@ -1475,41 +1533,38 @@ def _synthesize_hierarchical(cls, component_ir, ctx, module_name: str) -> str:
         )
 
     # ------------------------------------------------------------------ #
-    # 3. Collect unbound sub-instance ports → expose at top level          #
+    # 3. Check that all sub-instance ports are bound; error on any unbound #
     # ------------------------------------------------------------------ #
-    exposed_ports = []  # (port_name, bits, is_out)
-    # Track which names we've already exposed (de-dup)
-    exposed_names = set()
-
     for inst_name, _type_name, sub_ir, sub_py_cls in sub_insts:
         sub_py_meta = {}
         if sub_py_cls and hasattr(sub_py_cls, "__dataclass_fields__"):
             for pf in _dc.fields(sub_py_cls):
                 sub_py_meta[pf.name] = pf.metadata
 
+        unbound = []
         for sf in sub_ir.fields:
             sft = type(sf).__name__
             if sft == "FieldInOut":
                 pname = sf.name
-                if (inst_name, pname) not in bound_ports and pname not in exposed_names:
-                    bits = _field_bits(sf)
-                    is_out = getattr(sf, "is_out", False)
-                    exposed_ports.append((pname, bits, is_out))
-                    exposed_names.add(pname)
+                if (inst_name, pname) not in bound_ports:
+                    unbound.append(pname)
             elif sft == "Field":
                 sf_dt = getattr(sf, "datatype", None)
                 if sf_dt and type(sf_dt).__name__ == "DataTypeRef":
                     struct_ir = ctx.type_m.get(sf_dt.ref_name)
                     if struct_ir and type(struct_ir).__name__ == "DataTypeStruct":
-                        is_mirror = sub_py_meta.get(sf.name, {}).get("kind") == "mirror"
                         for ssf in struct_ir.fields:
                             expanded = f"{sf.name}_{ssf.name}"
-                            if (inst_name, expanded) not in bound_ports and expanded not in exposed_names:
-                                ssf_is_out = getattr(ssf, "is_out", True)
-                                if is_mirror:
-                                    ssf_is_out = not ssf_is_out
-                                exposed_ports.append((expanded, _field_bits(ssf), ssf_is_out))
-                                exposed_names.add(expanded)
+                            if (inst_name, expanded) not in bound_ports:
+                                unbound.append(expanded)
+
+        if unbound:
+            raise ValueError(
+                f"Sub-instance '{inst_name}' has unbound ports: {unbound}. "
+                f"Every port of a sub-instance must be connected in __bind__."
+            )
+
+    exposed_ports = []  # kept for compatibility with section 4
 
     # ------------------------------------------------------------------ #
     # 4. Synthesize sub-components first, then emit the wrapper module.    #

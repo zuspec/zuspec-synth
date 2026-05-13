@@ -264,7 +264,7 @@ class DomainBinding:
         # Lazy import to avoid circular dependency with zuspec-dataclasses
         try:
             from zuspec.dataclasses.domain import (
-                ClockDomain, ResetDomain,
+                ClockDomain, ResetDomain, ResetPolarity, ResetStyle,
             )
         except ImportError:
             return cls()
@@ -282,9 +282,9 @@ class DomainBinding:
 
         # Determine reset name, polarity, style
         if isinstance(reset_domain, ResetDomain):
-            active_low = (reset_domain.polarity == "active_low")
+            active_low = (reset_domain.polarity == ResetPolarity.ACTIVE_LOW)
             reset_name = "rst_n" if active_low else "rst"
-            reset_async = (reset_domain.style == "async")
+            reset_async = (reset_domain.style == ResetStyle.ASYNC)
         else:
             active_low = True
             reset_name = "rst_n"
