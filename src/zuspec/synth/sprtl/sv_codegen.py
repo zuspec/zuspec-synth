@@ -179,17 +179,26 @@ class SVCodeGenerator:
         # reads within the same always_ff block see the updated value.
         self._cond_depth: int = 0
 
-    def generate(self, fsm: FSMModule) -> str:
+    def generate(self, fsm: FSMModule, *, body_only: bool = False) -> str:
         """Generate SystemVerilog code for an FSM module.
         
         Args:
             fsm: FSM module to generate code for
+            body_only: When True, skip the module header, port declarations,
+                and ``endmodule`` footer — emit only the interior declarations
+                and ``always_ff`` / ``always_comb`` blocks.  Used by
+                ``FSMToRTLPass`` when ``ModuleAssemblePass`` builds the
+                module wrapper.
             
         Returns:
             SystemVerilog source code as string
         """
         self._output = StringIO()
         self._indent_level = 0
+
+        # Single-state fast path: plain always_ff, no state typedef/register.
+        if getattr(fsm, 'single_state', False):
+            return self._generate_single_state(fsm, body_only=body_only)
 
         # Stash field names and array fields for ExprRefField resolution
         self._field_names: Dict[int, str] = getattr(fsm, 'field_names', {})
@@ -249,23 +258,29 @@ class SVCodeGenerator:
                                     FSMRegister(name=op.result_var, width=32))
                                 known_reg_names.add(op.result_var)
 
-        self._generate_header(fsm)
-        self._generate_user_enum_typedefs(fsm)
-        self._generate_user_struct_typedefs(fsm)
-        self._generate_module_declaration(fsm)
-        self._generate_state_encoding(fsm)
         # Classify struct instances: scratch (no reset) vs dead refs (omit entirely).
         self._scratch_structs, self._dead_struct_refs = _collect_struct_usage(fsm)
+
+        if not body_only:
+            self._generate_header(fsm)
+            self._generate_user_enum_typedefs(fsm)
+            self._generate_user_struct_typedefs(fsm)
+            self._generate_module_declaration(fsm)
+
+        self._generate_state_encoding(fsm)
         self._generate_register_declarations(fsm)
         self._generate_state_register(fsm)
+        self._generate_cycle_counters(fsm)
         # Precompute per-state forwarding maps so both next-state comb logic
         # and output ff logic can use them consistently.
         self._precompute_state_forwarding(fsm)
         self._struct_aliases: Dict[str, str] = {}  # retired — struct IR handles aliasing
         self._generate_next_state_logic(fsm)
         self._generate_output_logic(fsm)
-        self._generate_module_end()
-        
+
+        if not body_only:
+            self._generate_module_end()
+
         return self._output.getvalue()
     
     def _emit(self, text: str = ""):
@@ -299,6 +314,84 @@ class SVCodeGenerator:
         if fsm.domain_binding is not None:
             return fsm.domain_binding.reset_name
         return fsm.reset_signal
+
+    def _generate_single_state(self, fsm: FSMModule, *, body_only: bool = False) -> str:
+        """Emit a plain always_ff block for a degenerate single-state FSM.
+
+        Called when ``fsm.single_state is True``.  No state typedef, no state
+        register, no case statement — just an ``always_ff`` block with an
+        optional auto-generated reset clause followed by the process body.
+
+        Args:
+            fsm:       The FSMModule (``single_state=True`` guaranteed by caller).
+            body_only: When True, the module wrapper is omitted (no header,
+                       port declarations, or ``endmodule``).
+
+        Returns:
+            SV text.
+        """
+        from zuspec.synth.sprtl.ir_to_sv import ir_stmts_to_sv, ir_stmts_to_sv_comb
+
+        self._output = StringIO()
+        self._indent_level = 0
+
+        clk = self._eff_clk(fsm)
+        rst = self._eff_rst(fsm)
+        act_low = self._eff_reset_active_low(fsm)
+        async_ = self._eff_reset_async(fsm)
+        rst_cond = f"!{rst}" if act_low else rst
+
+        reset_clauses = list(getattr(fsm, 'reset_clauses', []))
+        body_stmts = list(getattr(fsm, 'body_stmts', []))
+        idx_to_name = dict(getattr(fsm, 'body_idx_to_name', {}))
+
+        if not body_only:
+            self._generate_header(fsm)
+            self._generate_user_enum_typedefs(fsm)
+            self._generate_user_struct_typedefs(fsm)
+            self._generate_module_declaration(fsm)
+
+        # Emit internal state variable declarations.
+        for reg in fsm.registers:
+            from zuspec.synth.sprtl.fsm_ir import FSMRegister
+            bits = getattr(reg, 'width', 1)
+            w = f"[{bits - 1}:0] " if bits > 1 else ""
+            self._emitln(f"logic {w}{reg.name};")
+
+        # Build sensitivity list.
+        if async_:
+            edge = f"negedge {rst}" if act_low else f"posedge {rst}"
+            sens = f"posedge {clk} or {edge}"
+        else:
+            sens = f"posedge {clk}"
+
+        self._emitln(f"always_ff @({sens}) begin")
+        self._indent()
+
+        if reset_clauses:
+            self._emitln(f"if ({rst_cond}) begin")
+            self._indent()
+            for fname, rval in reset_clauses:
+                self._emitln(f"{fname} <= {rval};")
+            self._dedent()
+            self._emitln("end else begin")
+            self._indent()
+            for line in ir_stmts_to_sv(body_stmts, idx_to_name, indent=0):
+                self._emit(self._get_indent() + line + "\n")
+            self._dedent()
+            self._emitln("end")
+        else:
+            for line in ir_stmts_to_sv(body_stmts, idx_to_name, indent=0):
+                self._emit(self._get_indent() + line + "\n")
+
+        self._dedent()
+        self._emitln("end")
+        self._emitln()
+
+        if not body_only:
+            self._generate_module_end()
+
+        return self._output.getvalue()
 
     def _eff_reset_active_low(self, fsm: FSMModule) -> bool:
         """Effective reset polarity — prefers DomainBinding when set."""
@@ -498,6 +591,82 @@ class SVCodeGenerator:
             self._emitln("end")
         
         self._emitln()
+
+    def _wait_cycles_states(self, fsm: FSMModule):
+        """Return list of (state, n_cycles, counter_name) for multi-cycle WAIT_CYCLES states."""
+        result = []
+        for state in fsm.states:
+            if state.kind == FSMStateKind.WAIT_CYCLES and state.wait_cycles > 1:
+                cname = f"{self._state_sv_names[state.id]}_cnt"
+                result.append((state, state.wait_cycles, cname))
+        return result
+
+    def _generate_cycle_counters(self, fsm: FSMModule):
+        """Declare and drive cycle-counter registers for WAIT_CYCLES states.
+
+        For each ``WAIT_CYCLES`` state with ``wait_cycles > 1``:
+
+        * Declare ``logic [W-1:0] <STATE>_cnt;``
+        * Drive it with an ``always_ff`` block that loads ``N-1`` on entry
+          (when transitioning *into* the state) and decrements by one each
+          subsequent cycle while the FSM remains in that state.
+        """
+        wc_states = self._wait_cycles_states(fsm)
+        if not wc_states:
+            return
+
+        clk = self._eff_clk(fsm)
+        rst = self._eff_rst(fsm)
+        rst_style = self.config.reset_style
+
+        if self.config.generate_comments:
+            self._emitln("// Cycle-wait counters")
+
+        # Declarations
+        for state, n_cycles, cname in wc_states:
+            width = max(1, (n_cycles - 1).bit_length())
+            width_str = self._format_width(width)
+            self._emitln(f"logic {width_str}{cname};")
+        self._emitln()
+
+        # Drive each counter
+        for state, n_cycles, cname in wc_states:
+            sname = self._state_sv_names[state.id]
+            init_val = n_cycles - 1
+            width = max(1, init_val.bit_length())
+            rst_style = self.config.reset_style
+            async_rst = rst_style in (ResetStyle.ASYNC_LOW, ResetStyle.ASYNC_HIGH)
+            act_low   = rst_style in (ResetStyle.ASYNC_LOW, ResetStyle.SYNC_LOW)
+            has_reset = rst_style is not None
+            if async_rst:
+                edge = f"negedge {rst}" if act_low else f"posedge {rst}"
+                self._emitln(f"always_ff @(posedge {clk} or {edge}) begin")
+            else:
+                self._emitln(f"always_ff @(posedge {clk}) begin")
+            self._indent()
+            if has_reset:
+                rst_cond = f"!{rst}" if act_low else rst
+                self._emitln(f"if ({rst_cond})")
+                self._indent()
+                self._emitln(f"{cname} <= {width}'d{init_val};")
+                self._dedent()
+                self._emitln("else begin")
+            else:
+                self._emitln("begin")
+            self._indent()
+            self._emitln(f"if (state != {sname} && next_state == {sname})")
+            self._indent()
+            self._emitln(f"{cname} <= {width}'d{init_val};")
+            self._dedent()
+            self._emitln(f"else if (state == {sname})")
+            self._indent()
+            self._emitln(f"{cname} <= {cname} - 1'b1;")
+            self._dedent()
+            self._dedent()
+            self._emitln("end")
+            self._dedent()
+            self._emitln("end")
+            self._emitln()
     
     def _precompute_state_forwarding(self, fsm: FSMModule):
         """Precompute the within-state forwarding map for every state.
@@ -544,7 +713,7 @@ class SVCodeGenerator:
         """Generate combinational next state logic."""
         if not fsm.states:
             return
-        
+
         if self.config.generate_comments:
             self._emitln("// Next state logic")
         
@@ -564,13 +733,12 @@ class SVCodeGenerator:
             # Load this state's forwarding map so conditions use forwarded
             # (combinatorial) values rather than stale registered values.
             self._state_pending = self._state_forward_maps.get(state.id, {})
-            
-            # Generate transitions
+
+            # Generate transitions (counter conditions are now in the FSM IR)
             if state.transitions:
-                # Handle conditional and unconditional transitions
                 conditional = [t for t in state.transitions if t.condition is not None]
                 unconditional = [t for t in state.transitions if t.condition is None]
-                
+
                 for i, trans in enumerate(conditional):
                     target = fsm.get_state(trans.target_state)
                     target_name = self._state_sv_names.get(trans.target_state, f"S{trans.target_state}") if target else f"S{trans.target_state}"
@@ -580,7 +748,7 @@ class SVCodeGenerator:
                     self._indent()
                     self._emitln(f"next_state = {target_name};")
                     self._dedent()
-                
+
                 if unconditional:
                     target = fsm.get_state(unconditional[0].target_state)
                     target_name = self._state_sv_names.get(unconditional[0].target_state, f"S{unconditional[0].target_state}") if target else f"S{unconditional[0].target_state}"
@@ -1743,7 +1911,8 @@ def _add_port(fsm: FSMModule, known: set, name: str, direction: str, width: int)
         known.add(name)
 
 
-def generate_sv(fsm: FSMModule, config: Optional[SVGenConfig] = None) -> str:
+def generate_sv(fsm: FSMModule, config: Optional[SVGenConfig] = None,
+                *, body_only: bool = False) -> str:
     """Convenience function to generate SystemVerilog code.
     
     When ``config`` is ``None``, the reset style is auto-derived from
@@ -1761,6 +1930,9 @@ def generate_sv(fsm: FSMModule, config: Optional[SVGenConfig] = None) -> str:
     Args:
         fsm: FSM module to generate
         config: Optional generation configuration; overrides auto-derivation.
+        body_only: When True, skip module header, port declarations, and
+            ``endmodule`` — emit only the interior declarations and
+            ``always_ff`` blocks.  Used by ``FSMToRTLPass``.
         
     Returns:
         SystemVerilog source code
@@ -1783,7 +1955,7 @@ def generate_sv(fsm: FSMModule, config: Optional[SVGenConfig] = None) -> str:
             reset_style = ResetStyle.SYNC_HIGH
         config = SVGenConfig(reset_style=reset_style)
     generator = SVCodeGenerator(config)
-    return generator.generate(fsm)
+    return generator.generate(fsm, body_only=body_only)
 
 
 def generate_regfile_sv(meta, module_prefix: str = "") -> str:

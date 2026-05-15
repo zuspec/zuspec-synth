@@ -6,7 +6,20 @@ import dataclasses as dc
 import typing
 from typing import Any, Dict, Optional, Type, get_args, get_origin
 
-from .elab_ir import ComponentSynthMeta, ResourcePoolDecl, ArbiterDecl, InstanceDecl, PortDecl, MethodPortDecl, RegFileDeclIR, IndexedPoolDeclIR
+from .elab_ir import (
+    ComponentSynthMeta, ResourcePoolDecl, ArbiterDecl, InstanceDecl,
+    PortDecl, MethodPortDecl, RegFileDeclIR, IndexedPoolDeclIR,
+    MmrRegFileDeclIR,
+)
+
+import re as _re
+
+
+def _to_snake_case(name: str) -> str:
+    """Convert CamelCase class name to snake_case module name."""
+    s = _re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', name)
+    s = _re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
+    return s.lower()
 
 
 def _get_pool_element_type(hint) -> Optional[type]:
@@ -259,9 +272,16 @@ class Elaborator:
             except TypeError:
                 config_dict = vars(config) if hasattr(config, '__dict__') else {}
 
-        # Get type hints for the component class
+        # Get type hints for the component class, supplying _ClockDomain to fix
+        # the most common forward-reference failure in @zdc.dataclass classes.
+        localns_eh: dict = {}
         try:
-            hints = typing.get_type_hints(component_cls, include_extras=True)
+            from zuspec.dataclasses.domain import _ClockDomainField
+            localns_eh["_ClockDomain"] = _ClockDomainField
+        except ImportError:
+            pass
+        try:
+            hints = typing.get_type_hints(component_cls, include_extras=True, localns=localns_eh)
         except Exception:
             hints = {}
 
@@ -271,6 +291,7 @@ class Elaborator:
         port_decls: list[PortDecl] = []
         method_port_decls: list = []
         regfiles: list[RegFileDeclIR] = []
+        mmr_regfiles: list[MmrRegFileDeclIR] = []
         indexed_pools: list[IndexedPoolDeclIR] = []
 
         pipeline_width = config_dict.get('pipeline_width', 1)
@@ -279,16 +300,26 @@ class Elaborator:
 
         for f in dc.fields(component_cls):
             kind = f.metadata.get('kind')
-            hint = hints.get(f.name)
+            hint = hints.get(f.name) or f.type
 
             if kind == 'instance':
                 # Sub-component instance
                 comp_type = hint if isinstance(hint, type) else None
-                instances.append(InstanceDecl(
-                    name=f.name,
-                    comp_type=comp_type,
-                    is_present=True,  # Phase 1: always present; Phase 2 prunes
-                ))
+                # Check if this is an MMR RegisterFile subclass before treating
+                # it as a regular sub-component instance.
+                if comp_type is not None and getattr(comp_type, '__zdc_regfile__', False):
+                    module_name = _to_snake_case(comp_type.__name__)
+                    mmr_regfiles.append(MmrRegFileDeclIR(
+                        field_name=f.name,
+                        regfile_cls=comp_type,
+                        module_name=module_name,
+                    ))
+                else:
+                    instances.append(InstanceDecl(
+                        name=f.name,
+                        comp_type=comp_type,
+                        is_present=True,  # Phase 1: always present; Phase 2 prunes
+                    ))
 
             elif kind == 'pool':
                 # ClaimPool[T] field — synthesize a resource pool + arbiter
@@ -365,5 +396,6 @@ class Elaborator:
             ports=port_decls,
             method_ports=method_port_decls,
             regfiles=regfiles,
+            mmr_regfiles=mmr_regfiles,
             indexed_pools=indexed_pools,
         )

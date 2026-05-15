@@ -19,10 +19,14 @@ sys.path.insert(0, os.path.join(_this_dir, '..', 'src'))
 sys.path.insert(0, os.path.join(_this_dir, '..', '..', 'zuspec-dataclasses', 'src'))
 sys.path.insert(0, os.path.join(_this_dir, '..', '..', '..', 'src'))
 
-from org.zuspec.example.mls.riscv.rv_units import ALUUnit, MulDivUnit
-from org.zuspec.example.mls.riscv.rv_core import RVCore
+try:
+    from org.zuspec.example.mls.riscv.rv_units import ALUUnit, MulDivUnit
+    from org.zuspec.example.mls.riscv.rv_core import RVCore
+    from org.zuspec.example.mls.riscv.sprtl.decode_field_extractor import DecodeFieldExtractor
+except ImportError as _e:
+    pytest.skip(f'Skipping: missing external reference ({_e})', allow_module_level=True)
+
 from zuspec.synth.sprtl.unit_body_compiler import UnitBodyCompiler
-from org.zuspec.example.mls.riscv.sprtl.decode_field_extractor import DecodeFieldExtractor
 
 
 # ---------------------------------------------------------------------------

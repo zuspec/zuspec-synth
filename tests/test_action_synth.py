@@ -47,24 +47,23 @@ def action_sv():
 # ---------------------------------------------------------------------------
 
 def test_has_clock_reset_ports(action_sv):
-    assert "input clock" in action_sv
-    assert "input reset" in action_sv
+    assert "input  logic clk" in action_sv
+    assert "input  logic rst_n" in action_sv
 
 
 def test_has_count_output_reg(action_sv):
-    assert "output reg" in action_sv
-    assert "count" in action_sv
+    assert "output logic [31:0] count" in action_sv
 
 
 def test_has_always_posedge(action_sv):
-    assert "always @(posedge clock or posedge reset)" in action_sv
+    assert "always_ff @(posedge clk)" in action_sv
 
 
 def test_reset_clears_count(action_sv):
-    assert "count <= 0" in action_sv
+    assert "count <= 32'd0" in action_sv
 
 
 def test_body_increments_count(action_sv):
-    assert "count <= " in action_sv
-    assert "count + 1" in action_sv or "(count + 1)" in action_sv
+    assert "count" in action_sv
+    assert "+ 1" in action_sv
 

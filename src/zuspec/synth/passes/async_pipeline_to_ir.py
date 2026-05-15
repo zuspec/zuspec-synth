@@ -592,20 +592,68 @@ class AsyncPipelineToIrPass(SynthPass):
         """Extract per-port bit-widths from the component's field annotations.
 
         zdc field types are ``Annotated[int, U(width=N, signed=...)]``.
+        Falls back through multiple strategies when get_type_hints() fails
+        (common for @zdc.dataclass classes that inject forward-reference
+        annotations, or plain zdc.Component subclasses without @zdc.dataclass).
         Falls back to 32 for fields whose type cannot be resolved.
         """
+        def _width_from_hint(hint) -> Optional[int]:
+            meta = getattr(hint, "__metadata__", ())
+            for m in meta:
+                if hasattr(m, "width"):
+                    return int(m.width)
+            return None
+
         if comp_cls is None:
             return {}
+        # Strategy 1: get_type_hints() with _ClockDomain supplied to fix the
+        # most common forward-reference failure in @zdc.dataclass classes.
         try:
             import typing
-            hints = typing.get_type_hints(comp_cls, include_extras=True)
+            localns: Dict[str, Any] = {}
+            try:
+                from zuspec.dataclasses.domain import _ClockDomainField
+                localns["_ClockDomain"] = _ClockDomainField
+            except ImportError:
+                pass
+            hints = typing.get_type_hints(comp_cls, include_extras=True, localns=localns)
             result: Dict[str, int] = {}
             for name, hint in hints.items():
-                meta = getattr(hint, "__metadata__", ())
-                for m in meta:
-                    if hasattr(m, "width"):
-                        result[name] = int(m.width)
-                        break
+                if name.startswith("_"):
+                    continue
+                w = _width_from_hint(hint)
+                if w is not None:
+                    result[name] = w
+            if result:
+                return result
+        except Exception:
+            pass
+        # Strategy 2: use f.type from dataclasses.fields() — works when
+        # annotations are real type objects (not strings).
+        try:
+            import dataclasses as _dc
+            result = {}
+            for f in _dc.fields(comp_cls):
+                if f.name.startswith("_"):
+                    continue
+                w = _width_from_hint(f.type)
+                if w is not None:
+                    result[f.name] = w
+            if result:
+                return result
+        except Exception:
+            pass
+        # Strategy 3: __annotations__ directly — works for plain Component
+        # subclasses that don't go through @dataclass at all, when annotations
+        # are real type objects (not strings).
+        try:
+            result = {}
+            for name, hint in getattr(comp_cls, "__annotations__", {}).items():
+                if name.startswith("_"):
+                    continue
+                w = _width_from_hint(hint)
+                if w is not None:
+                    result[name] = w
             return result
         except Exception:
             return {}

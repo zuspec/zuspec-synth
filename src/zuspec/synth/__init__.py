@@ -221,19 +221,26 @@ def _synthesize_pipeline(cls, *, forward: bool = True, top=None) -> str:
 
 
 def _synthesize_sprtl(cls, *, reset_style: str = "sync_low", top=None) -> str:
-    """Run the SPRTL transformer + SV codegen and return SV text.
+    """Run the unified 5-pass lowering chain and return SV text.
 
-    Handles both sync/comb mixed components (via FSM) and pure-comb
-    components (via a simple always_comb module skeleton).
-    Handles hierarchical components (sub-instances) via _synthesize_hierarchical.
+    Pass chain (non-hierarchical path):
+
+    1. :class:`~zuspec.synth.passes.ComponentFieldsPass`
+    2. :class:`~zuspec.synth.passes.ProcessToFSMPass`
+    3. :class:`~zuspec.synth.passes.FSMToRTLPass`
+    4. :class:`~zuspec.synth.passes.CombLowerPass`
+    5. :class:`~zuspec.synth.passes.ModuleAssemblePass`
+
+    Hierarchical components (sub-instances) are still handled by the
+    dedicated ``_synthesize_hierarchical`` function.
     """
     from zuspec.dataclasses.data_model_factory import DataModelFactory
-    from zuspec.synth.sprtl import (
-        SPRTLTransformer,
-        generate_sv,
-        SVGenConfig,
-        FSMOptimizer,
-    )
+    from zuspec.synth.ir.synth_ir import SynthIR, SynthConfig
+    from zuspec.synth.passes.component_fields import ComponentFieldsPass
+    from zuspec.synth.passes.process_to_fsm import ProcessToFSMPass
+    from zuspec.synth.passes.fsm_to_rtl import FSMToRTLPass
+    from zuspec.synth.passes.comb_lower import CombLowerPass
+    from zuspec.synth.passes.module_assemble import ModuleAssemblePass
 
     ctx = DataModelFactory().build(cls)
     module_name = top or cls.__name__
@@ -248,53 +255,34 @@ def _synthesize_sprtl(cls, *, reset_style: str = "sync_low", top=None) -> str:
             f"Available keys: {list(ctx.type_m.keys())}"
         )
 
-    # Hierarchical components (with sub-instances) get their own path.
+    # Pre-process: lower Counter sub-components to explicit register logic.
+    # Must run before _is_hierarchical so counter fields don't route to the
+    # hierarchical synthesis path.
+    from zuspec.synth.passes.counter_lower import lower_counter_fields
+    lower_counter_fields(component_ir, ctx, cls)
+
+    # Hierarchical components (with sub-instances) keep their dedicated path.
     if _is_hierarchical(component_ir, ctx):
         return _synthesize_hierarchical(cls, component_ir, ctx, module_name)
 
-    sync_processes = getattr(component_ir, "sync_processes", [])
-    proc_processes = getattr(component_ir, "proc_processes", [])
+    # Build the synthesis IR and run the unified pass chain.
+    ir = SynthIR(component=cls, model_context=ctx)
+    default_cfg = SynthConfig()
 
-    if sync_processes:
-        proc = sync_processes[0]
-        if getattr(proc, "is_async", False):
-            # Async (while True / await) path — use the SPRTL FSM transformer.
-            reset_cfg = SVGenConfig(reset_style=_reset_style_enum(reset_style))
-            transformer = SPRTLTransformer()
-            fsm = transformer.transform(component_ir, proc)
-            fsm.name = module_name
-            FSMOptimizer(minimize_states=False, merge_operations=False).optimize(fsm)
-            _apply_struct_ir(fsm, ctx)
-            sv = generate_sv(fsm, config=reset_cfg)
-        else:
-            # Plain-def one-cycle sync path — emit always_ff directly from IR.
-            sv = _synthesize_simple_sync(
-                component_ir, proc, module_name, reset_style,
-                ctx=ctx, py_cls=cls,
-            )
-    elif proc_processes:
-        # @zdc.proc Process nodes.
-        # Route through SPRTLTransformer if any field is a protocol port
-        # (needs full FSM/handshake lowering). Otherwise use the simple
-        # register-process path (e.g. Counter pattern).
-        reg_proc_nodes = [p for p in proc_processes if type(p).__name__ == 'Process']
-        if reg_proc_nodes and (_has_protocol_port(component_ir)
-                               or _proc_has_await(reg_proc_nodes[0])):
-            proc = reg_proc_nodes[0]
-            reset_cfg = SVGenConfig(reset_style=_reset_style_enum(reset_style))
-            transformer = SPRTLTransformer()
-            fsm = transformer.transform(component_ir, proc)
-            fsm.name = module_name
-            FSMOptimizer(minimize_states=False, merge_operations=False).optimize(fsm)
-            _apply_struct_ir(fsm, ctx)
-            sv = generate_sv(fsm, config=reset_cfg)
-        elif reg_proc_nodes:
-            sv = _synthesize_reg_process(component_ir, reg_proc_nodes[0], module_name, py_cls=cls)
-        else:
-            sv = _build_comb_module(component_ir, module_name)
-    else:
-        # Pure-comb path: build a simple always_comb module skeleton.
-        sv = _build_comb_module(component_ir, module_name)
+    passes = [
+        ComponentFieldsPass(default_cfg),
+        ProcessToFSMPass(default_cfg),
+        FSMToRTLPass(default_cfg),
+        CombLowerPass(default_cfg),
+        ModuleAssemblePass(default_cfg),
+    ]
+    for p in passes:
+        ir = p.run(ir)
+
+    # Override the module name with the caller-supplied value.
+    sv = ir.lowered_sv.get("sv/module/top", "")
+    if module_name != cls.__name__:
+        sv = sv.replace(f"module {cls.__name__} (", f"module {module_name} (", 1)
 
     return sv
 
@@ -738,6 +726,66 @@ def _proc_has_await(proc) -> bool:
                     return True
         return False
     return _check_stmts(getattr(proc, 'body', []))
+
+
+def _is_simple_tick_proc(proc) -> bool:
+    """Return True if *proc* is a `while True: await zdc.tick(); <assignments>` loop.
+
+    Such a proc is semantically equivalent to a @zdc.sync body and can be
+    synthesized via ``_synthesize_simple_sync`` without an FSM.
+    """
+    def _is_tick_await(stmt) -> bool:
+        """Check if stmt is `await zdc.tick()` (no args)."""
+        if type(stmt).__name__ != 'StmtExpr':
+            return False
+        expr = getattr(stmt, 'expr', None)
+        if type(expr).__name__ != 'ExprAwait':
+            return False
+        inner = getattr(expr, 'value', None)
+        if type(inner).__name__ != 'ExprCall':
+            return False
+        func = getattr(inner, 'func', None)
+        if type(func).__name__ != 'ExprAttribute':
+            return False
+        return getattr(func, 'attr', '') == 'tick' and not getattr(inner, 'args', None)
+
+    def _has_nested_await(stmts) -> bool:
+        for s in stmts or []:
+            t = type(s).__name__
+            if t == 'StmtExpr' and type(getattr(s, 'expr', None)).__name__ == 'ExprAwait':
+                return True
+            if t == 'StmtAssign' and type(getattr(s, 'value', None)).__name__ == 'ExprAwait':
+                return True
+            for attr in ('body', 'orelse'):
+                sub = getattr(s, attr, None)
+                if isinstance(sub, list) and _has_nested_await(sub):
+                    return True
+        return False
+
+    body = getattr(proc, 'body', [])
+    if len(body) != 1 or type(body[0]).__name__ != 'StmtWhile':
+        return False
+    loop = body[0]
+    # Must be `while True`
+    test = getattr(loop, 'test', None)
+    if not (type(test).__name__ == 'ExprConstant' and bool(getattr(test, 'value', False))):
+        return False
+    loop_body = getattr(loop, 'body', [])
+    tick_count = sum(1 for s in loop_body if _is_tick_await(s))
+    if tick_count != 1:
+        return False
+    # No nested awaits inside if/while sub-blocks
+    for s in loop_body:
+        if _is_tick_await(s):
+            continue
+        t = type(s).__name__
+        if t not in ('StmtAssign', 'StmtAugAssign', 'StmtIf', 'StmtAnnAssign'):
+            return False
+        for attr in ('body', 'orelse'):
+            sub = getattr(s, attr, None)
+            if isinstance(sub, list) and _has_nested_await(sub):
+                return False
+    return True
 
 
 def _has_protocol_port(component_ir) -> bool:

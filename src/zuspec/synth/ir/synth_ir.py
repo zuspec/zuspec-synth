@@ -201,6 +201,15 @@ class SynthIR:
     +======================+================+===========================================+
     | ``sv/pipeline/top``  | ``SVEmitPass`` | Full pipeline SystemVerilog text          |
     +----------------------+----------------+-------------------------------------------+
+    | ``sv/module/clocked``| ``FSMToRTLPass`` | ``always_ff`` bodies for all clocked    |
+    |                      |                | processes (non-pipeline path)             |
+    +----------------------+----------------+-------------------------------------------+
+    | ``sv/module/comb``   | ``CombLowerPass`` | ``always_comb`` bodies (non-pipeline   |
+    |                      |                | path)                                     |
+    +----------------------+----------------+-------------------------------------------+
+    | ``sv/module/top``    | ``ModuleAssemblePass`` | Complete SV text for the module  |
+    |                      |                | (non-pipeline path)                       |
+    +----------------------+----------------+-------------------------------------------+
 
     Passes that add new keys **must** register them in the table above.  Experimental or
     private keys must use a ``_`` prefix in the item segment
@@ -208,6 +217,14 @@ class SynthIR:
     """
     stage_sv: Dict[str, List[str]] = dc.field(default_factory=dict)
     model_context: Optional[Any] = dc.field(default=None)
+
+    # --- New unified-lowering fields (non-pipeline SPRTL path) -------------
+
+    component_fields: Optional[Any] = dc.field(default=None)
+    """Classified ports, state vars, and domain info.  Set by ComponentFieldsPass."""
+
+    fsm_modules: List[Any] = dc.field(default_factory=list)
+    """One FSMModule per clocked process.  Set by ProcessToFSMPass."""
 
     # --- New Phase 5 fields -------------------------------------------------
 

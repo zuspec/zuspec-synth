@@ -19,7 +19,11 @@ sys.path.insert(0, os.path.join(_this_dir, '..', 'src'))
 sys.path.insert(0, os.path.join(_this_dir, '..', '..', 'zuspec-dataclasses', 'src'))
 sys.path.insert(0, os.path.join(_this_dir, '..', '..', '..', 'src'))
 
-from org.zuspec.example.mls.riscv.rv_core import Decode
+try:
+    from org.zuspec.example.mls.riscv.rv_core import Decode
+except ImportError as _e:
+    pytest.skip(f'Skipping: missing external reference ({_e})', allow_module_level=True)
+
 from zuspec.synth.sprtl.accessor_lowering import (
     AccessorLowering,
     _detect_sext_body,
