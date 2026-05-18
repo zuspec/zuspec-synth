@@ -208,16 +208,8 @@ class SVCodeGenerator:
         self._port_widths: Dict[str, int] = {p.name: p.width for p in fsm.ports}
 
         # Build a deduplicated state-name map (state.id → SV enum literal).
-        # If two states share a name, append the encoded value to disambiguate.
-        self._state_sv_names: Dict[int, str] = {}
-        _seen: Dict[str, int] = {}
-        for i, st in enumerate(fsm.states):
-            enc = fsm.state_encoding.get(st.id, i)
-            sname = st.name
-            if sname in _seen and _seen[sname] != enc:
-                sname = f"{sname}_{enc}"
-            _seen.setdefault(st.name, enc)
-            self._state_sv_names[st.id] = sname
+        from zuspec.synth.sprtl.fsm_structural import fsm_state_names
+        self._state_sv_names: Dict[int, str] = fsm_state_names(fsm)
         # Auto-infer registers: collect all FSMAssign targets not yet in fsm.registers.
         # Skip array-indexed targets (e.g. "gpr[rd]") — those are covered by array_fields.
         # Skip ports (declared in module header), array fields, and clock/reset signals.
@@ -502,7 +494,8 @@ class SVCodeGenerator:
             self._emitln("// State encoding")
         
         # Generate enum type
-        width = fsm.state_width or 1
+        from zuspec.synth.sprtl.fsm_structural import fsm_state_width
+        width = fsm_state_width(fsm)
         self._emitln(f"typedef enum logic [{width-1}:0] {{")
         self._indent()
         
@@ -560,8 +553,8 @@ class SVCodeGenerator:
         if self.config.generate_comments:
             self._emitln("// State register")
         
-        initial_state = fsm.get_state(fsm.initial_state)
-        initial_name = self._state_sv_names.get(initial_state.id, "IDLE") if initial_state else "IDLE"
+        from zuspec.synth.sprtl.fsm_structural import fsm_initial_state_name
+        initial_name = fsm_initial_state_name(fsm, self._state_sv_names)
         
         if self.config.reset_style == ResetStyle.ASYNC_LOW:
             self._emitln(f"always_ff @(posedge {self._eff_clk(fsm)} or negedge {self._eff_rst(fsm)}) begin")
@@ -593,13 +586,9 @@ class SVCodeGenerator:
         self._emitln()
 
     def _wait_cycles_states(self, fsm: FSMModule):
-        """Return list of (state, n_cycles, counter_name) for multi-cycle WAIT_CYCLES states."""
-        result = []
-        for state in fsm.states:
-            if state.kind == FSMStateKind.WAIT_CYCLES and state.wait_cycles > 1:
-                cname = f"{self._state_sv_names[state.id]}_cnt"
-                result.append((state, state.wait_cycles, cname))
-        return result
+        """Return WaitCounterInfo list for multi-cycle WAIT_CYCLES states."""
+        from zuspec.synth.sprtl.fsm_structural import fsm_wait_counter_info
+        return fsm_wait_counter_info(fsm, self._state_sv_names)
 
     def _generate_cycle_counters(self, fsm: FSMModule):
         """Declare and drive cycle-counter registers for WAIT_CYCLES states.
@@ -623,17 +612,17 @@ class SVCodeGenerator:
             self._emitln("// Cycle-wait counters")
 
         # Declarations
-        for state, n_cycles, cname in wc_states:
-            width = max(1, (n_cycles - 1).bit_length())
-            width_str = self._format_width(width)
-            self._emitln(f"logic {width_str}{cname};")
+        for wci in wc_states:
+            width_str = self._format_width(wci.counter_width)
+            self._emitln(f"logic {width_str}{wci.counter_name};")
         self._emitln()
 
         # Drive each counter
-        for state, n_cycles, cname in wc_states:
-            sname = self._state_sv_names[state.id]
-            init_val = n_cycles - 1
-            width = max(1, init_val.bit_length())
+        for wci in wc_states:
+            sname = self._state_sv_names[wci.state.id]
+            cname = wci.counter_name
+            init_val = wci.init_val
+            width = wci.counter_width
             rst_style = self.config.reset_style
             async_rst = rst_style in (ResetStyle.ASYNC_LOW, ResetStyle.ASYNC_HIGH)
             act_low   = rst_style in (ResetStyle.ASYNC_LOW, ResetStyle.SYNC_LOW)

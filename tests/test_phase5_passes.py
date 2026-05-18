@@ -216,23 +216,72 @@ class TestSynthIRNewFields:
 
 
 # ============================================================
-# QueueLowerPass — runs on minimal SynthIR with no model context
+# AbstractionSVEmitPass — replaces QueueLowerPass in pipeline
 # ============================================================
 
-class TestQueueLowerPass:
+class TestAbstractionSVEmitPass:
     def test_no_context_noop(self):
-        from zuspec.synth.passes.queue_lower import QueueLowerPass
-        from zuspec.synth.ir.synth_ir import SynthConfig
+        from zuspec.synth.passes.abstraction_sv_lower import AbstractionSVEmitPass
         ir = _make_ir()
-        result = QueueLowerPass(SynthConfig()).run(ir)
+        result = AbstractionSVEmitPass().run(ir)
         assert result.queue_nodes == []
 
     def test_returns_ir(self):
-        from zuspec.synth.passes.queue_lower import QueueLowerPass
-        from zuspec.synth.ir.synth_ir import SynthConfig
+        from zuspec.synth.passes.abstraction_sv_lower import AbstractionSVEmitPass
         ir = _make_ir()
-        result = QueueLowerPass(SynthConfig()).run(ir)
+        result = AbstractionSVEmitPass().run(ir)
         assert result is ir
+
+    def test_abstraction_field_ir_produces_queue_node(self):
+        """AbstractionFieldIR(Queue) → AbstractionSVEmitPass → ir.queue_nodes populated."""
+        import zuspec.dataclasses as zdc
+        from zuspec.dataclasses.data_model_factory import DataModelFactory
+        from zuspec.synth.passes.abstraction_sv_lower import AbstractionSVEmitPass
+
+        @zdc.dataclass
+        class _Comp(zdc.Component):
+            req_q: zdc.Queue[zdc.u32] = zdc.inst(zdc.Queue, kwargs={"DEPTH": 4})
+
+        ctx = DataModelFactory().build(_Comp)
+        ir = _make_ir(_Comp)
+        ir.model_context = ctx
+        result = AbstractionSVEmitPass().run(ir)
+        assert len(result.queue_nodes) == 1
+        node = result.queue_nodes[0]
+        assert node.name == "req_q"
+        assert node.elem_width == 32
+        assert node.depth == 4
+
+    def test_abstraction_field_ir_stores_lowered_sv(self):
+        """Queue AbstractionFieldIR → queue_nodes, not lowered_sv (ProtocolSVEmitPass handles SV)."""
+        import zuspec.dataclasses as zdc
+        from zuspec.dataclasses.data_model_factory import DataModelFactory
+        from zuspec.synth.passes.abstraction_sv_lower import AbstractionSVEmitPass
+
+        @zdc.dataclass
+        class _Comp2(zdc.Component):
+            data_q: zdc.Queue[zdc.u16] = zdc.inst(zdc.Queue, kwargs={"DEPTH": 8})
+
+        ctx = DataModelFactory().build(_Comp2)
+        ir = _make_ir(_Comp2)
+        ir.model_context = ctx
+        AbstractionSVEmitPass().run(ir)
+        # Queue SV is emitted via queue_nodes → ProtocolSVEmitPass, not lowered_sv
+        assert len(ir.queue_nodes) == 1
+        assert "sv/module/data_q" not in ir.lowered_sv
+
+    def test_protocol_pipeline_emits_fifo_sv(self):
+        """End-to-end: ProtocolSynthPipeline emits FIFO SV for Queue fields."""
+        import zuspec.dataclasses as zdc
+        from zuspec.synth.protocol_pipeline import ProtocolSynthPipeline
+
+        @zdc.dataclass
+        class _PipeComp(zdc.Component):
+            data_q: zdc.Queue[zdc.u16] = zdc.inst(zdc.Queue, kwargs={"DEPTH": 8})
+
+        pipeline = ProtocolSynthPipeline(_PipeComp)
+        sv = pipeline.run()
+        assert "fifo" in sv.lower() or "FIFO" in sv
 
 
 # ============================================================

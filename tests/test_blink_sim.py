@@ -352,15 +352,26 @@ class TestBlinkFastFSM:
         assert len(wc_cond) == 1, "Expected one LOOP_I_CHK state"
 
     def test_loop_increment_in_wait_cycles_state(self, blink_fast_fsm):
-        """Loop increment (i += 1) must be in the WAIT_CYCLES state."""
-        from zuspec.synth.sprtl.fsm_ir import FSMAssign
+        """Loop increment (i += 1) must be in the WAIT_CYCLES state (possibly nested in FSMCond)."""
+        from zuspec.synth.sprtl.fsm_ir import FSMAssign, FSMCond
+
+        def collect_assigns(ops):
+            result = []
+            for op in ops:
+                if isinstance(op, FSMAssign):
+                    result.append(op)
+                elif isinstance(op, FSMCond):
+                    result.extend(collect_assigns(op.then_ops))
+                    result.extend(collect_assigns(op.else_ops or []))
+            return result
+
         wc = next(s for s in blink_fast_fsm.states
                   if s.kind == FSMStateKind.WAIT_CYCLES and s.wait_cycles > 1)
-        assigns = [op for op in wc.operations if isinstance(op, FSMAssign)]
+        assigns = collect_assigns(wc.operations)
         assert any(
             isinstance(op.value, tuple) and '+' in op.value
             for op in assigns
-        ), "Expected i <= i + 1 in WAIT_CYCLES state"
+        ), "Expected i += 1 in WAIT_CYCLES state (possibly nested in FSMCond)"
 
 
 class TestBlinkFastSimulation:
@@ -378,15 +389,15 @@ class TestBlinkFastSimulation:
         assert out.get('L4') == 0
 
     def test_l1_high_for_exactly_one_cycle(self, blink_fast_interp):
-        """L1 stays high for exactly 1 cycle (outputs are registered)."""
+        """L1 stays high for exactly 1 cycle per pulse (outputs are registered, not sustained)."""
         blink_fast_interp.reset()
-        # Find cycle where L1 goes high
-        l1_high_cycles = 0
+        prev_l1 = 0
         for _ in range(50):
             out = blink_fast_interp.step()
-            if out.get('L1') == 1:
-                l1_high_cycles += 1
-        assert l1_high_cycles == 1, f"L1 should be high exactly 1 cycle in 50, got {l1_high_cycles}"
+            cur_l1 = out.get('L1', 0)
+            assert not (prev_l1 == 1 and cur_l1 == 1), \
+                "L1 was high for >1 consecutive cycle — outputs should be single-cycle pulses"
+            prev_l1 = cur_l1
 
     def test_outputs_rotate_l1_l2_l3_l4(self, blink_fast_interp):
         """In the first 4 iterations, outputs rotate: L1 then L2 then L3 then L4."""

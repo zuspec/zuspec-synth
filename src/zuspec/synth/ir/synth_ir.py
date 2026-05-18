@@ -217,6 +217,26 @@ class SynthIR:
     """
     stage_sv: Dict[str, List[str]] = dc.field(default_factory=dict)
     model_context: Optional[Any] = dc.field(default=None)
+    lowered_py: Dict[str, str] = dc.field(default_factory=dict)
+    """Python source fragments produced by Python-backend passes.
+
+    Key naming convention mirrors ``lowered_sv``:  ``<backend>/<category>/<item>``
+    where backend is always ``py``.
+
+    Use :func:`validate_lowered_sv_key` to validate keys (the same regex applies).
+
+    **Registered keys:**
+
+    +------------------------+---------------------------+--------------------------------------+
+    | Key                    | Producer pass             | Description                          |
+    +========================+===========================+======================================+
+    | ``py/module/sync``     | ``FSMToPythonPass``       | ``@zdc.sync`` method body text       |
+    +------------------------+---------------------------+--------------------------------------+
+    | ``py/module/comb``     | ``CombToPythonPass``      | ``@zdc.comb`` method body text       |
+    +------------------------+---------------------------+--------------------------------------+
+    | ``py/module/top``      | ``ModuleAssemblePythonPass`` | Complete reconstructed Python     |
+    +------------------------+---------------------------+--------------------------------------+
+    """
 
     # --- New unified-lowering fields (non-pipeline SPRTL path) -------------
 
@@ -232,7 +252,8 @@ class SynthIR:
     """IfProtocol port/export nodes produced by ``IfProtocolLowerPass``."""
 
     queue_nodes: List[QueueIR] = dc.field(default_factory=list)
-    """Queue synthesis IR nodes produced by ``QueueLowerPass``."""
+    """Queue synthesis IR nodes.  Populated by ``AbstractionSVEmitPass``; consumed
+    by ``ProtocolSVEmitPass._emit_queues()``."""  # deprecated: QueueLowerPass removed
 
     spawn_nodes: List[SpawnIR] = dc.field(default_factory=list)
     """Spawn synthesis IR nodes produced by ``SpawnLowerPass``."""

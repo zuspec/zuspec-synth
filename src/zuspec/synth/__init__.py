@@ -256,10 +256,10 @@ def _synthesize_sprtl(cls, *, reset_style: str = "sync_low", top=None) -> str:
         )
 
     # Pre-process: lower Counter sub-components to explicit register logic.
-    # Must run before _is_hierarchical so counter fields don't route to the
-    # hierarchical synthesis path.
-    from zuspec.synth.passes.counter_lower import lower_counter_fields
-    lower_counter_fields(component_ir, ctx, cls)
+    # AbstractionSVLowerPass handles AbstractionFieldIR nodes produced by
+    # DataModelFactory when it encounters Lowerable fields (Counter, etc.).
+    from zuspec.synth.passes.abstraction_sv_lower import run_abstraction_sv_lower
+    run_abstraction_sv_lower(component_ir)
 
     # Hierarchical components (with sub-instances) keep their dedicated path.
     if _is_hierarchical(component_ir, ctx):
@@ -285,6 +285,76 @@ def _synthesize_sprtl(cls, *, reset_style: str = "sync_low", top=None) -> str:
         sv = sv.replace(f"module {cls.__name__} (", f"module {module_name} (", 1)
 
     return sv
+
+
+
+# ---------------------------------------------------------------------------
+# Python round-trip backend
+# ---------------------------------------------------------------------------
+
+def lower_to_python(cls, *, top: str = None) -> str:
+    """Lower a ``@zdc.dataclass`` component to reconstructed Python source.
+
+    Runs the 5-pass Python backend chain and returns a complete Python class
+    as a string:
+
+    1. :class:`~zuspec.synth.passes.ComponentFieldsPass`
+    2. :class:`~zuspec.synth.passes.ProcessToFSMPass`
+    3. :class:`~zuspec.synth.passes.FSMToPythonPass`
+    4. :class:`~zuspec.synth.passes.CombToPythonPass`
+    5. :class:`~zuspec.synth.passes.ModuleAssemblePythonPass`
+
+    Parameters
+    ----------
+    cls:
+        Component class decorated with ``@zdc.dataclass``.
+    top:
+        Override the generated class name (default: ``cls.__name__``).
+
+    Returns
+    -------
+    str
+        Complete Python source for the reconstructed component.
+
+    Example
+    -------
+    ::
+
+        from zuspec.synth import lower_to_python
+        from my_component import Blink
+
+        src = lower_to_python(Blink)
+        print(src)
+    """
+    from zuspec.dataclasses.data_model_factory import DataModelFactory
+    from zuspec.synth.ir.synth_ir import SynthIR, SynthConfig
+    from zuspec.synth.passes.component_fields import ComponentFieldsPass
+    from zuspec.synth.passes.process_to_fsm import ProcessToFSMPass
+    from zuspec.synth.passes.fsm_to_python import FSMToPythonPass
+    from zuspec.synth.passes.comb_to_python import CombToPythonPass
+    from zuspec.synth.passes.module_assemble_python import ModuleAssemblePythonPass
+
+    ctx = DataModelFactory().build(cls)
+    ir = SynthIR(component=cls, model_context=ctx)
+    cfg = SynthConfig()
+
+    passes = [
+        ComponentFieldsPass(cfg),
+        ProcessToFSMPass(cfg),
+        FSMToPythonPass(cfg),
+        CombToPythonPass(cfg),
+        ModuleAssemblePythonPass(cfg),
+    ]
+    for p in passes:
+        ir = p.run(ir)
+
+    py_src = ir.lowered_py.get("py/module/top", "")
+
+    # Override class name if requested.
+    if top and top != cls.__name__ and py_src:
+        py_src = py_src.replace(f"class {cls.__name__}", f"class {top}", 1)
+
+    return py_src
 
 
 # ---------------------------------------------------------------------------
@@ -807,6 +877,8 @@ def _has_protocol_port(component_ir) -> bool:
 def _is_hierarchical(component_ir, ctx) -> bool:
     """Return True if the component has sub-component instance fields."""
     for f in component_ir.fields:
+        if getattr(f, "is_abstraction_field", False):
+            continue
         if type(f).__name__ == "Field":
             dt = getattr(f, "datatype", None)
             if dt and type(dt).__name__ == "DataTypeRef":
