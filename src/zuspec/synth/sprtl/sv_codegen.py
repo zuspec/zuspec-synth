@@ -515,9 +515,14 @@ class SVCodeGenerator:
     
     def _generate_register_declarations(self, fsm: FSMModule):
         """Generate internal register declarations."""
-        # Filter out state register and port signals (already declared in module header)
+        # Filter out state register, port signals, and cycle-wait counter
+        # registers (declared separately by _generate_cycle_counters).
         port_names = {p.name for p in fsm.ports}
-        regs = [r for r in fsm.registers if r.name != "state" and r.name not in port_names]
+        wc_counter_names = {wci.counter_name for wci in self._wait_cycles_states(fsm)}
+        regs = [r for r in fsm.registers
+                if r.name != "state"
+                and r.name not in port_names
+                and r.name not in wc_counter_names]
 
         has_content = bool(regs or self._array_fields or fsm.struct_instances)
         if not has_content:
@@ -1353,14 +1358,6 @@ class SVCodeGenerator:
         self._dedent()
         self._emitln("end else begin")
         self._indent()
-
-        # Default-clear all output ports each cycle so that valid/strobe
-        # signals are asserted for exactly one clock cycle per transaction.
-        # Individual states override these defaults by assigning later in the
-        # same always_ff block (last-assignment-wins for non-blocking).
-        for port in output_ports:
-            reset_val = self._format_reset_value(port.reset_value, port.width)
-            self._emitln(f"{port.name} <= {reset_val};")
 
         self._emitln("case (state)")
         self._indent()

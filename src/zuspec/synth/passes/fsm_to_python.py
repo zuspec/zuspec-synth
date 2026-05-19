@@ -284,6 +284,41 @@ class _MultiStatePythonEmitter:
                 return f"{base}[{sl.value}]"
             return f"{base}[{self._fmt_expr(sl)}]"
 
+        if t == "ExprCall":
+            func = expr.func
+            args = getattr(expr, "args", [])
+
+            if func is not None and type(func).__name__ == "ExprAttribute":
+                _ZDC_CTOR_ATTRS = (
+                    "bv", "bit", "u1", "u2", "u4", "u8", "u16", "u32", "u64",
+                    "s8", "s16", "s32", "s64",
+                )
+                if func.attr in _ZDC_CTOR_ATTRS:
+                    base_val = func.value
+                    if (
+                        base_val is not None
+                        and type(base_val).__name__ == "ExprRefUnresolved"
+                        and base_val.name == "zdc"
+                        and len(args) == 1
+                    ):
+                        return f"zdc.{func.attr}({self._fmt_expr(args[0])})"
+                if func.attr == "read" and func.value is not None:
+                    return self._fmt_expr(func.value)
+
+            if func is not None and type(func).__name__ == "ExprRefUnresolved":
+                fname = func.name
+                if fname == "int" and len(args) == 1:
+                    return self._fmt_expr(args[0])
+                if fname == "bool" and len(args) == 1:
+                    return f"bool({self._fmt_expr(args[0])})"
+                if fname == "_illegal":
+                    return "# illegal"
+
+            if func is not None:
+                fn_str = self._fmt_expr(func)
+                args_str = ", ".join(self._fmt_expr(arg) for arg in args)
+                return f"{fn_str}({args_str})"
+
         # Fallback: try common attributes
         if hasattr(expr, "name"):
             return self._py_name(expr.name)

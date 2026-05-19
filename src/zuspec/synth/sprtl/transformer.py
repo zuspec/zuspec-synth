@@ -412,12 +412,20 @@ class SPRTLTransformer:
             self._transform_loop(stmt)
     
     def _transform_loop(self, stmt: Any):
-        """Transform a regular (non-while-True) loop."""
-        # Create a loop state that checks condition
+        """Transform a regular (non-while-True) loop.
+
+        Generated states
+        ----------------
+        ``LOOP_<N>``      — WAIT_COND: check condition each iteration; exit when false
+        ``LOOP_BODY_<N>`` — NORMAL: first state of the loop body
+        …                 — states created by body's await expressions
+        ``LOOP_DONE_<N>`` — NORMAL: first state after the loop
+        """
         test = getattr(stmt, 'test', None)
         body = getattr(stmt, 'body', [])
-        
-        loop_state = self._ctx.new_state(
+
+        # LOOP_CHK — evaluate condition; conditional → body, unconditional → done
+        loop_chk = self._ctx.new_state(
             self._ctx.make_state_name("LOOP"),
             FSMStateKind.WAIT_COND,
             wait_condition=test,
@@ -425,19 +433,38 @@ class SPRTLTransformer:
                 "loop stall", cond_str=self._format_cond_str(test)
             )
         )
-        
-        # Transition from current state to loop state
-        if self._ctx.current_state:
-            self._ctx.current_state.add_transition(loop_state.id)
-        
-        self._ctx.current_state = loop_state
-        
-        # Transform loop body
+
+        if self._ctx.current_state is not None:
+            self._ctx.current_state.add_transition(loop_chk.id)
+
+        # LOOP_BODY — entry point for the loop body (separate state so the
+        # counter-reload condition ``state != S_N && next_state == S_N`` fires
+        # correctly on re-entry from loop_chk rather than as a self-loop).
+        loop_body = self._ctx.new_state(
+            self._ctx.make_state_name("LOOP_BODY"),
+            FSMStateKind.NORMAL,
+        )
+        # Conditional advance: condition true → body
+        loop_chk.add_transition(loop_body.id, condition=test)
+
+        self._ctx.current_state = loop_body
+
+        # Transform loop body (may create more states via await expressions)
         self._transform_body(body)
-        
-        # Add back-edge to loop state with condition
-        if self._ctx.current_state:
-            self._ctx.current_state.add_transition(loop_state.id, condition=test)
+
+        # Unconditional back-edge from end of body to loop check so that
+        # loop_chk re-evaluates the condition with updated registered values.
+        if self._ctx.current_state is not None:
+            self._ctx.current_state.add_transition(loop_chk.id)
+
+        # LOOP_DONE — reached when condition is false (unconditional else from chk)
+        loop_done = self._ctx.new_state(
+            self._ctx.make_state_name("LOOP_DONE"),
+            FSMStateKind.NORMAL,
+        )
+        loop_chk.add_transition(loop_done.id)  # unconditional = else branch
+
+        self._ctx.current_state = loop_done
     
     def _branch_has_await(self, stmts: List[Any]) -> bool:
         """Return True if any statement in *stmts* (recursively) contains ExprAwait."""
@@ -1014,6 +1041,26 @@ class SPRTLTransformer:
                 elif self._is_cycles_call(func):
                     self._transform_await_cycles(await_value)
                     return
+
+                # zdc.negedge/posedge/edge(lambda: self.signal) — convert to
+                # a WAIT_COND state with a proper signal-level comparison so
+                # that the SV codegen emits a clean `rx == 0` condition rather
+                # than the unresolved call string.
+                if attr in ('negedge', 'posedge', 'edge') and _HAVE_IR:
+                    args = getattr(await_value, 'args', [])
+                    if args:
+                        lambda_arg = args[0]
+                        if type(lambda_arg).__name__ == 'ExprLambda':
+                            body = getattr(lambda_arg, 'body', None)
+                            if body is not None:
+                                cmp_op = CmpOp.Eq if attr == 'negedge' else CmpOp.NotEq
+                                cond = ExprCompare(
+                                    left=body,
+                                    ops=[cmp_op],
+                                    comparators=[ExprConstant(value=0)],
+                                )
+                                self._transform_await_condition(cond)
+                                return
 
         if await_type == 'ExprCompare':
             self._transform_await_condition(await_value)

@@ -10,8 +10,9 @@ _synth_src = os.path.join(_this_dir, "..", "src")
 _dc_src = os.path.join(_this_dir, "..", "..", "zuspec-dataclasses", "src")
 _blinky_dir = os.path.join(_this_dir, "..", "..", "..", "design", "spl", "blinky")
 _rotate_dir = os.path.join(_this_dir, "..", "..", "..", "design", "spl", "rotate")
+_uart_dir = os.path.join(_this_dir, "..", "..", "..", "design", "spl", "uart")
 
-for _p in (_synth_src, _dc_src, _blinky_dir, _rotate_dir):
+for _p in (_synth_src, _dc_src, _blinky_dir, _rotate_dir, _uart_dir):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -199,3 +200,26 @@ class TestMultiStateFSM:
         """``_i`` should be incremented inside the S_3 state body."""
         src = ir.lowered_py["py/module/top"]
         assert "self._i = self._i + 1" in src or "self._i += " in src
+
+
+class TestUartRxLowering:
+    @pytest.fixture(scope="class")
+    def ir(self):
+        import uart_rx as spl_uart
+        return _build_ir(spl_uart.UartRx)
+
+    def test_uart_output_is_valid_python(self, ir):
+        src = ir.lowered_py["py/module/top"]
+        try:
+            compile(src, "<generated-uart>", "exec")
+        except SyntaxError as exc:
+            pytest.fail(f"Generated UART Python has syntax error: {exc}")
+
+    def test_uart_exprcall_nodes_are_lowered(self, ir):
+        src = ir.lowered_py["py/module/top"]
+        assert "ExprCall(" not in src
+
+    def test_uart_references_keep_self_prefix(self, ir):
+        src = ir.lowered_py["py/module/top"]
+        assert "if (self.rx == 1):" in src
+        assert "self._data = (self._data | (self.rx << self._bit_i))" in src
