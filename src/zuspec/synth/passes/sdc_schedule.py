@@ -161,6 +161,11 @@ class SDCSchedulePass(SynthPass):
     def name(self) -> str:
         return "sdc_schedule"
 
+    @property
+    def output_layer(self):
+        from zuspec.synth.ir.layers import IRLayer
+        return IRLayer.SCHEDULED
+
     def run(self, ir: SynthIR) -> SynthIR:
         """Run SDC scheduling on the flat stage produced by :class:`PipelineAnnotationPass`.
 

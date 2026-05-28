@@ -90,6 +90,11 @@ class SchedulePass(SynthPass):
     def name(self) -> str:
         return "schedule"
 
+    @property
+    def output_layer(self):
+        from zuspec.synth.ir.layers import IRLayer
+        return IRLayer.SCHEDULED
+
     def run(self, ir: SynthIR) -> SynthIR:
         if ir.fsm_module is None:
             _log.info("[SchedulePass] no fsm_module — skipping scheduling")

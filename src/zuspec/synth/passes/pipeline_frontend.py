@@ -60,6 +60,11 @@ class PipelineFrontendPass(SynthPass):
     def name(self) -> str:
         return "pipeline_frontend"
 
+    @property
+    def output_layer(self):
+        from zuspec.synth.ir.layers import IRLayer
+        return IRLayer.PIPELINE
+
     def run(self, ir: SynthIR) -> SynthIR:
         """Build ``ir.pipeline_ir`` from new-style pipeline IR in model context.
 
@@ -141,6 +146,19 @@ class PipelineFrontendPass(SynthPass):
             operations = []
             if smir and smir.body_ast is not None and is_first_substage:
                 operations = list(smir.body_ast.body)
+            # Propagate source location from the body AST node (R2).
+            stage_loc = None
+            if smir and smir.body_ast is not None:
+                try:
+                    from zuspec.ir.core.base import Loc
+                    stage_loc = Loc(
+                        file=getattr(smir.body_ast, "filename", None),
+                        line=getattr(smir.body_ast, "lineno", 0),
+                        pos=getattr(smir.body_ast, "col_offset", 0),
+                        ref=self.name,
+                    )
+                except Exception:
+                    pass
             stage = StageIR(
                 name=sname,
                 index=idx,
@@ -149,6 +167,7 @@ class PipelineFrontendPass(SynthPass):
                 stall_cond=smir.stall_decls[0].cond_ast if (smir and smir.stall_decls and is_first_substage) else None,
                 cancel_cond=smir.cancel_decls[0].cond_ast if (smir and smir.cancel_decls and is_first_substage) else None,
                 flush_decls=list(smir.flush_decls) if (smir and is_first_substage) else [],
+                loc=stage_loc,
             )
             stages.append(stage)
 

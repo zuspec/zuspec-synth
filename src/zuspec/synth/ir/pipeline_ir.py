@@ -44,6 +44,7 @@ class ForwardingDecl:
     to_stage:   str          # consumer stage name (e.g. "ID")
     signal:     str          # variable name being forwarded/stalled
     suppressed: bool = False # True → no_forward (stall); False → forward (bypass mux)
+    loc:        Any  = None  # Optional[Loc] -- source location propagated by ForwardingGenPass (R2)
 
 
 @dataclass
@@ -182,6 +183,7 @@ class StageIR:
     stall_cond:   Any      = None   # lowered AST for zdc.stage.stall(...) if present
     cancel_cond:  Any      = None   # lowered AST for zdc.stage.cancel(...) if present
     flush_decls:  List[Any] = field(default_factory=list)  # List[FlushDeclNode] from stage body
+    loc:          Any       = None   # Optional[Loc] -- source location propagated from body_ast
 
 
 @dataclass
@@ -254,4 +256,3 @@ class PipelineIR:
     Used by :class:`~zuspec.synth.passes.expr_lowerer.ExprLowerer` to
     substitute ingress variable names with their port data signals.
     """
-

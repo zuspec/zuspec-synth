@@ -21,6 +21,11 @@ class LowerPass(SynthPass):
     def name(self) -> str:
         return "lower"
 
+    @property
+    def output_layer(self):
+        from zuspec.synth.ir.layers import IRLayer
+        return IRLayer.STRUCTURAL
+
     def run(self, ir: SynthIR) -> SynthIR:
         from zuspec.synth.elab.lowerer import Lowerer
 

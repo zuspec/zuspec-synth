@@ -264,6 +264,11 @@ class AsyncPipelineToIrPass(SynthPass):
     def name(self) -> str:
         return "AsyncPipelineToIrPass"
 
+    @property
+    def output_layer(self):
+        from zuspec.synth.ir.layers import IRLayer
+        return IRLayer.PIPELINE
+
     def run(self, ir: SynthIR) -> SynthIR:
         ip: Optional[IrPipeline] = ir.async_pipeline_ir
         if ip is None:

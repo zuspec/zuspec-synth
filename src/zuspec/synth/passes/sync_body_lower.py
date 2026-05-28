@@ -111,6 +111,11 @@ class SyncBodyLowerPass(SynthPass):
     def name(self) -> str:
         return "sync_body_lower"
 
+    @property
+    def output_layer(self):
+        from zuspec.synth.ir.layers import IRLayer
+        return IRLayer.STRUCTURAL
+
     def run(self, ir: SynthIR) -> SynthIR:
         """Rewrite DSL queries in sync and stage bodies.
 

@@ -167,6 +167,24 @@ class SynthCommand(Command):
             metavar="FILELIST",
             help="File containing a list of source files (one per line)",
         )
+        p.add_argument(
+            "--dump-ir",
+            metavar="PATH",
+            default=None,
+            help=(
+                "After SchedulePass, serialize SynthIR to PATH using "
+                "IRBoundarySerializer (R3).  Later reloadable with --load-ir."
+            ),
+        )
+        p.add_argument(
+            "--load-ir",
+            metavar="PATH",
+            default=None,
+            help=(
+                "Load a previously serialized SynthIR snapshot from PATH "
+                "and skip elaboration/scheduling passes (R3)."
+            ),
+        )
         return p
 
     def run(self, args: argparse.Namespace, registry: "Registry") -> int:
@@ -197,6 +215,28 @@ class SynthCommand(Command):
 
         be = registry.get_backend(args.be)
         runner = PipelineRunner(fe, xfs, be)
+
+        # --load-ir: bypass elaboration and scheduling; run emission only.
+        load_ir_path = getattr(args, "load_ir", None)
+        if load_ir_path:
+            try:
+                from zuspec.synth.ir.boundary import IRBoundaryDeserializer
+                deser = IRBoundaryDeserializer()
+                yaml_text = Path(load_ir_path).read_text()
+                ir, layer = deser.deserialize_synth_ir(yaml_text)
+                # Delegate to backend directly with the reloaded IR.
+                if hasattr(be, "run_ir"):
+                    return be.run_ir(ir, args)
+            except Exception as exc:
+                import sys
+                print(f"[zuspec-synth] --load-ir failed: {exc}", file=sys.stderr)
+                return 1
+
+        # --dump-ir: serialize after scheduling, before emission.
+        dump_ir_path = getattr(args, "dump_ir", None)
+        if dump_ir_path:
+            runner._dump_ir_path = dump_ir_path
+
         return runner.run(files, args)
 
 
