@@ -24,6 +24,7 @@ This package provides:
 """
 
 from . import sprtl
+from .pcf_gen import gen_pcf
 
 
 def synthesize(cls, *, output=None, top=None, reset_style="sync_low",
@@ -220,19 +221,26 @@ def _synthesize_pipeline(cls, *, forward: bool = True, top=None) -> str:
 
 
 def _synthesize_sprtl(cls, *, reset_style: str = "sync_low", top=None) -> str:
-    """Run the SPRTL transformer + SV codegen and return SV text.
+    """Run the unified 5-pass lowering chain and return SV text.
 
-    Handles both sync/comb mixed components (via FSM) and pure-comb
-    components (via a simple always_comb module skeleton).
-    Handles hierarchical components (sub-instances) via _synthesize_hierarchical.
+    Pass chain (non-hierarchical path):
+
+    1. :class:`~zuspec.synth.passes.ComponentFieldsPass`
+    2. :class:`~zuspec.synth.passes.ProcessToFSMPass`
+    3. :class:`~zuspec.synth.passes.FSMToRTLPass`
+    4. :class:`~zuspec.synth.passes.CombLowerPass`
+    5. :class:`~zuspec.synth.passes.ModuleAssemblePass`
+
+    Hierarchical components (sub-instances) are still handled by the
+    dedicated ``_synthesize_hierarchical`` function.
     """
     from zuspec.dataclasses.data_model_factory import DataModelFactory
-    from zuspec.synth.sprtl import (
-        SPRTLTransformer,
-        generate_sv,
-        SVGenConfig,
-        FSMOptimizer,
-    )
+    from zuspec.synth.ir.synth_ir import SynthIR, SynthConfig
+    from zuspec.synth.passes.component_fields import ComponentFieldsPass
+    from zuspec.synth.passes.process_to_fsm import ProcessToFSMPass
+    from zuspec.synth.passes.fsm_to_rtl import FSMToRTLPass
+    from zuspec.synth.passes.comb_lower import CombLowerPass
+    from zuspec.synth.passes.module_assemble import ModuleAssemblePass
 
     ctx = DataModelFactory().build(cls)
     module_name = top or cls.__name__
@@ -247,55 +255,106 @@ def _synthesize_sprtl(cls, *, reset_style: str = "sync_low", top=None) -> str:
             f"Available keys: {list(ctx.type_m.keys())}"
         )
 
-    # Hierarchical components (with sub-instances) get their own path.
+    # Pre-process: lower Counter sub-components to explicit register logic.
+    # AbstractionSVLowerPass handles AbstractionFieldIR nodes produced by
+    # DataModelFactory when it encounters Lowerable fields (Counter, etc.).
+    from zuspec.synth.passes.abstraction_sv_lower import run_abstraction_sv_lower
+    run_abstraction_sv_lower(component_ir)
+
+    # Hierarchical components (with sub-instances) keep their dedicated path.
     if _is_hierarchical(component_ir, ctx):
         return _synthesize_hierarchical(cls, component_ir, ctx, module_name)
 
-    sync_processes = getattr(component_ir, "sync_processes", [])
-    proc_processes = getattr(component_ir, "proc_processes", [])
+    # Build the synthesis IR and run the unified pass chain.
+    ir = SynthIR(component=cls, model_context=ctx)
+    default_cfg = SynthConfig()
 
-    if sync_processes:
-        proc = sync_processes[0]
-        if getattr(proc, "is_async", False):
-            # Async (while True / await) path — use the SPRTL FSM transformer.
-            reset_cfg = SVGenConfig(reset_style=_reset_style_enum(reset_style))
-            transformer = SPRTLTransformer()
-            fsm = transformer.transform(component_ir, proc)
-            fsm.name = module_name
-            FSMOptimizer(minimize_states=False, merge_operations=False).optimize(fsm)
-            _apply_struct_ir(fsm, ctx)
-            sv = generate_sv(fsm, config=reset_cfg)
-        else:
-            # Plain-def one-cycle sync path — emit always_ff directly from IR.
-            sv = _synthesize_simple_sync(
-                component_ir, proc, module_name, reset_style,
-                ctx=ctx, py_cls=cls,
-            )
-    elif proc_processes:
-        # @zdc.proc Process nodes.
-        # Route through SPRTLTransformer if any field is a protocol port
-        # (needs full FSM/handshake lowering). Otherwise use the simple
-        # register-process path (e.g. Counter pattern).
-        reg_proc_nodes = [p for p in proc_processes if type(p).__name__ == 'Process']
-        if reg_proc_nodes and (_has_protocol_port(component_ir)
-                               or _proc_has_await(reg_proc_nodes[0])):
-            proc = reg_proc_nodes[0]
-            reset_cfg = SVGenConfig(reset_style=_reset_style_enum(reset_style))
-            transformer = SPRTLTransformer()
-            fsm = transformer.transform(component_ir, proc)
-            fsm.name = module_name
-            FSMOptimizer(minimize_states=False, merge_operations=False).optimize(fsm)
-            _apply_struct_ir(fsm, ctx)
-            sv = generate_sv(fsm, config=reset_cfg)
-        elif reg_proc_nodes:
-            sv = _synthesize_reg_process(component_ir, reg_proc_nodes[0], module_name, py_cls=cls)
-        else:
-            sv = _build_comb_module(component_ir, module_name)
-    else:
-        # Pure-comb path: build a simple always_comb module skeleton.
-        sv = _build_comb_module(component_ir, module_name)
+    passes = [
+        ComponentFieldsPass(default_cfg),
+        ProcessToFSMPass(default_cfg),
+        FSMToRTLPass(default_cfg),
+        CombLowerPass(default_cfg),
+        ModuleAssemblePass(default_cfg),
+    ]
+    for p in passes:
+        ir = p.run(ir)
+
+    # Override the module name with the caller-supplied value.
+    sv = ir.lowered_sv.get("sv/module/top", "")
+    if module_name != cls.__name__:
+        sv = sv.replace(f"module {cls.__name__} (", f"module {module_name} (", 1)
 
     return sv
+
+
+
+# ---------------------------------------------------------------------------
+# Python round-trip backend
+# ---------------------------------------------------------------------------
+
+def lower_to_python(cls, *, top: str = None) -> str:
+    """Lower a ``@zdc.dataclass`` component to reconstructed Python source.
+
+    Runs the 5-pass Python backend chain and returns a complete Python class
+    as a string:
+
+    1. :class:`~zuspec.synth.passes.ComponentFieldsPass`
+    2. :class:`~zuspec.synth.passes.ProcessToFSMPass`
+    3. :class:`~zuspec.synth.passes.FSMToPythonPass`
+    4. :class:`~zuspec.synth.passes.CombToPythonPass`
+    5. :class:`~zuspec.synth.passes.ModuleAssemblePythonPass`
+
+    Parameters
+    ----------
+    cls:
+        Component class decorated with ``@zdc.dataclass``.
+    top:
+        Override the generated class name (default: ``cls.__name__``).
+
+    Returns
+    -------
+    str
+        Complete Python source for the reconstructed component.
+
+    Example
+    -------
+    ::
+
+        from zuspec.synth import lower_to_python
+        from my_component import Blink
+
+        src = lower_to_python(Blink)
+        print(src)
+    """
+    from zuspec.dataclasses.data_model_factory import DataModelFactory
+    from zuspec.synth.ir.synth_ir import SynthIR, SynthConfig
+    from zuspec.synth.passes.component_fields import ComponentFieldsPass
+    from zuspec.synth.passes.process_to_fsm import ProcessToFSMPass
+    from zuspec.synth.passes.fsm_to_python import FSMToPythonPass
+    from zuspec.synth.passes.comb_to_python import CombToPythonPass
+    from zuspec.synth.passes.module_assemble_python import ModuleAssemblePythonPass
+
+    ctx = DataModelFactory().build(cls)
+    ir = SynthIR(component=cls, model_context=ctx)
+    cfg = SynthConfig()
+
+    passes = [
+        ComponentFieldsPass(cfg),
+        ProcessToFSMPass(cfg),
+        FSMToPythonPass(cfg),
+        CombToPythonPass(cfg),
+        ModuleAssemblePythonPass(cfg),
+    ]
+    for p in passes:
+        ir = p.run(ir)
+
+    py_src = ir.lowered_py.get("py/module/top", "")
+
+    # Override class name if requested.
+    if top and top != cls.__name__ and py_src:
+        py_src = py_src.replace(f"class {cls.__name__}", f"class {top}", 1)
+
+    return py_src
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +379,16 @@ def _ir_expr_to_sv(expr, idx_to_name: dict) -> str:
         return idx_to_name.get(expr.index, f"_f{expr.index}")
     if t == "ExprAttribute":
         base = _ir_expr_to_sv(expr.value, idx_to_name)
+        # ExprAttribute(TypeExprRefSelf, attr) → just the field name
+        if base == "" or type(expr.value).__name__ == "TypeExprRefSelf":
+            return expr.attr
         return f"{base}_{expr.attr}"
+    if t == "ExprSubscript":
+        base = _ir_expr_to_sv(expr.value, idx_to_name)
+        sl = expr.slice
+        if type(sl).__name__ == "ExprConstant":
+            return f"{base}[{sl.value}]"
+        return f"{base}[{_ir_expr_to_sv(sl, idx_to_name)}]"
     if t == "ExprConstant":
         v = expr.value
         if isinstance(v, int) and not isinstance(v, bool) and (v > 0xFFFF or v < -0x8000):
@@ -350,6 +418,17 @@ def _ir_expr_to_sv(expr, idx_to_name: dict) -> str:
                 base = func.value
                 if base is not None and type(base).__name__ == "ExprRefField":
                     return idx_to_name.get(base.index, f"_f{base.index}")
+            # zdc.bv(N) / zdc.bit(N) / zdc.uN(val) → lower to the constant value
+            _ZDC_CTOR_ATTRS = ('bv', 'bit', 'u1', 'u2', 'u4', 'u8', 'u16', 'u32', 'u64',
+                               's8', 's16', 's32', 's64')
+            if func.attr in _ZDC_CTOR_ATTRS:
+                base_val = func.value
+                if (base_val is not None
+                        and type(base_val).__name__ == "ExprRefUnresolved"
+                        and base_val.name == "zdc"):
+                    args = getattr(expr, 'args', [])
+                    if len(args) == 1:
+                        return _ir_expr_to_sv(args[0], idx_to_name)
         # zdc built-in lowering
         if func is not None and type(func).__name__ == "ExprRefUnresolved":
             fname = func.name
@@ -719,6 +798,66 @@ def _proc_has_await(proc) -> bool:
     return _check_stmts(getattr(proc, 'body', []))
 
 
+def _is_simple_tick_proc(proc) -> bool:
+    """Return True if *proc* is a `while True: await zdc.tick(); <assignments>` loop.
+
+    Such a proc is semantically equivalent to a @zdc.sync body and can be
+    synthesized via ``_synthesize_simple_sync`` without an FSM.
+    """
+    def _is_tick_await(stmt) -> bool:
+        """Check if stmt is `await zdc.tick()` (no args)."""
+        if type(stmt).__name__ != 'StmtExpr':
+            return False
+        expr = getattr(stmt, 'expr', None)
+        if type(expr).__name__ != 'ExprAwait':
+            return False
+        inner = getattr(expr, 'value', None)
+        if type(inner).__name__ != 'ExprCall':
+            return False
+        func = getattr(inner, 'func', None)
+        if type(func).__name__ != 'ExprAttribute':
+            return False
+        return getattr(func, 'attr', '') == 'tick' and not getattr(inner, 'args', None)
+
+    def _has_nested_await(stmts) -> bool:
+        for s in stmts or []:
+            t = type(s).__name__
+            if t == 'StmtExpr' and type(getattr(s, 'expr', None)).__name__ == 'ExprAwait':
+                return True
+            if t == 'StmtAssign' and type(getattr(s, 'value', None)).__name__ == 'ExprAwait':
+                return True
+            for attr in ('body', 'orelse'):
+                sub = getattr(s, attr, None)
+                if isinstance(sub, list) and _has_nested_await(sub):
+                    return True
+        return False
+
+    body = getattr(proc, 'body', [])
+    if len(body) != 1 or type(body[0]).__name__ != 'StmtWhile':
+        return False
+    loop = body[0]
+    # Must be `while True`
+    test = getattr(loop, 'test', None)
+    if not (type(test).__name__ == 'ExprConstant' and bool(getattr(test, 'value', False))):
+        return False
+    loop_body = getattr(loop, 'body', [])
+    tick_count = sum(1 for s in loop_body if _is_tick_await(s))
+    if tick_count != 1:
+        return False
+    # No nested awaits inside if/while sub-blocks
+    for s in loop_body:
+        if _is_tick_await(s):
+            continue
+        t = type(s).__name__
+        if t not in ('StmtAssign', 'StmtAugAssign', 'StmtIf', 'StmtAnnAssign'):
+            return False
+        for attr in ('body', 'orelse'):
+            sub = getattr(s, attr, None)
+            if isinstance(sub, list) and _has_nested_await(sub):
+                return False
+    return True
+
+
 def _has_protocol_port(component_ir) -> bool:
     """Return True if the component has any ProtocolPort or ProtocolExport field."""
     try:
@@ -738,6 +877,8 @@ def _has_protocol_port(component_ir) -> bool:
 def _is_hierarchical(component_ir, ctx) -> bool:
     """Return True if the component has sub-component instance fields."""
     for f in component_ir.fields:
+        if getattr(f, "is_abstraction_field", False):
+            continue
         if type(f).__name__ == "Field":
             dt = getattr(f, "datatype", None)
             if dt and type(dt).__name__ == "DataTypeRef":
@@ -750,17 +891,19 @@ def _is_hierarchical(component_ir, ctx) -> bool:
 def _bind_proxy_nested_index_to_name(sub_py_cls, bind_index: int):
     """Map a bind-expression index to a field name for a sub-instance class.
 
-    ``_BindProxy`` builds nested field indices by iterating
-    ``field_type.__dataclass_fields__`` and skipping names that start with ``_``.
-    This function reproduces that mapping so that ``_decode_bind_ref_h`` can
-    correctly resolve sub-instance field references even when non-dataclass
-    fields such as ``clock_domain`` precede the user-visible fields.
+    ``_BindProxy`` builds nested field indices by iterating ``dataclasses.fields()``
+    and skipping names that start with ``_``.  Using ``dc.fields()`` (rather than
+    ``__dataclass_fields__``) excludes inherited class-level descriptors such as
+    ``clock_domain`` and ``reset_domain`` that are not real instance fields, keeping
+    the index scheme stable regardless of how many parent-class descriptors precede
+    the user-visible ports.
     """
+    import dataclasses as _dc_mod
     idx = 0
-    for fname in sub_py_cls.__dataclass_fields__:
-        if not fname.startswith('_'):
+    for f in _dc_mod.fields(sub_py_cls):
+        if not f.name.startswith('_'):
             if idx == bind_index:
-                return fname
+                return f.name
             idx += 1
     return None
 
@@ -1365,15 +1508,19 @@ def _synthesize_hierarchical(cls, component_ir, ctx, module_name: str) -> str:
     # ------------------------------------------------------------------ #
     # 1. Classify top-level fields                                         #
     # ------------------------------------------------------------------ #
-    top_scalar_ports = []  # (name, bits, is_out)
-    sub_insts = []         # (field_name, type_name, sub_ir, sub_py_cls)
+    top_scalar_ports = []   # (name, bits, is_out)  — direction already known
+    top_inout_ports = {}    # name → (bits, ir_field)  — direction TBD from binds
+    sub_insts = []          # (field_name, type_name, sub_ir, sub_py_cls)
 
     for f in top_fields:
         ft = type(f).__name__
         if ft == "FieldInOut":
             bits = _field_bits(f)
-            is_out = getattr(f, "is_out", False)
-            top_scalar_ports.append((f.name, bits, is_out))
+            if getattr(f, "is_inout", False):
+                top_inout_ports[f.name] = (bits, f)
+            else:
+                is_out = getattr(f, "is_out", False)
+                top_scalar_ports.append((f.name, bits, is_out))
         elif ft == "Field":
             dt = getattr(f, "datatype", None)
             if dt and type(dt).__name__ == "DataTypeRef":
@@ -1421,6 +1568,39 @@ def _synthesize_hierarchical(cls, component_ir, ctx, module_name: str) -> str:
         elif rhs_inst and not lhs_inst:
             bound_ports.add((rhs_inst, rhs_port))
             inst_port_to_top[(rhs_inst, rhs_port)] = lhs_port
+
+    # ------------------------------------------------------------------ #
+    # 2c. Resolve inout port directions from bindings                      #
+    #                                                                      #
+    # An inout port's direction is determined by what it is bound to:     #
+    # if the connected sub-instance port is an output, the inout becomes  #
+    # an output; if the sub-instance port is an input, it becomes input.  #
+    # Unbound top-level inout ports are simply unused pads — omitted.     #
+    # ------------------------------------------------------------------ #
+    # Build a lookup: sub-instance field name → IR fields indexed by name
+    sub_ir_port_map = {}  # inst_name → {port_name: FieldInOut}
+    for inst_name, _type_name, sub_ir, _sub_py_cls in sub_insts:
+        sub_ir_port_map[inst_name] = {
+            sf.name: sf for sf in sub_ir.fields if type(sf).__name__ == "FieldInOut"
+        }
+
+    for top_port_name, (bits, _f) in top_inout_ports.items():
+        # Find which (inst, port) this top port is connected to
+        resolved = None
+        for (inst_name, port_name), mapped_top in inst_port_to_top.items():
+            if mapped_top == top_port_name:
+                inst_ports = sub_ir_port_map.get(inst_name, {})
+                sub_field = inst_ports.get(port_name)
+                if sub_field is not None:
+                    # Direction of the inout pin = direction seen from the sub-instance
+                    # A sub-instance OUTPUT drives the pin → pin is output
+                    # A sub-instance INPUT receives from the pin → pin is input
+                    resolved = getattr(sub_field, "is_out", False)
+                break
+        if resolved is not None:
+            # Bound — include with resolved direction
+            top_scalar_ports.append((top_port_name, bits, resolved))
+        # else: unbound inout → unused pad, omit silently
 
     # ------------------------------------------------------------------ #
     # 2b. Detect transactor bindings                                       #
@@ -1475,41 +1655,38 @@ def _synthesize_hierarchical(cls, component_ir, ctx, module_name: str) -> str:
         )
 
     # ------------------------------------------------------------------ #
-    # 3. Collect unbound sub-instance ports → expose at top level          #
+    # 3. Check that all sub-instance ports are bound; error on any unbound #
     # ------------------------------------------------------------------ #
-    exposed_ports = []  # (port_name, bits, is_out)
-    # Track which names we've already exposed (de-dup)
-    exposed_names = set()
-
     for inst_name, _type_name, sub_ir, sub_py_cls in sub_insts:
         sub_py_meta = {}
         if sub_py_cls and hasattr(sub_py_cls, "__dataclass_fields__"):
             for pf in _dc.fields(sub_py_cls):
                 sub_py_meta[pf.name] = pf.metadata
 
+        unbound = []
         for sf in sub_ir.fields:
             sft = type(sf).__name__
             if sft == "FieldInOut":
                 pname = sf.name
-                if (inst_name, pname) not in bound_ports and pname not in exposed_names:
-                    bits = _field_bits(sf)
-                    is_out = getattr(sf, "is_out", False)
-                    exposed_ports.append((pname, bits, is_out))
-                    exposed_names.add(pname)
+                if (inst_name, pname) not in bound_ports:
+                    unbound.append(pname)
             elif sft == "Field":
                 sf_dt = getattr(sf, "datatype", None)
                 if sf_dt and type(sf_dt).__name__ == "DataTypeRef":
                     struct_ir = ctx.type_m.get(sf_dt.ref_name)
                     if struct_ir and type(struct_ir).__name__ == "DataTypeStruct":
-                        is_mirror = sub_py_meta.get(sf.name, {}).get("kind") == "mirror"
                         for ssf in struct_ir.fields:
                             expanded = f"{sf.name}_{ssf.name}"
-                            if (inst_name, expanded) not in bound_ports and expanded not in exposed_names:
-                                ssf_is_out = getattr(ssf, "is_out", True)
-                                if is_mirror:
-                                    ssf_is_out = not ssf_is_out
-                                exposed_ports.append((expanded, _field_bits(ssf), ssf_is_out))
-                                exposed_names.add(expanded)
+                            if (inst_name, expanded) not in bound_ports:
+                                unbound.append(expanded)
+
+        if unbound:
+            raise ValueError(
+                f"Sub-instance '{inst_name}' has unbound ports: {unbound}. "
+                f"Every port of a sub-instance must be connected in __bind__."
+            )
+
+    exposed_ports = []  # kept for compatibility with section 4
 
     # ------------------------------------------------------------------ #
     # 4. Synthesize sub-components first, then emit the wrapper module.    #

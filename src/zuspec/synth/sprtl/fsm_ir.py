@@ -264,7 +264,7 @@ class DomainBinding:
         # Lazy import to avoid circular dependency with zuspec-dataclasses
         try:
             from zuspec.dataclasses.domain import (
-                ClockDomain, ResetDomain,
+                ClockDomain, ResetDomain, ResetPolarity, ResetStyle,
             )
         except ImportError:
             return cls()
@@ -282,9 +282,9 @@ class DomainBinding:
 
         # Determine reset name, polarity, style
         if isinstance(reset_domain, ResetDomain):
-            active_low = (reset_domain.polarity == "active_low")
+            active_low = (reset_domain.polarity == ResetPolarity.ACTIVE_LOW)
             reset_name = "rst_n" if active_low else "rst"
-            reset_async = (reset_domain.style == "async")
+            reset_async = (reset_domain.style == ResetStyle.ASYNC)
         else:
             active_low = True
             reset_name = "rst_n"
@@ -297,6 +297,69 @@ class DomainBinding:
             reset_async=reset_async,
             period=period,
         )
+
+
+@dc.dataclass
+class PortDecl:
+    """A classified port entry produced by ComponentFieldsPass.
+
+    Attributes:
+        name:        Signal name as it will appear in the SV port list.
+        direction:   ``'input'`` or ``'output'``.
+        width:       Bit width (1 = scalar ``logic``).
+        reset_value: Reset value for outputs (None = not applicable).
+    """
+    name:        str
+    direction:   str
+    width:       int = 1
+    reset_value: Optional[Any] = None
+
+
+@dc.dataclass
+class StateVarDecl:
+    """An internal state variable (register) produced by ComponentFieldsPass.
+
+    Attributes:
+        name:        Signal name.
+        width:       Bit width (1 = scalar ``logic``).
+        reset_value: Reset value (None = not generated in reset clause).
+    """
+    name:        str
+    width:       int = 1
+    reset_value: Optional[Any] = None
+
+
+@dc.dataclass
+class ComponentFields:
+    """Classified ports, state variables, and domain info for a component.
+
+    Produced by ``ComponentFieldsPass``; consumed by ``ProcessToFSMPass``,
+    ``FSMToRTLPass``, ``CombLowerPass``, and ``ModuleAssemblePass``.
+
+    Attributes:
+        ports:            All port declarations (input and output), in field order.
+        state_vars:       Internal register declarations.
+        idx_to_name:      Mapping from IR field index to signal name.
+        clock_name:       Clock signal name.
+        reset_name:       Reset signal name.
+        reset_active_low: True when reset asserts low (``rst_n`` style).
+        reset_async:      True when reset appears in the sensitivity list.
+        reset_clauses:    List of ``(field_name, reset_value)`` pairs for the
+                          auto-generated reset block.
+        clock_port_injected: True when the clock was not a declared field and
+                             was added to the port list automatically.
+        module_name:      Module name (set from the component class name).
+    """
+    ports:               List[PortDecl] = dc.field(default_factory=list)
+    state_vars:          List[StateVarDecl] = dc.field(default_factory=list)
+    idx_to_name:         Dict[int, str] = dc.field(default_factory=dict)
+    clock_name:          str = "clk"
+    reset_name:          str = "rst_n"
+    reset_active_low:    bool = True
+    reset_async:         bool = False
+    reset_clauses:       List[tuple] = dc.field(default_factory=list)
+    clock_port_injected: bool = False
+    module_name:         str = ""
 
 
 @dc.dataclass
@@ -316,6 +379,9 @@ class FSMModule:
         reset_signal: Name of the reset signal
         reset_active_low: True if reset is active-low (rst_n)
         reset_async: True if reset is asynchronous (appears in posedge/negedge sensitivity list)
+        single_state: True for the degenerate one-state FSM (plain @zdc.sync or simple
+            @zdc.proc).  When True, SVCodeGenerator suppresses the state typedef/register
+            and emits a plain always_ff block.
     """
     name: str
     ports: List[FSMPort] = dc.field(default_factory=list)
@@ -347,6 +413,23 @@ class FSMModule:
 
     # Field name map: ExprRefField.index → field name
     field_names: Dict[int, str] = dc.field(default_factory=dict)
+
+    # When True, SVCodeGenerator emits a plain always_ff block (no state
+    # typedef / register).  Set by SingleStateStrategy for plain @zdc.sync
+    # and simple @zdc.proc processes.
+    single_state: bool = False
+
+    # Reset clauses from ComponentFieldsPass: list[(field_name, reset_value)].
+    # Used by SVCodeGenerator's single_state fast path to emit the reset block.
+    reset_clauses: List[tuple] = dc.field(default_factory=list)
+
+    # For single_state=True: raw IR body statements from the proc (list of IR AST nodes).
+    # When set, _generate_single_state uses ir_stmts_to_sv directly instead of
+    # walking FSM operations (avoids assignment-style and condition-wrapping mismatches).
+    body_stmts: List[Any] = dc.field(default_factory=list)
+
+    # For single_state=True: idx_to_name map for body_stmts ExprRefField resolution.
+    body_idx_to_name: Dict[int, str] = dc.field(default_factory=dict)
 
     # State encoding
     state_width: int = 0  # Computed from number of states

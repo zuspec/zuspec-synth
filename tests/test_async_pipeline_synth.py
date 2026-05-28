@@ -34,6 +34,7 @@ for _p in [_synth_src, _dc_src]:
         sys.path.insert(0, _p)
 
 import zuspec.dataclasses as zdc
+from zuspec.synth.ir.pipeline_ir import HazardResolution, LockType, RegFileAccessKind
 from zuspec.synth.ir.synth_ir import SynthIR, SynthConfig
 from zuspec.synth.passes import (
     HazardAnalysisPass,
@@ -892,13 +893,13 @@ class TestTier2RegfileHazard:
     def test_block_op_produces_read_access(self):
         """block() in ID stage creates a read RegFileAccess."""
         ir, _ = _run_to_ir(_RegfilePipe)
-        reads = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == "read"]
+        reads = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == RegFileAccessKind.READ]
         assert len(reads) >= 1, "block() must produce a read RegFileAccess"
 
     def test_write_op_produces_write_access(self):
         """write() in WB stage creates a write RegFileAccess."""
         ir, _ = _run_to_ir(_RegfilePipe)
-        writes = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == "write"]
+        writes = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == RegFileAccessKind.WRITE]
         assert len(writes) >= 1, "write() must produce a write RegFileAccess"
 
     def test_regfile_pipeline_sv_lint_clean(self):
@@ -922,7 +923,7 @@ class TestTier2PipelineResource:
         decls = pip.regfile_decls
         assert len(decls) >= 1, "regfile_decls must be populated"
         d = next(d for d in decls if d.field_name == "rf")
-        assert d.lock_type == "bypass", f"expected 'bypass', got {d.lock_type!r}"
+        assert d.lock_type == LockType.BYPASS, f"expected 'bypass', got {d.lock_type!r}"
 
     def test_bypass_lock_decl_depth(self):
         """BypassLock resource with size=16 → depth=16, addr_width=4."""
@@ -939,7 +940,7 @@ class TestTier2PipelineResource:
         decls = pip.regfile_decls
         assert len(decls) >= 1, "regfile_decls must be populated"
         d = next(d for d in decls if d.field_name == "rf")
-        assert d.lock_type == "queue", f"expected 'queue', got {d.lock_type!r}"
+        assert d.lock_type == LockType.QUEUE, f"expected 'queue', got {d.lock_type!r}"
 
     def test_bypass_lock_hazard_resolved_as_forward(self):
         """BypassLock RAW hazard resolves to 'forward' (bypass mux)."""
@@ -949,7 +950,7 @@ class TestTier2PipelineResource:
         ir = ForwardingGenPass(cfg).run(ir)
         pip = ir.pipeline_ir
         hazards = pip.regfile_hazards
-        fwd = [h for h in hazards if h.resolved_by == "forward"]
+        fwd = [h for h in hazards if h.resolved_by == HazardResolution.FORWARD]
         assert len(fwd) >= 1, "BypassLock hazard must resolve to 'forward'"
 
     def test_queue_lock_hazard_resolved_as_stall(self):
@@ -960,7 +961,7 @@ class TestTier2PipelineResource:
         ir = ForwardingGenPass(cfg).run(ir)
         pip = ir.pipeline_ir
         hazards = pip.regfile_hazards
-        stall = [h for h in hazards if h.resolved_by == "stall"]
+        stall = [h for h in hazards if h.resolved_by == HazardResolution.STALL]
         assert len(stall) >= 1, "QueueLock hazard must resolve to 'stall'"
 
     def test_bypass_lock_sv_lint_clean(self):

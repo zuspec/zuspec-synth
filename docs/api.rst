@@ -652,17 +652,22 @@ IfProtocolLowerPass
    The emitted signals depend on the resolved properties (see
    *Property → RTL signal mapping* below).
 
-QueueLowerPass
-~~~~~~~~~~~~~~
+AbstractionSVEmitPass
+~~~~~~~~~~~~~~~~~~~~~
 
-.. class:: zuspec.synth.passes.queue_lower.QueueLowerPass
+.. class:: zuspec.synth.passes.abstraction_sv_lower.AbstractionSVEmitPass
 
-   **Lowers ``zdc.Queue[T]`` fields to synchronous FIFO instances.**
+   **Emits SV for all** ``AbstractionFieldIR`` **fields in the top-level component.**
 
-   Generates a FIFO instance with the element type and depth from the field
-   declaration.  Uses the existing ``ChannelType`` FIFO template where
-   adequate; falls back to a new depth-parameterised template when signal
-   naming differs.
+   Used inside :class:`ProtocolSynthPipeline` as the interface-dispatch SV emitter.
+   For each ``AbstractionFieldIR`` field:
+
+   * Rewrites ``@proc`` bodies via the registered SV model.
+   * For ``zdc.Queue[T]`` fields: creates a :class:`QueueIR` node in
+     ``ir.queue_nodes`` so :class:`ProtocolSVEmitPass` can emit the FIFO module
+     with the configured ``module_prefix``.
+   * For other abstraction fields: stores ``[sv_module_text()]`` in
+     ``ir.lowered_sv["sv/module/<field>"]``.
 
 CompletionAnalysisPass
 ~~~~~~~~~~~~~~~~~~~~~~

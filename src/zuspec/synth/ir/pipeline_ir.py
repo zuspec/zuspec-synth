@@ -16,10 +16,39 @@ Extended for ``@zdc.pipeline`` support:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import enum as _enum
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..elab.elab_ir import ComponentSynthMeta, PortDecl
+
+
+class HazardKind(_enum.Enum):
+    """Type of data hazard between pipeline stages."""
+    RAW = "RAW"
+    WAR = "WAR"
+    WAW = "WAW"
+
+
+class HazardResolution(_enum.Enum):
+    """How a detected hazard is resolved."""
+    UNRESOLVED = "unresolved"
+    FORWARD = "forward"
+    STALL = "stall"
+    SUPPRESS = "suppress"
+    REORDER = "reorder"
+
+
+class LockType(_enum.Enum):
+    """Resource locking / forwarding strategy for a regfile."""
+    BYPASS = "bypass"
+    QUEUE = "queue"
+
+
+class RegFileAccessKind(_enum.Enum):
+    """Whether a regfile access is a read or write."""
+    READ = "read"
+    WRITE = "write"
 
 
 @dataclass
@@ -54,11 +83,11 @@ class HazardPair:
     Populated by ``HazardAnalysisPass``; resolution filled in by
     ``ForwardingGenPass``.
     """
-    kind:           str  # "RAW", "WAR", or "WAW"
+    kind:           HazardKind
     producer_stage: str
     consumer_stage: str
     signal:         str
-    resolved_by:    str = "unresolved"  # "forward", "stall", or "unresolved"
+    resolved_by:    HazardResolution = HazardResolution.UNRESOLVED
 
 
 @dataclass
@@ -79,15 +108,16 @@ class RegFileDeclInfo:
     data_width:
         Data bit-width (e.g. 32).
     lock_type:
-        Hazard resolution strategy: ``"bypass"`` (forwarding mux) or
-        ``"queue"`` (stall until write completes).  Defaults to ``"bypass"``
-        which matches the ``BypassLock`` / ``forward_default=True`` behaviour.
+        Hazard resolution strategy: :class:`LockType.BYPASS` (forwarding mux)
+        or :class:`LockType.QUEUE` (stall until write completes). Defaults to
+        :class:`LockType.BYPASS`, which matches the ``BypassLock`` /
+        ``forward_default=True`` behaviour.
     """
     field_name:  str
     depth:       int = 32
     addr_width:  int = 5
     data_width:  int = 32
-    lock_type:   str = "bypass"  # "bypass" or "queue"
+    lock_type:   LockType = LockType.BYPASS
 
 
 @dataclass
@@ -101,7 +131,7 @@ class RegFileAccess:
     field_name:
         Name of the component field (e.g. ``"regfile"``).
     kind:
-        ``"read"`` or ``"write"``.
+        :class:`RegFileAccessKind.READ` or :class:`RegFileAccessKind.WRITE`.
     stage:
         Name of the pipeline stage containing this access.
     addr_var:
@@ -118,7 +148,7 @@ class RegFileAccess:
         Address width in bits (default 5 for 32-entry regfile).
     """
     field_name:  str
-    kind:        str   # "read" or "write"
+    kind:        RegFileAccessKind
     stage:       str
     addr_var:    str
     data_var:    str = ""
@@ -150,9 +180,9 @@ class RegFileHazard:
     read_result_var:
         Variable receiving the read result (e.g. ``"rdata1"``).
     resolved_by:
-        ``"forward"`` — comparator + mux bypass;
-        ``"stall"``   — comparator drives stall signal;
-        ``"unresolved"`` — not yet decided.
+        :class:`HazardResolution.FORWARD` — comparator + mux bypass;
+        :class:`HazardResolution.STALL` — comparator drives stall signal;
+        :class:`HazardResolution.UNRESOLVED` — not yet decided.
     suppressed:
         ``True`` when the user declared ``no_forward`` for this hazard.
     """
@@ -163,7 +193,7 @@ class RegFileHazard:
     read_addr_var:   str
     write_data_var:  str
     read_result_var: str
-    resolved_by:     str  = "unresolved"
+    resolved_by:     HazardResolution = HazardResolution.UNRESOLVED
     suppressed:      bool = False
 
 

@@ -224,9 +224,10 @@ class IfProtocolLowerPass(SynthPass):
                 py_annotations = getattr(comp_cls, "__annotations__", {})
 
         for field in getattr(comp_dtype, "fields", []):
+            # AbstractionFieldIR nodes are handled by AbstractionSVLowerPass; skip here.
+            if getattr(field, 'is_abstraction_field', False):
+                continue
             dtype = field.datatype
-
-            # --- Path 1: model_context stores an IfProtocolType node --------
             is_proto = hasattr(zdc_ir, "IfProtocolType") and isinstance(dtype, zdc_ir.IfProtocolType)
             if is_proto:
                 props = getattr(dtype, "properties", None)

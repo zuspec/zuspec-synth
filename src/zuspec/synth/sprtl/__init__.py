@@ -43,6 +43,9 @@ from .fsm_ir import (
     FSMAddrDecode,
     FSMPort,
     FSMRegister,
+    PortDecl,
+    StateVarDecl,
+    ComponentFields,
 )
 
 from .transformer import SPRTLTransformer
@@ -167,6 +170,9 @@ __all__ = [
     'FSMAddrDecode',
     'FSMPort',
     'FSMRegister',
+    'PortDecl',
+    'StateVarDecl',
+    'ComponentFields',
     'SPRTLTransformer',
     # Scheduler
     'OperationType',

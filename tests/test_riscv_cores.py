@@ -57,6 +57,7 @@ else:
     sys.path.insert(1, _dc_src)
 
 import zuspec.dataclasses as zdc
+from zuspec.synth.ir.pipeline_ir import RegFileAccessKind
 from zuspec.synth.ir.synth_ir import SynthIR, SynthConfig
 from zuspec.synth.passes import (
     PipelineAnnotationPass,
@@ -254,7 +255,7 @@ class TestRiscV3Stage:
 
     def test_two_regfile_reads_detected(self, ir):
         """Both rdata1 and rdata2 register file reads are detected."""
-        reads = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == "read"]
+        reads = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == RegFileAccessKind.READ]
         assert len(reads) == 2
         result_vars = {a.result_var for a in reads}
         assert "rdata1" in result_vars
@@ -262,7 +263,7 @@ class TestRiscV3Stage:
 
     def test_regfile_write_detected(self, ir):
         """Exactly one register file write is detected in WB."""
-        writes = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == "write"]
+        writes = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == RegFileAccessKind.WRITE]
         assert len(writes) == 1
         assert writes[0].stage == "WB"
 
@@ -380,14 +381,14 @@ class TestRiscV5Stage:
 
     def test_two_regfile_reads_in_id(self, ir):
         """Both register file reads are in the ID stage."""
-        reads = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == "read"]
+        reads = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == RegFileAccessKind.READ]
         assert len(reads) == 2
         for r in reads:
             assert r.stage == "ID"
 
     def test_regfile_write_in_wb(self, ir):
         """Register file write is in WB."""
-        writes = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == "write"]
+        writes = [a for a in ir.pipeline_ir.regfile_accesses if a.kind == RegFileAccessKind.WRITE]
         assert len(writes) == 1
         assert writes[0].stage == "WB"
 

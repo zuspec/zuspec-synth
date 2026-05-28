@@ -34,8 +34,15 @@ from io import StringIO
 from typing import Dict, List, Optional, Set, Tuple
 
 from zuspec.synth.ir.pipeline_ir import (
-    ChannelDecl, ForwardingDecl, PipelineIR, RegFileAccess, RegFileDeclInfo,
-    RegFileHazard, StageIR,
+    ChannelDecl,
+    ForwardingDecl,
+    HazardResolution,
+    PipelineIR,
+    RegFileAccess,
+    RegFileAccessKind,
+    RegFileDeclInfo,
+    RegFileHazard,
+    StageIR,
 )
 from .expr_lowerer import ExprLowerer, collect_ports, _get_sv_width
 
@@ -829,7 +836,7 @@ class PipelineSVCodegen:
         write is guarded by the write-stage's valid register so that bubbles
         do not spuriously write.
         """
-        writes = [a for a in getattr(pip, "regfile_accesses", []) if a.kind == "write"]
+        writes = [a for a in getattr(pip, "regfile_accesses", []) if a.kind == RegFileAccessKind.WRITE]
         if not writes:
             return
         sv.line("// ── Register-file write ports ─────────────────────────────────────")
@@ -871,7 +878,7 @@ class PipelineSVCodegen:
         The forwarding is only emitted when a matching ``RegFileHazard`` exists
         (i.e. a write in a later stage can alias the read address).
         """
-        reads = [a for a in getattr(pip, "regfile_accesses", []) if a.kind == "read"]
+        reads = [a for a in getattr(pip, "regfile_accesses", []) if a.kind == RegFileAccessKind.READ]
         if not reads:
             return
 
@@ -899,7 +906,7 @@ class PipelineSVCodegen:
                 h for h in hazards
                 if h.field_name == rd.field_name
                 and h.read_result_var == rd.result_var
-                and h.resolved_by == "forward"
+                and h.resolved_by == HazardResolution.FORWARD
             ]
 
             if matching:

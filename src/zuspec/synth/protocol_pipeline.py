@@ -15,7 +15,7 @@ The pipeline runs:
 
 1. ``DataModelFactory.build(comp_cls)``   → ``ir.model_context``
 2. ``IfProtocolLowerPass``                → ``ir.protocol_ports``
-3. ``QueueLowerPass``                     → ``ir.queue_nodes``
+3. ``AbstractionSVEmitPass``              → ``ir.lowered_sv``, ``ir.queue_nodes``
 4. ``SpawnLowerPass``                     → ``ir.spawn_nodes``
 5. ``SelectLowerPass``                    → ``ir.select_nodes``
 6. ``CompletionAnalysisPass``             → ``ir.completion_nodes``
@@ -36,7 +36,7 @@ from typing import Any, Optional
 
 from zuspec.synth.ir.synth_ir import SynthConfig, SynthIR
 from zuspec.synth.passes.if_protocol_lower import IfProtocolLowerPass
-from zuspec.synth.passes.queue_lower import QueueLowerPass
+from zuspec.synth.passes.abstraction_sv_lower import AbstractionSVEmitPass
 from zuspec.synth.passes.spawn_lower import SpawnLowerPass
 from zuspec.synth.passes.select_lower import SelectLowerPass
 from zuspec.synth.passes.completion_analysis import CompletionAnalysisPass
@@ -114,7 +114,7 @@ class ProtocolSynthPipeline:
         # Steps 2–6 — lowering passes
         for pass_cls, kwargs in [
             (IfProtocolLowerPass, {}),
-            (QueueLowerPass, {}),
+            (AbstractionSVEmitPass, {}),
             (SpawnLowerPass, {}),
             (SelectLowerPass, {}),
             (CompletionAnalysisPass, {}),

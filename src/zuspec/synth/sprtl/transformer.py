@@ -412,12 +412,20 @@ class SPRTLTransformer:
             self._transform_loop(stmt)
     
     def _transform_loop(self, stmt: Any):
-        """Transform a regular (non-while-True) loop."""
-        # Create a loop state that checks condition
+        """Transform a regular (non-while-True) loop.
+
+        Generated states
+        ----------------
+        ``LOOP_<N>``      — WAIT_COND: check condition each iteration; exit when false
+        ``LOOP_BODY_<N>`` — NORMAL: first state of the loop body
+        …                 — states created by body's await expressions
+        ``LOOP_DONE_<N>`` — NORMAL: first state after the loop
+        """
         test = getattr(stmt, 'test', None)
         body = getattr(stmt, 'body', [])
-        
-        loop_state = self._ctx.new_state(
+
+        # LOOP_CHK — evaluate condition; conditional → body, unconditional → done
+        loop_chk = self._ctx.new_state(
             self._ctx.make_state_name("LOOP"),
             FSMStateKind.WAIT_COND,
             wait_condition=test,
@@ -425,19 +433,38 @@ class SPRTLTransformer:
                 "loop stall", cond_str=self._format_cond_str(test)
             )
         )
-        
-        # Transition from current state to loop state
-        if self._ctx.current_state:
-            self._ctx.current_state.add_transition(loop_state.id)
-        
-        self._ctx.current_state = loop_state
-        
-        # Transform loop body
+
+        if self._ctx.current_state is not None:
+            self._ctx.current_state.add_transition(loop_chk.id)
+
+        # LOOP_BODY — entry point for the loop body (separate state so the
+        # counter-reload condition ``state != S_N && next_state == S_N`` fires
+        # correctly on re-entry from loop_chk rather than as a self-loop).
+        loop_body = self._ctx.new_state(
+            self._ctx.make_state_name("LOOP_BODY"),
+            FSMStateKind.NORMAL,
+        )
+        # Conditional advance: condition true → body
+        loop_chk.add_transition(loop_body.id, condition=test)
+
+        self._ctx.current_state = loop_body
+
+        # Transform loop body (may create more states via await expressions)
         self._transform_body(body)
-        
-        # Add back-edge to loop state with condition
-        if self._ctx.current_state:
-            self._ctx.current_state.add_transition(loop_state.id, condition=test)
+
+        # Unconditional back-edge from end of body to loop check so that
+        # loop_chk re-evaluates the condition with updated registered values.
+        if self._ctx.current_state is not None:
+            self._ctx.current_state.add_transition(loop_chk.id)
+
+        # LOOP_DONE — reached when condition is false (unconditional else from chk)
+        loop_done = self._ctx.new_state(
+            self._ctx.make_state_name("LOOP_DONE"),
+            FSMStateKind.NORMAL,
+        )
+        loop_chk.add_transition(loop_done.id)  # unconditional = else branch
+
+        self._ctx.current_state = loop_done
     
     def _branch_has_await(self, stmts: List[Any]) -> bool:
         """Return True if any statement in *stmts* (recursively) contains ExprAwait."""
@@ -979,6 +1006,12 @@ class SPRTLTransformer:
                         elif attr == 'wait':
                             self._transform_await_reg_wait(await_value, result_var)
                             return
+                        elif attr == 'request':
+                            self._transform_await_mem_request(await_value)
+                            return
+                        elif attr == 'response':
+                            self._transform_await_mem_response(await_value, result_var)
+                            return
 
                 elif receiver_type == 'TypeExprRefSelf':
                     if attr == 'wait':
@@ -1009,6 +1042,26 @@ class SPRTLTransformer:
                     self._transform_await_cycles(await_value)
                     return
 
+                # zdc.negedge/posedge/edge(lambda: self.signal) — convert to
+                # a WAIT_COND state with a proper signal-level comparison so
+                # that the SV codegen emits a clean `rx == 0` condition rather
+                # than the unresolved call string.
+                if attr in ('negedge', 'posedge', 'edge') and _HAVE_IR:
+                    args = getattr(await_value, 'args', [])
+                    if args:
+                        lambda_arg = args[0]
+                        if type(lambda_arg).__name__ == 'ExprLambda':
+                            body = getattr(lambda_arg, 'body', None)
+                            if body is not None:
+                                cmp_op = CmpOp.Eq if attr == 'negedge' else CmpOp.NotEq
+                                cond = ExprCompare(
+                                    left=body,
+                                    ops=[cmp_op],
+                                    comparators=[ExprConstant(value=0)],
+                                )
+                                self._transform_await_condition(cond)
+                                return
+
         if await_type == 'ExprCompare':
             self._transform_await_condition(await_value)
             return
@@ -1023,11 +1076,19 @@ class SPRTLTransformer:
     def _extract_reg_name(self, func_expr: Any) -> str:
         """Return the register attribute name from a .read()/.write() call func.
 
-        For ``ExprAttribute(attr='read', value=ExprAttribute(attr='ctrl', …))``
-        this returns ``'ctrl'``.
+        Handles two IR forms:
+        - ``ExprAttribute(attr='read', value=ExprAttribute(attr='ctrl', …))``
+          → returns ``'ctrl'``
+        - ``ExprAttribute(attr='read', value=ExprRefField(index=N, …))``
+          → returns ``self._field_names.get(N, 'reg')``
         """
         reg_expr = getattr(func_expr, 'value', None)
-        attr = getattr(reg_expr, 'attr', None) if reg_expr is not None else None
+        if reg_expr is None:
+            return 'reg'
+        if type(reg_expr).__name__ == 'ExprRefField':
+            idx = getattr(reg_expr, 'index', 0)
+            return self._field_names.get(idx, 'reg')
+        attr = getattr(reg_expr, 'attr', None)
         return attr if attr else 'reg'
 
     def _extract_port_name(self, func_expr: Any) -> str:
@@ -1384,13 +1445,42 @@ class SPRTLTransformer:
             return True
         return False
     
+    def _eval_const_expr(self, expr: Any) -> Optional[int]:
+        """Evaluate a constant IR expression to a Python int, or return None."""
+        if expr is None:
+            return None
+        if hasattr(expr, 'value') and isinstance(getattr(expr, 'value'), (int, bool)):
+            return int(expr.value)
+        if type(expr).__name__ == 'ExprBin':
+            lhs = self._eval_const_expr(getattr(expr, 'lhs', None))
+            rhs = self._eval_const_expr(getattr(expr, 'rhs', None))
+            if lhs is None or rhs is None:
+                return None
+            op = getattr(expr, 'op', None)
+            try:
+                return {
+                    BinOp.Add:      lhs + rhs,
+                    BinOp.Sub:      lhs - rhs,
+                    BinOp.Mult:     lhs * rhs,
+                    BinOp.FloorDiv: lhs // rhs,
+                    BinOp.Mod:      lhs % rhs,
+                    BinOp.LShift:   lhs << rhs,
+                    BinOp.RShift:   lhs >> rhs,
+                    BinOp.BitAnd:   lhs & rhs,
+                    BinOp.BitOr:    lhs | rhs,
+                    BinOp.BitXor:   lhs ^ rhs,
+                }.get(op)
+            except Exception:
+                return None
+        return None
+
     def _transform_await_cycles(self, call_expr: Any):
         """Transform 'await zdc.cycles(N)'."""
         # Extract N from arguments
         args = getattr(call_expr, 'args', [])
         n_cycles = 1
-        if args and hasattr(args[0], 'value'):
-            n_cycles = args[0].value
+        if args:
+            n_cycles = self._eval_const_expr(args[0]) or 1
         
         # Create a new state for after the wait
         next_state = self._ctx.new_state(
@@ -1747,7 +1837,34 @@ class SPRTLTransformer:
     def _finalize(self):
         """Finalize the FSM after transformation."""
         module = self._ctx.module
-        
+
+        # For multi-cycle WAIT_CYCLES states, annotate exit transitions with
+        # the counter condition and wrap operations in a counter guard.  This
+        # makes the counter condition part of the FSM IR so both the SV
+        # codegen and any interpreter can handle it generically.
+        for state in module.states:
+            if state.kind == FSMStateKind.WAIT_CYCLES and state.wait_cycles > 1:
+                counter_name = f"{state.name}_cnt"
+                # Add the counter register to the module
+                width = max(1, (state.wait_cycles - 1).bit_length())
+                module.add_register(
+                    name=counter_name,
+                    width=width,
+                    reset_value=state.wait_cycles - 1,
+                )
+                # Condition exit transitions on counter == 0
+                for trans in state.transitions:
+                    if trans.condition is None:
+                        trans.condition = ('eq', counter_name, 0)
+                # Wrap existing operations in an if (cnt == 0) guard so they
+                # execute only on the final wait cycle (e.g. loop increment).
+                if state.operations:
+                    guarded = FSMCond(
+                        condition=('eq', counter_name, 0),
+                        then_ops=list(state.operations),
+                    )
+                    state.operations = [guarded]
+
         # Ensure state encoding is computed
         module._compute_state_encoding()
         

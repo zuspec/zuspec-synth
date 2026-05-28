@@ -115,3 +115,39 @@ def test_validate_lowered_sv_key_rejects_invalid_keys(key):
     """validate_lowered_sv_key raises ValueError for malformed keys."""
     with pytest.raises(ValueError, match="lowered_sv key"):
         validate_lowered_sv_key(key)
+
+
+# ---------------------------------------------------------------------------
+# Tests: lowered_py key format (same convention as lowered_sv)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("key", [
+    "py/module/sync",
+    "py/module/comb",
+    "py/module/top",
+    "py/module/_debug",
+])
+def test_lowered_py_key_format_valid(key):
+    """Valid py/… keys pass the same validator used for lowered_sv."""
+    validate_lowered_sv_key(key)  # reuses the same regex
+
+
+@pytest.mark.parametrize("key", [
+    "PY/module/sync",       # uppercase backend
+    "py/Module/sync",       # uppercase category
+    "py_module_sync",       # underscores instead of slashes
+    "py/",                  # missing item
+])
+def test_lowered_py_key_format_invalid(key):
+    """Invalid py/… keys are rejected by the same validator."""
+    with pytest.raises(ValueError):
+        validate_lowered_sv_key(key)
+
+
+def test_lowered_py_field_exists_on_synth_ir():
+    """SynthIR has a lowered_py dict field that starts empty."""
+    from zuspec.synth.ir.synth_ir import SynthIR
+    ir = SynthIR()
+    assert hasattr(ir, "lowered_py")
+    assert isinstance(ir.lowered_py, dict)
+    assert len(ir.lowered_py) == 0

@@ -21,6 +21,14 @@ from .pipeline_to_source import PipelineToSource, PipelineToSourcePass
 from .expr_lowerer import ExprLowerer, collect_ports
 from .cdc_analysis import CDCAnalysisPass, CDCCrossing
 
+# Unified non-pipeline lowering chain (design/unified-lowering.md)
+from .component_fields import ComponentFieldsPass, build_component_fields
+from .process_to_fsm import ProcessToFSMPass
+from .fsm_to_rtl import FSMToRTLPass
+from .comb_lower import CombLowerPass
+from .module_assemble import ModuleAssemblePass
+from .mmr_regfile_emit import MmrRegFileEmitPass, MmrRegFileRtlEmitter, synthesize_regfile
+
 __all__ = [
     "SynthPass",
     "ElaboratePass",
@@ -52,4 +60,15 @@ __all__ = [
     "collect_ports",
     "CDCAnalysisPass",
     "CDCCrossing",
+    # Unified non-pipeline lowering chain
+    "ComponentFieldsPass",
+    "build_component_fields",
+    "ProcessToFSMPass",
+    "FSMToRTLPass",
+    "CombLowerPass",
+    "ModuleAssemblePass",
+    # MMR RegisterFile RTL emission
+    "MmrRegFileEmitPass",
+    "MmrRegFileRtlEmitter",
+    "synthesize_regfile",
 ]

@@ -338,6 +338,8 @@ class PassThroughEliminator:
         for state in fsm.states:
             if state.id == fsm.initial_state:
                 continue  # keep the reset/IDLE state
+            if state.kind == FSMStateKind.WAIT_CYCLES:
+                continue  # WAIT_CYCLES states are semantically meaningful
             if (len(state.operations) == 0
                     and len(state.transitions) == 1
                     and state.transitions[0].is_unconditional):

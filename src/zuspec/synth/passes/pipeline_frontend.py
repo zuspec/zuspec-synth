@@ -325,19 +325,40 @@ class PipelineFrontendPass(SynthPass):
     def _build_port_widths(self, comp_cls) -> Dict[str, int]:
         """Return {field_name: bit_width} from the component class field annotations."""
         import typing
+        import dataclasses as _dc
         widths: Dict[str, int] = {}
         if comp_cls is None:
             return widths
+        localns: Dict[str, Any] = {}
         try:
-            hints = typing.get_type_hints(comp_cls, include_extras=True)
+            from zuspec.dataclasses.domain import _ClockDomainField
+            localns["_ClockDomain"] = _ClockDomainField
+        except ImportError:
+            pass
+        try:
+            hints = typing.get_type_hints(comp_cls, include_extras=True, localns=localns)
         except Exception:
+            hints = {}
+        if hints:
+            for name, hint in hints.items():
+                if name.startswith("_"):
+                    continue
+                w = _width_from_type_hint(hint)
+                if w is not None:
+                    widths[name] = w
+        if widths:
             return widths
-        for name, hint in hints.items():
-            if name.startswith("_"):
-                continue
-            w = _width_from_type_hint(hint)
-            if w is not None:
-                widths[name] = w
+        # get_type_hints failed or returned nothing; fall back to f.type from
+        # dataclasses.fields() when type objects are preserved (not stringified).
+        try:
+            for f in _dc.fields(comp_cls):
+                if f.name.startswith("_"):
+                    continue
+                w = _width_from_type_hint(f.type)
+                if w is not None:
+                    widths[f.name] = w
+        except Exception:
+            pass
         return widths
 
     def _infer_channels(

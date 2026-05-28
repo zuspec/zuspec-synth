@@ -47,6 +47,7 @@ else:
 
 import zuspec.dataclasses as zdc
 from zuspec.dataclasses.data_model_factory import DataModelFactory
+from zuspec.synth.ir.pipeline_ir import HazardKind, HazardResolution
 from zuspec.synth.ir.synth_ir import SynthIR, SynthConfig
 from zuspec.synth.passes import (
     PipelineFrontendPass,
@@ -366,7 +367,7 @@ class TestEx5ForwardingRAW:
             ir = pass_cls(cfg).run(ir)
         # All hazards should be resolved (none left as 'unresolved')
         assert ir.pipeline_ir is not None
-        unresolved = [h for h in ir.pipeline_ir.hazards if h.resolved_by == "unresolved"]
+        unresolved = [h for h in ir.pipeline_ir.hazards if h.resolved_by == HazardResolution.UNRESOLVED]
         assert not unresolved, f"Unexpected unresolved hazards: {unresolved}"
 
     def test_lint(self):
@@ -430,8 +431,8 @@ class TestEx6LoadUseStall:
             ir = pass_cls(cfg).run(ir)
         assert ir.pipeline_ir is not None
         for h in ir.pipeline_ir.hazards:
-            if h.producer_stage == "MEM" and h.kind == "RAW":
-                assert h.resolved_by == "stall", (
+            if h.producer_stage == "MEM" and h.kind == HazardKind.RAW:
+                assert h.resolved_by == HazardResolution.STALL, (
                     f"MEM RAW hazard should resolve to 'stall', got '{h.resolved_by}'"
                 )
 

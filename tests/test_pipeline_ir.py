@@ -32,6 +32,7 @@ else:
 from zuspec.synth.ir.pipeline_ir import (
     ChannelDecl,
     ForwardingDecl,
+    HazardKind,
     HazardPair,
     PipelineIR,
     StageIR,
@@ -64,12 +65,12 @@ class TestForwardingDecl:
 
 class TestHazardPair:
     def test_raw(self):
-        h = HazardPair(kind="RAW", signal="a", producer_stage="EX",
+        h = HazardPair(kind=HazardKind.RAW, signal="a", producer_stage="EX",
                        consumer_stage="ID")
-        assert h.kind == "RAW"
+        assert h.kind == HazardKind.RAW
 
     def test_all_kinds(self):
-        for kind in ("RAW", "WAW", "WAR"):
+        for kind in (HazardKind.RAW, HazardKind.WAW, HazardKind.WAR):
             h = HazardPair(kind=kind, signal="x", producer_stage="EX",
                            consumer_stage="ID")
             assert h.kind == kind

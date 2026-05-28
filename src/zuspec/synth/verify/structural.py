@@ -10,7 +10,7 @@ import ast
 from dataclasses import dataclass
 from typing import List
 
-from ..ir.pipeline_ir import PipelineIR, RegFileHazard, ForwardingDecl
+from ..ir.pipeline_ir import ForwardingDecl, HazardResolution, PipelineIR, RegFileHazard
 from ..passes.expr_lowerer import _get_sv_width
 
 
@@ -63,7 +63,7 @@ def check_forwarding_completeness(pip: PipelineIR) -> List[StructuralError]:
 
     Builds a set of ``(from_stage, to_stage, signal)`` tuples from
     ``pip.forwarding`` where ``suppressed == False``.  For each
-    :class:`RegFileHazard` with ``resolved_by == "forward"`` checks that
+    :class:`RegFileHazard` with ``resolved_by == HazardResolution.FORWARD`` checks that
     the corresponding declaration exists.
 
     :param pip: Lowered :class:`PipelineIR` to inspect.
@@ -76,7 +76,7 @@ def check_forwarding_completeness(pip: PipelineIR) -> List[StructuralError]:
         if not fwd.suppressed
     }
     for hz in pip.regfile_hazards:
-        if hz.resolved_by != "forward":
+        if hz.resolved_by != HazardResolution.FORWARD:
             continue
         key = (hz.write_stage, hz.read_stage, hz.write_data_var)
         if key not in fwd_set:

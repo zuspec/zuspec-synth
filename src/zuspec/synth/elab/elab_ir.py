@@ -78,6 +78,7 @@ class ComponentSynthMeta:
     ports: List[PortDecl] = field(default_factory=list)  # flat RTL port declarations
     method_ports: List[MethodPortDecl] = field(default_factory=list)  # callable/protocol ports
     regfiles: List['RegFileDeclIR'] = field(default_factory=list)
+    mmr_regfiles: List['MmrRegFileDeclIR'] = field(default_factory=list)
     indexed_pools: List['IndexedPoolDeclIR'] = field(default_factory=list)
 
 
@@ -116,6 +117,27 @@ class RegFileDeclIR:
     read_ports:  int
     write_ports: int
     shared_port: bool
+
+
+@dataclass
+class MmrRegFileDeclIR:
+    """An MMR RegisterFile sub-component field on a Component, resolved for synthesis.
+
+    Produced by the Elaborator when it encounters a ``kind='instance'`` field
+    whose type is a ``RegisterFile`` subclass (i.e. has ``__zdc_regfile__ = True``).
+
+    Attributes
+    ----------
+    field_name:
+        The attribute name on the Component class (e.g. ``'regs'``).
+    regfile_cls:
+        The ``RegisterFile`` subclass carrying ``_mmr_reg_classes`` metadata.
+    module_name:
+        Derived SystemVerilog module name (snake_case of the class name).
+    """
+    field_name:   str
+    regfile_cls:  type
+    module_name:  str
 
 
 @dataclass

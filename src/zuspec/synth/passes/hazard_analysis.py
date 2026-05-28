@@ -33,7 +33,15 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .synth_pass import SynthPass
 from zuspec.synth.ir.pipeline_ir import (
-    HazardPair, PipelineIR, RegFileAccess, RegFileDeclInfo, RegFileHazard, StageIR,
+    HazardKind,
+    HazardPair,
+    LockType,
+    PipelineIR,
+    RegFileAccess,
+    RegFileAccessKind,
+    RegFileDeclInfo,
+    RegFileHazard,
+    StageIR,
 )
 from zuspec.synth.ir.synth_ir import SynthConfig, SynthIR
 
@@ -145,7 +153,7 @@ class _RegFileAccessCollector(ast.NodeVisitor):
                 addr_var = addr_arg.id if isinstance(addr_arg, ast.Name) else ast.unparse(addr_arg)
                 self.accesses.append(RegFileAccess(
                     field_name=field_name,
-                    kind="read",
+                    kind=RegFileAccessKind.READ,
                     stage=self.stage,
                     addr_var=addr_var,
                     result_var=self._current_target,
@@ -157,7 +165,7 @@ class _RegFileAccessCollector(ast.NodeVisitor):
                 data_var = data_arg.id if isinstance(data_arg, ast.Name) else ast.unparse(data_arg)
                 self.accesses.append(RegFileAccess(
                     field_name=field_name,
-                    kind="write",
+                    kind=RegFileAccessKind.WRITE,
                     stage=self.stage,
                     addr_var=addr_var,
                     data_var=data_var,
@@ -230,7 +238,7 @@ class HazardAnalysisPass(SynthPass):
                 for r_idx in range(w_idx):
                     if var in stage_reads[r_idx]:
                         hazards.append(HazardPair(
-                            kind="RAW",
+                            kind=HazardKind.RAW,
                             producer_stage=pip.stages[w_idx].name,
                             consumer_stage=pip.stages[r_idx].name,
                             signal=var,
@@ -250,7 +258,7 @@ class HazardAnalysisPass(SynthPass):
                 # First write is shadowed by the later one
                 for earlier, later in zip(idxs, idxs[1:]):
                     hazards.append(HazardPair(
-                        kind="WAW",
+                        kind=HazardKind.WAW,
                         producer_stage=pip.stages[earlier].name,
                         consumer_stage=pip.stages[later].name,
                         signal=var,
@@ -266,7 +274,7 @@ class HazardAnalysisPass(SynthPass):
                 for w_idx in range(r_idx + 1, n):
                     if var in stage_writes[w_idx]:
                         hazards.append(HazardPair(
-                            kind="WAR",
+                            kind=HazardKind.WAR,
                             producer_stage=pip.stages[r_idx].name,
                             consumer_stage=pip.stages[w_idx].name,
                             signal=var,
@@ -284,7 +292,7 @@ class HazardAnalysisPass(SynthPass):
         self._analyze_regfile_hazards(ir)
 
         # De-duplicate (same kind/producer/consumer/signal)
-        seen: Set[Tuple[str, str, str, str]] = set()
+        seen: Set[Tuple[HazardKind, str, str, str]] = set()
         unique_hazards: List[HazardPair] = []
         for h in hazards:
             key = (h.kind, h.producer_stage, h.consumer_stage, h.signal)
@@ -347,8 +355,8 @@ class HazardAnalysisPass(SynthPass):
         # Detect RAW: a read in stage R, and a write in a LATER stage W > R.
         # In a pipeline, the write result from stage W "passes through" all earlier
         # stages and could alias the read address in stage R.
-        reads  = [a for a in all_accesses if a.kind == "read"]
-        writes = [a for a in all_accesses if a.kind == "write"]
+        reads  = [a for a in all_accesses if a.kind == RegFileAccessKind.READ]
+        writes = [a for a in all_accesses if a.kind == RegFileAccessKind.WRITE]
 
         rf_hazards: List[RegFileHazard] = []
 
@@ -404,9 +412,9 @@ class HazardAnalysisPass(SynthPass):
             if acc.field_name in seen:
                 continue
             # Infer data width
-            if acc.kind == "read" and acc.result_var:
+            if acc.kind == RegFileAccessKind.READ and acc.result_var:
                 dw = port_widths.get(acc.result_var, 32)
-            elif acc.kind == "write" and acc.data_var:
+            elif acc.kind == RegFileAccessKind.WRITE and acc.data_var:
                 dw = port_widths.get(acc.data_var, 32)
             else:
                 dw = 32
@@ -418,6 +426,6 @@ class HazardAnalysisPass(SynthPass):
                 depth=depth,
                 addr_width=aw,
                 data_width=dw,
-                lock_type=existing_lock.get(acc.field_name, "bypass"),
+                lock_type=existing_lock.get(acc.field_name, LockType.BYPASS),
             )
         return list(seen.values())

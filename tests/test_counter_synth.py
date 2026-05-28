@@ -25,17 +25,16 @@ def counter_sv():
 
 
 def test_has_clock_reset_ports(counter_sv):
-    assert "input clock" in counter_sv
-    assert "input reset" in counter_sv
+    assert "input  logic clk" in counter_sv
+    assert "input  logic rst_n" in counter_sv
 
 
 def test_has_count_output_reg(counter_sv):
-    assert "output reg" in counter_sv
-    assert "count" in counter_sv
+    assert "logic [31:0] count" in counter_sv
 
 
 def test_has_always_posedge(counter_sv):
-    assert "always @(posedge clock or posedge reset)" in counter_sv
+    assert "always_ff @(posedge clk)" in counter_sv
 
 
 def test_reset_clears_count(counter_sv):
