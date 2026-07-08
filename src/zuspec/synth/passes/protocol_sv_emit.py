@@ -63,10 +63,12 @@ class ProtocolSVEmitPass(SynthPass):
 
     def _emit_ifprotocol_ports(self, ir: SynthIR) -> None:
         for port in ir.protocol_ports:
-            decls = generate_ifprotocol_port_decls(port)
+            decls = self._besv_port_fragment(
+                "decls", port, generate_ifprotocol_port_decls)
             ir.lowered_sv[_sv_key("sv", "port", port.name)] = [decls]
 
-            inst = generate_port_instantiation(port)
+            inst = self._besv_port_fragment(
+                "inst", port, generate_port_instantiation)
             ir.lowered_sv[_sv_key("sv", "instantiation", port.name)] = [inst]
 
             _log.debug(
@@ -80,7 +82,7 @@ class ProtocolSVEmitPass(SynthPass):
 
     def _emit_queues(self, ir: SynthIR) -> None:
         for q in ir.queue_nodes:
-            sv = generate_fifo_sv(q, module_prefix=self._prefix)
+            sv = self._besv_or_legacy("fifo", q, generate_fifo_sv)
             ir.lowered_sv[_sv_key("sv", "module", f"{q.name}_fifo")] = [sv]
             _log.debug(
                 "[ProtocolSVEmitPass] emitted FIFO module for queue '%s'", q.name
@@ -93,9 +95,11 @@ class ProtocolSVEmitPass(SynthPass):
     def _emit_arbiters(self, ir: SynthIR) -> None:
         for sel in ir.select_nodes:
             if sel.round_robin:
-                sv = generate_rr_arbiter_sv(sel, module_prefix=self._prefix)
+                sv = self._besv_or_legacy("rr_arb", sel,
+                                          generate_rr_arbiter_sv)
             else:
-                sv = generate_priority_arbiter_sv(sel, module_prefix=self._prefix)
+                sv = self._besv_or_legacy("priority_arb", sel,
+                                          generate_priority_arbiter_sv)
             key = _sv_key("sv", "module", f"{sel.name}_arb")
             ir.lowered_sv[key] = [sv]
             arb_type = "round-robin" if sel.round_robin else "priority"
@@ -103,3 +107,52 @@ class ProtocolSVEmitPass(SynthPass):
                 "[ProtocolSVEmitPass] emitted %s arbiter for select '%s'",
                 arb_type, sel.name,
             )
+
+    # ------------------------------------------------------------------
+    # be.sv structural emit (with legacy fallback) — process→FSM unification U-3
+    # ------------------------------------------------------------------
+
+    def _besv_or_legacy(self, kind: str, node, legacy_fn) -> str:
+        """Emit *node*'s SV via ``zuspec.be.sv`` (sole SV backend), else legacy.
+
+        The be.sv builder produces structured RTL IR that ``SVEmitter`` serialises;
+        constructs it doesn't cover (e.g. a round-robin arbiter, empty select)
+        raise ``ProtocolSVUnsupported`` and fall back to the legacy generator —
+        so this flip is regression-safe (no node loses coverage).
+        """
+        try:
+            from zuspec.be.sv.passes.protocol_to_sv import (
+                build_fifo_sv, build_priority_arbiter_sv, build_rr_arbiter_sv,
+                ProtocolSVUnsupported,
+            )
+            from zuspec.be.sv.ir.sv_emit import SVEmitter
+            builder = {"fifo": build_fifo_sv,
+                       "priority_arb": build_priority_arbiter_sv,
+                       "rr_arb": build_rr_arbiter_sv}[kind]
+            nodes = builder(node, module_prefix=self._prefix)
+            return SVEmitter().emit_all(nodes) + "\n"
+        except ProtocolSVUnsupported as e:
+            _log.debug("[ProtocolSVEmitPass] be.sv declined %s (%s); using legacy",
+                       kind, e)
+            return legacy_fn(node, module_prefix=self._prefix)
+
+    def _besv_port_fragment(self, which: str, port, legacy_fn) -> str:
+        """Emit an IfProtocol port-decl / instantiation *fragment* via ``be.sv``.
+
+        Unlike modules, these are port-list / connection fragments (no wrapper),
+        so they go through ``RTLEmitter``'s fragment renderers rather than
+        ``SVEmitter.emit_all``.  The be.sv output is byte-identical to the legacy
+        generator for every scenario; the bare-``Exception`` fallback is purely
+        defensive during the flip (no construct is expected to be unmapped).
+        """
+        try:
+            from zuspec.be.sv.passes.protocol_to_sv import (
+                build_ifprotocol_port_decls, build_ifprotocol_port_instantiation,
+            )
+            builder = {"decls": build_ifprotocol_port_decls,
+                       "inst": build_ifprotocol_port_instantiation}[which]
+            return builder(port)
+        except Exception as e:  # pragma: no cover - defensive
+            _log.debug("[ProtocolSVEmitPass] be.sv declined port %s (%s); using legacy",
+                       which, e)
+            return legacy_fn(port)

@@ -50,8 +50,10 @@ class FSMToRTLPass(SynthPass):
                 )
                 bodies.append(body)
             else:
-                # Multi-state SPRTL path: generate complete module directly.
-                sv = generate_sv(fsm)
+                # Multi-state path: emit via zuspec.be.sv (the sole SV backend),
+                # falling back to the legacy generator for FSM shapes the be.sv
+                # builder does not yet cover (process→FSM unification, phase U-2).
+                sv = self._emit_multistate(fsm)
                 _log.debug(
                     "[FSMToRTLPass] multi-state full module %d chars for %r",
                     len(sv), fsm.name,
@@ -61,3 +63,29 @@ class FSMToRTLPass(SynthPass):
 
         ir.lowered_sv["sv/module/clocked"] = "\n".join(bodies)
         return ir
+
+    @staticmethod
+    def _emit_multistate(fsm: Any) -> str:
+        """Emit a complete multi-state FSM module via be.sv, else legacy.
+
+        Attempts the be.sv builder + serializer.  Any construct the core-shape
+        builder cannot map (``FsmSVUnsupported``) or any expression the be.sv
+        emitter cannot render (``NotImplementedError``) triggers a fall back to
+        the legacy ``sv_codegen.generate_sv`` — so this flip is regression-safe:
+        no FSM loses coverage, the be.sv path simply takes over the shapes it
+        can faithfully reproduce.
+        """
+        from zuspec.synth.sprtl.sv_codegen import generate_sv
+        try:
+            from zuspec.be.sv.passes.fsm_to_sv import build_fsm_sv, FsmSVUnsupported
+            from zuspec.be.sv.ir.sv_emit import SVEmitter
+            nodes = build_fsm_sv(fsm)
+            sv = SVEmitter().emit_all(nodes)
+            _log.debug("[FSMToRTLPass] be.sv path handled %r", fsm.name)
+            return sv
+        except (FsmSVUnsupported, NotImplementedError) as e:
+            _log.debug(
+                "[FSMToRTLPass] be.sv path declined %r (%s); using legacy generator",
+                fsm.name, e,
+            )
+            return generate_sv(fsm)

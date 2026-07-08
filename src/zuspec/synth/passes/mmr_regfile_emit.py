@@ -679,12 +679,30 @@ class MmrRegFileEmitPass(SynthPass):
         if ir.meta is None:
             return
         for decl in ir.meta.mmr_regfiles:
-            emitter = MmrRegFileRtlEmitter(
-                decl.regfile_cls,
-                module_name=decl.module_name,
-            )
-            sv_text  = emitter.emit()
-            pkg_text = emitter.emit_package()
+            sv_text, pkg_text = _emit_regfile_besv_or_legacy(
+                decl.regfile_cls, decl.module_name)
             ir.lowered_sv[f"sv/regfile/{decl.field_name}"]     = sv_text
             ir.lowered_sv[f"sv/regfile/{decl.field_name}_pkg"] = pkg_text
             self.results[decl.field_name] = sv_text
+
+
+def _emit_regfile_besv_or_legacy(regfile_cls, module_name) -> Tuple[str, str]:
+    """Emit ``(module_sv, package_sv)`` via ``zuspec.be.sv`` (sole SV backend), else
+    the legacy ``MmrRegFileRtlEmitter``.
+
+    be.sv covers the plain SW-write / HW-read CSR shape (slice 1); register files
+    using field semantics it doesn't map yet raise ``MmrSVUnsupported`` and fall back
+    — so this flip is regression-safe (no register file loses coverage), and be.sv
+    coverage grows one field-semantic slice at a time (process→FSM unification U-5).
+    """
+    try:
+        from zuspec.be.sv.passes.mmr_to_sv import (
+            build_mmr_regfile_sv, build_mmr_regfile_package, MmrSVUnsupported,
+        )
+        from zuspec.be.sv.ir.sv_emit import SVEmitter
+        mod = SVEmitter().emit_all(build_mmr_regfile_sv(regfile_cls, module_name=module_name))
+        pkg = SVEmitter().emit_all(build_mmr_regfile_package(regfile_cls, module_name=module_name))
+        return mod, pkg
+    except MmrSVUnsupported:
+        emitter = MmrRegFileRtlEmitter(regfile_cls, module_name=module_name)
+        return emitter.emit(), emitter.emit_package()
