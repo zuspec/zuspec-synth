@@ -25,6 +25,9 @@ dependencies = [
     "zuspec-dataclasses",
     "zuspec-ir-core",
     "dv-flow-mgr",
+    # Both imported at module scope: pydantic by dfm.py, yaml by ir/boundary.py.
+    "pydantic",
+    "PyYAML",
 ]
 
 [project.optional-dependencies]
