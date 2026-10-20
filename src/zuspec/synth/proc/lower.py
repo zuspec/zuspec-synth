@@ -462,13 +462,16 @@ class LowerOptions:
     # different states where they join (see CycleExec.run_multi)
     share_joins: bool = True
     # selects grouped by value (see _select_grouped)
-    group_selects: object = False    # False | True (drop default arms) | "or"
+    group_selects: object = True     # False | True (drop default arms) | "or"
     # selects drop conjuncts common to all their conditions (see _select)
     drop_common: bool = False
     # 1-bit ORs of conjunctions simplified where paths rejoin (term.or_)
     simplify_or: bool = False
     # netlist optimizer: register correspondence (see _reg_corr)
     reg_corr: bool = True
+    # netlist optimizer: sequential redundancy by SAT induction over the
+    # whole netlist (seqcorr.optimize): False | "flops" | "all"
+    seqcorr: object = "all"
 
 
 def lower(d: P.Design, opts: Optional[LowerOptions] = None) -> Netlist:
@@ -477,13 +480,22 @@ def lower(d: P.Design, opts: Optional[LowerOptions] = None) -> Netlist:
     _DROP_COMMON[0] = opts.drop_common
     T.SIMPLIFY_OR[0] = opts.simplify_or
     _OPT["reg_corr"] = opts.reg_corr
+    _OPT["seqcorr"] = opts.seqcorr
     qref: Dict[P.Var, T.Term] = {v: T.var(v.name, v.w) for v in d.vars}
     report: List[str] = []
     regs: List[Reg] = []
     # per var: [(proc priority, proc index, next term)]
     writers: Dict[P.Var, List[Tuple[int, int, T.Term]]] = {}
+    comb_wires = _lower_comb(d, qref, report)
+    seq = [p for p in d.procs if not p.comb]
+    if len(seq) != len(d.procs):
+        d = dc.replace(d, procs=seq)
     cfgs = [CFG(proc) for proc in d.procs]
-    dead = _dead_private(d, cfgs, qref)
+    # what combinational processes write or read is observed by them
+    comb_seen = set(comb_wires)
+    for t in comb_wires.values():
+        comb_seen |= {x.name for x in T.leaves(t)}
+    dead = _dead_private(d, cfgs, qref, comb_seen)
     if dead:
         report.append(f"no register for {len(dead)} process-private vars "
                       f"({sum(v.w for v in dead)} bits) not live across a clock edge")
@@ -635,13 +647,58 @@ def lower(d: P.Design, opts: Optional[LowerOptions] = None) -> Netlist:
         if v.kind in ("in",) and v is not d.clock and v is not d.reset:
             inputs.append((v.name, v.w))
     outputs = [(p.name, qref[p.var]) for p in d.ports if p.direction == "out"]
-    wires = [(a.var.name, a.value) for a in d.assigns] + consts
+    for v in d.vars:
+        if v.name in comb_wires and (v.name in driven or v.kind == "in"):
+            raise LowerError(f"{v.name}: written by a combinational process and "
+                             f"{'a clocked process' if v.name in driven else 'is an input'}")
+    consts = [(n, t) for n, t in consts if n not in comb_wires]
+    wires = [(a.var.name, a.value) for a in d.assigns] + list(comb_wires.items()) + consts
     assigned = {n for n, _ in wires}
     nets = [(v.name, v.w) for v in d.vars
             if v.kind == "net" and v.name not in assigned]
     return Netlist(name=d.name, inputs=inputs, outputs=outputs, regs=regs, wires=wires,
                    instances=list(d.instances), clock=d.clock.name,
                    reset=d.reset.name if d.reset else None, report=report, nets=nets)
+
+
+def _lower_comb(d: P.Design, qref, report: List[str]) -> Dict[str, T.Term]:
+    """Combinational processes -> {net name: value}. The body runs once,
+    symbolically, from no state; each var it writes must be written on every
+    path (a var kept on some path is a latch) and not read before it is
+    written (a combinational loop)."""
+    out: Dict[str, T.Term] = {}
+    for proc in d.procs:
+        if not proc.comb:
+            continue
+        body = [P.Await(None, initial=True, label=f"{proc.name}@comb")] + list(proc.body)
+        cfg = CFG(P.Proc(proc.name, body, origin=proc.origin))
+        if len(cfg.awaits) != 1:
+            raise LowerError(f"combinational process {proc.name} waits")
+        leaves = CycleExec(cfg, qref, proc.name).run(cfg.initial)
+        leaves = [lf for lf in leaves if not (lf.cond.is_const and not lf.cond.val)]
+        vs: Set[P.Var] = set()
+        for lf in leaves:
+            if lf.env.nbw:
+                raise LowerError(f"combinational process {proc.name}: nonblocking write to "
+                                 f"{', '.join(sorted(v.name for v in lf.env.nbw))}")
+            vs.update(lf.env.cur)
+        for v in sorted(vs, key=lambda v: v.name):
+            missing = [lf for lf in leaves if v not in lf.env.cur]
+            if missing:
+                raise LowerError(f"combinational process {proc.name}: {v.name} is not written "
+                                 "on every path (it would be a latch)")
+            val = _select([(lf.cond, lf.env.cur[v]) for lf in leaves])
+            if any(x.name == v.name for x in T.leaves(val)):
+                raise LowerError(f"combinational process {proc.name}: {v.name} keeps its "
+                                 "value on some path (a latch) or is read before it is "
+                                 "written (a combinational loop)")
+            if v.name in out:
+                raise LowerError(f"{v.name}: written by two combinational processes")
+            out[v.name] = val
+    if out:
+        report.append(f"combinational processes: {sum(1 for p in d.procs if p.comb)}, "
+                      f"{len(out)} nets")
+    return out
 
 
 def _node_uses(n: Node, byname: Dict[str, P.Var]) -> Set[P.Var]:
@@ -659,7 +716,8 @@ def _node_uses(n: Node, byname: Dict[str, P.Var]) -> Set[P.Var]:
     return out
 
 
-def _dead_private(d: P.Design, cfgs: List[CFG], qref) -> Dict[P.Var, T.Term]:
+def _dead_private(d: P.Design, cfgs: List[CFG], qref,
+                  observed_names: Set[str] = frozenset()) -> Dict[P.Var, T.Term]:
     """Process-private vars whose value never has to survive a clock edge.
 
     A var is private when one process alone reads and writes it and nothing
@@ -668,7 +726,7 @@ def _dead_private(d: P.Design, cfgs: List[CFG], qref) -> Dict[P.Var, T.Term]:
     await, every read of it in a cycle follows a write in the same cycle (or
     is of an undefined value), so it needs no register."""
     byname = {v.name: v for v in d.vars}
-    observed: Set[P.Var] = set()
+    observed: Set[P.Var] = {v for v in d.vars if v.name in observed_names}
     for p in d.ports:
         observed.add(p.var)
     for a in d.assigns:
@@ -780,20 +838,46 @@ def optimize(nl: Netlist) -> Netlist:
     - Register bits that are always equal (register correspondence) are
       replaced by one of them; the others are then dead."""
     before = sum(r.w for r in nl.regs)
-    for _ in range(64):
-        changed = _seq_const(nl)
-        if _OPT["reg_corr"]:
-            changed |= _reg_corr(nl)
-        changed |= _coi(nl)
-        if not changed:
-            break
+
+    def fixpoint():
+        for _ in range(64):
+            changed = _seq_const(nl)
+            if _OPT["reg_corr"]:
+                changed |= _reg_corr(nl)
+            changed |= _coi(nl)
+            if not changed:
+                break
+    fixpoint()
+    if _OPT["seqcorr"]:
+        from . import seqcorr
+        nl.regs = [r for r in nl.regs if not _is_const_reg(r)]
+        nodes = "flops" if _OPT["seqcorr"] == "flops" else "all"
+        nl.report.extend(seqcorr.optimize(nl, nodes=nodes))
+        fixpoint()
     nl.regs = [r for r in nl.regs if not _is_const_reg(r)]
+    _check_defined(nl)
     after_bits = sum(r.w for r in nl.regs)
     nl.report.append(f"optimize: {before} register bits -> {after_bits}")
     return nl
 
 
-_OPT = {"reg_corr": True}
+_OPT = {"reg_corr": True, "seqcorr": False}
+
+
+def _check_defined(nl: Netlist) -> None:
+    """Every signal a term reads is a register, an input, a wire or a net
+    (a pass that removes a register must leave no reference to it)."""
+    known = ({r.name for r in nl.regs} | {n for n, _ in nl.inputs} | {n for n, _ in nl.wires}
+             | {n for n, _ in nl.nets})
+    terms = [r.next for r in nl.regs] + [t for _, t in nl.wires] + [t for _, t in nl.outputs]
+    terms += [c.term for i in nl.instances for c in i.conns if c.term is not None]
+    seen: Set[T.Term] = set()
+    for t in terms:
+        for x in T.leaves(t):
+            if x not in seen:
+                seen.add(x)
+                if x.name not in known:
+                    raise LowerError(f"internal: {x.name} is read but no longer defined")
 
 
 def _reg_corr(nl: Netlist) -> bool:

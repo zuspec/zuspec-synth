@@ -28,6 +28,8 @@ dependencies = [
     # Both imported at module scope: pydantic by dfm.py, yaml by ir/boundary.py.
     "pydantic",
     "PyYAML",
+    # SAT checks of proc.seqcorr (sequential correspondence)
+    "python-sat",
 ]
 
 [project.optional-dependencies]

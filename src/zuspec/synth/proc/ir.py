@@ -8,7 +8,8 @@ netlist with
     module input; ``net`` is driven by something else in the netlist (a leaf
     instance output, a continuous assignment);
   - ``procs``: clocked processes, each a structured statement body that awaits
-    clock edges and conditions;
+    clock edges and conditions, and combinational processes (``comb``: no
+    awaits; what they write are nets);
   - ``assigns``: continuous assignments (``net = term``);
   - ``instances``: leaf modules kept as they are, connected to vars.
 
@@ -94,6 +95,10 @@ class Proc:
     body: List[Stmt]
     priority: int = 0
     origin: str = ""
+    # combinational: no awaits; the body runs whenever what it reads changes,
+    # and every var it writes is a net with the body's final value. Each such
+    # var must be written on every path before it is read (else: a latch)
+    comb: bool = False
 
 
 @dc.dataclass(eq=False)
