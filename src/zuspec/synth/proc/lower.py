@@ -36,7 +36,7 @@ class LowerError(Exception):
 # ======================================================================= CFG
 class Node:
     __slots__ = ("id", "kind", "var", "value", "nb", "cond", "next", "alt", "await_",
-                 "label")
+                 "label", "loc")
 
     def __init__(self, nid: int, kind: str):
         self.id = nid
@@ -49,6 +49,7 @@ class Node:
         self.alt: Optional[Node] = None   # branch: taken when cond is false
         self.await_: Optional[P.Await] = None
         self.label = ""
+        self.loc = ""                     # source 'file:line'
 
     def __repr__(self) -> str:
         return f"<{self.kind}{self.id}>"
@@ -82,10 +83,12 @@ class CFG:
         if isinstance(s, P.Assign):
             n = self._new("assign")
             n.var, n.value, n.nb, n.next = s.var, s.value, s.nb, succ
+            n.loc = s.loc
             return n
         if isinstance(s, P.If):
             n = self._new("branch")
             n.cond = s.cond
+            n.loc = s.loc
             n.next = self._build(s.then, succ, brk, cont)
             n.alt = self._build(s.orelse, succ, brk, cont)
             return n
@@ -95,6 +98,7 @@ class CFG:
             n.cond = s.cond
             n.next = succ
             n.label = s.label
+            n.loc = s.loc
             self.awaits.append(n)
             if s.initial:
                 if self.initial is not None:
@@ -442,6 +446,21 @@ class Reg:
 
 
 @dc.dataclass
+class ProcInfo:
+    """What the lowering decided for one clocked process (for structured
+    emission, :mod:`zuspec.synth.proc.structured`)."""
+    proc: P.Proc
+    cfg: CFG
+    states: List[Node]                 # reachable awaits; index = state number
+    state_var: Optional[str]           # None: one state, no state register
+    state_w: int
+    codes: List[int]                   # per state: its code in state_var
+    onehot: bool
+    dead: Dict[P.Var, T.Term]          # private vars with no register
+    qref: Dict[P.Var, T.Term]
+
+
+@dc.dataclass
 class Netlist:
     name: str
     inputs: List[Tuple[str, int]]
@@ -452,7 +471,82 @@ class Netlist:
     clock: str
     reset: Optional[str]
     report: List[str] = dc.field(default_factory=list)
+    # every register the lowering made: name -> (width, reset value)
+    reg_shapes: Dict[str, Tuple[int, int]] = dc.field(default_factory=dict)
+    procs: List[ProcInfo] = dc.field(default_factory=list)
+    # before seqcorr: (register -> next, observable roots); see optimize
+    var_view: Optional[tuple] = None
+    # register var -> the processes that write it, highest priority first
+    writers: Dict[str, List[str]] = dc.field(default_factory=dict)
     nets: List[Tuple[str, int]] = dc.field(default_factory=list)   # driven by instances
+    # registers the optimizer replaced: name -> full-width value over the
+    # surviving signals (bits it kept are slices of the register itself);
+    # see register_values
+    subst: Dict[str, T.Term] = dc.field(default_factory=dict)
+
+    def record_subst(self, m: Dict[T.Term, T.Term]) -> None:
+        """Note a substitution of register vars (var term -> value)."""
+        memo: Dict[T.Term, T.Term] = {}
+        self.subst = {n: T.substitute(v, m, memo) for n, v in self.subst.items()}
+        for q, v in m.items():
+            if q.op == "var" and q.name not in self.subst:
+                self.subst[q.name] = v
+
+    def _needed_by_source(self) -> Optional[Dict[str, int]]:
+        """With a var_view: the register bits observable when only register
+        substitutions are applied (code in the source's structure)."""
+        if self.var_view is None:
+            return None
+        nexts, roots = self.var_view
+        m = {T.var(n, self.reg_shapes[n][0]): v for n, v in self.subst.items()}
+        memo: Dict[T.Term, T.Term] = {}
+        nexts = {n: T.substitute(t, m, memo) for n, t in nexts.items() if n not in self.subst
+                 or any(T.slice_(self.subst[n], b, 1) is T.slice_(T.var(n, t.w), b, 1)
+                        for b in range(t.w))}
+        return _needed(nexts, [T.substitute(t, m, memo) for t in roots])
+
+    def next_by_source(self, name: str) -> Optional[T.Term]:
+        """A register's next value in the var_view (registers substituted)."""
+        if self.var_view is None or name not in self.var_view[0]:
+            return None
+        m = {T.var(n, self.reg_shapes[n][0]): v for n, v in self.subst.items()}
+        return T.substitute(self.var_view[0][name], m)
+
+    def register_values(self) -> Dict[str, T.Term]:
+        """After optimize: for every register var the lowering made, what it
+        is now. A bit that is still a flop is a slice of the var itself; a bit
+        the optimizer replaced is its replacement; a bit that is constant or
+        that nothing observable reads is its reset value. Only vars with at
+        least one bit that is not a flop are listed."""
+        live = {r.name: r for r in self.regs if not _is_const_reg(r)}
+        need = self._needed_by_source()
+        # a bit is a flop when it is not replaced and (with a var_view) the
+        # code in the source's structure observes it, (without) the flat
+        # netlist still has it
+        out: Dict[str, T.Term] = {}
+        for name, (w, init) in self.reg_shapes.items():
+            q = T.var(name, w)
+            val = self.subst.get(name, q)
+            r = live.get(name)
+            bits = []
+            changed = False
+            for b in range(w):
+                vb = T.slice_(val, b, 1)
+                if vb is T.slice_(q, b, 1):
+                    if need is not None:
+                        dead = not (need.get(name, 0) >> b) & 1
+                    else:
+                        nb = T.slice_(r.next, b, 1) if r is not None else None
+                        dead = r is None or (nb.is_const and nb.val == (init >> b) & 1)
+                    if dead:
+                        vb = T.const((init >> b) & 1, 1)
+                        changed = True
+                else:
+                    changed = True
+                bits.append(vb)
+            if changed:
+                out[name] = T.concat(*reversed(bits))
+        return out
 
 
 @dc.dataclass
@@ -496,6 +590,7 @@ def lower(d: P.Design, opts: Optional[LowerOptions] = None) -> Netlist:
     for t in comb_wires.values():
         comb_seen |= {x.name for x in T.leaves(t)}
     dead = _dead_private(d, cfgs, qref, comb_seen)
+    infos: List[ProcInfo] = []
     if dead:
         report.append(f"no register for {len(dead)} process-private vars "
                       f"({sum(v.w for v in dead)} bits) not live across a clock edge")
@@ -552,6 +647,19 @@ def lower(d: P.Design, opts: Optional[LowerOptions] = None) -> Netlist:
                 return T.const(i, sw)
             sinit = idx[cfg.initial.id]
         written: Set[P.Var] = set()
+        if opts.encoding == "onehot" and n > 1:
+            codes_ = [1 << i for i in range(n)]
+        elif opts.encoding == "factored" and n > 1:
+            codes_ = list(codes)
+        else:
+            codes_ = list(range(n))
+        pnames = set()
+        for nd in cfg.nodes:
+            pnames |= _node_uses(nd, {v.name: v for v in dead})
+            if nd.kind == "assign" and nd.var in dead:
+                pnames.add(nd.var)
+        infos.append(ProcInfo(proc, cfg, states, sname if n > 1 else None, sw, codes_,
+                              opts.encoding == "onehot", {v: dead[v] for v in pnames}, qref))
 
         def finals(leaves: List[Leaf], stay: T.Term):
             vs: Set[P.Var] = set()
@@ -658,7 +766,10 @@ def lower(d: P.Design, opts: Optional[LowerOptions] = None) -> Netlist:
             if v.kind == "net" and v.name not in assigned]
     return Netlist(name=d.name, inputs=inputs, outputs=outputs, regs=regs, wires=wires,
                    instances=list(d.instances), clock=d.clock.name,
-                   reset=d.reset.name if d.reset else None, report=report, nets=nets)
+                   reset=d.reset.name if d.reset else None, report=report, nets=nets,
+                   reg_shapes={r.name: (r.w, r.init) for r in regs}, procs=infos,
+                   writers={v.name: [d.procs[pi].name for _, pi, _ in ws]
+                            for v, ws in writers.items()})
 
 
 def _lower_comb(d: P.Design, qref, report: List[str]) -> Dict[str, T.Term]:
@@ -851,6 +962,11 @@ def optimize(nl: Netlist) -> Netlist:
     if _OPT["seqcorr"]:
         from . import seqcorr
         nl.regs = [r for r in nl.regs if not _is_const_reg(r)]
+        # seqcorr also replaces internal signals by equivalent ones, which
+        # can leave a register unread here that code written in the source's
+        # structure still reads: what that code needs is decided on this
+        # snapshot (see register_values)
+        nl.var_view = ({r.name: r.next for r in nl.regs}, _roots(nl))
         nodes = "flops" if _OPT["seqcorr"] == "flops" else "all"
         nl.report.extend(seqcorr.optimize(nl, nodes=nodes))
         fixpoint()
@@ -964,6 +1080,7 @@ def _is_const_reg(r: Reg) -> bool:
 
 
 def _subst_all(nl: Netlist, m: Dict[T.Term, T.Term]) -> None:
+    nl.record_subst(m)
     memo: Dict[T.Term, T.Term] = {}
     for r in nl.regs:
         r.next = T.substitute(r.next, m, memo)
@@ -1035,8 +1152,23 @@ def _only_self_or(t: T.Term, qb: T.Term, ib: int) -> bool:
     return True
 
 
-def _coi(nl: Netlist) -> bool:
-    regs = {r.name: r for r in nl.regs if not _is_const_reg(r)}
+def _roots(nl: Netlist) -> List[T.Term]:
+    """What is observable: outputs, continuous assignments, instance inputs."""
+    roots = [t for _n, t in nl.outputs] + [t for _n, t in nl.wires]
+    for inst in nl.instances:
+        for c in inst.conns:
+            if c.var is not None:
+                roots.append(T.var(c.var.name, c.var.w))
+            if c.term is not None:
+                roots.append(c.term)
+    return roots
+
+
+def _needed(nexts: Dict[str, T.Term], roots: List[T.Term]) -> Dict[str, int]:
+    """Bit-level cone of influence: per register (name -> next term), the
+    mask of its bits that the roots depend on, through any chain of
+    registers."""
+    regs = nexts
     need: Dict[str, int] = {}          # reg name -> needed bit mask
     work: List[Tuple[str, int]] = []
 
@@ -1083,20 +1215,17 @@ def _coi(nl: Netlist) -> bool:
                 for a in x.args:
                     stack.append((a, (1 << a.w) - 1))
 
-    for _n, t in nl.outputs:
+    for t in roots:
         mark_term(t)
-    for _n, t in nl.wires:
-        mark_term(t)
-    for inst in nl.instances:
-        for c in inst.conns:
-            if c.var is not None and c.var.name in regs:
-                mark_term(T.var(c.var.name, c.var.w))
-            if c.term is not None:
-                mark_term(c.term)
     while work:
         name, bm = work.pop()
-        r = regs[name]
-        mark_term(r.next, bm)
+        mark_term(regs[name], bm)
+    return need
+
+
+def _coi(nl: Netlist) -> bool:
+    regs = {r.name: r for r in nl.regs if not _is_const_reg(r)}
+    need = _needed({n: r.next for n, r in regs.items()}, _roots(nl))
     changed = False
     for name, r in regs.items():
         nb = need.get(name, 0)

@@ -640,12 +640,21 @@ def apply(nl, res: Result, bl: _Blaster) -> List[str]:
 
     for r in nl.regs:
         r.next = sub(r.next)
-    nl.outputs = [(n, t if t.op == "var" else sub(t)) for n, t in nl.outputs]
+    # an output that is a merged register reads its representative
+    nl.outputs = [(n, sub(t)) for n, t in nl.outputs]
     nl.wires = [(n, sub(t)) for n, t in nl.wires]
     for inst in nl.instances:
         for c in inst.conns:
             if c.term is not None:
                 c.term = sub(c.term)
+    # the value of every register var, read here or not (code in the
+    # source's structure may read registers these terms no longer do)
+    for r in nl.regs:
+        q = T.var(r.name, r.w)
+        if q not in memo:
+            sub(q)
+    nl.record_subst({q: memo[q] for q in (T.var(r.name, r.w) for r in nl.regs)
+                     if q in memo and memo[q] is not q})
     # merged register bits are read nowhere now: they hold their reset value
     merged: Dict[str, Set[int]] = {}
     for f in res.aig.flops:

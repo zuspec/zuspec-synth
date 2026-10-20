@@ -52,6 +52,7 @@ class Assign:
     var: Var
     value: Term                  # full width of var
     nb: bool = False             # nonblocking
+    loc: str = ""                # source 'file:line', for the output's comments
 
 
 @dc.dataclass(eq=False)
@@ -59,6 +60,7 @@ class If:
     cond: Term
     then: List["Stmt"] = dc.field(default_factory=list)
     orelse: List["Stmt"] = dc.field(default_factory=list)
+    loc: str = ""
 
 
 @dc.dataclass(eq=False)
@@ -84,6 +86,7 @@ class Await:
     cond: Optional[Term] = None  # None: the next clock edge
     initial: bool = False
     label: str = ""
+    loc: str = ""
 
 
 Stmt = Union[Assign, If, Loop, Break, Continue, Await]
