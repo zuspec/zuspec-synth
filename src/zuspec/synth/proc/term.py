@@ -231,8 +231,76 @@ def _bitwise(op: str, args: List[Term]) -> Term:
         return const(cval, w)
     if len(rest) == 1:
         return rest[0]
+    if op == "or" and w == 1 and SIMPLIFY_OR[0] and len(rest) <= _OR_MAX:
+        r = _or_of_ands(rest)
+        if r is not None:
+            return r
     rest.sort(key=lambda a: a._hash)
     return _mk(op, w, tuple(rest))
+
+
+SIMPLIFY_OR = [True]
+_OR_MAX = 64
+
+
+def conjuncts(t: Term) -> frozenset:
+    return frozenset(t.args) if t.op == "and" else frozenset([t])
+
+
+def _or_of_ands(args: List[Term]) -> Optional[Term]:
+    """A 1-bit OR of conjunctions, simplified where paths rejoin:
+
+      (R & x) | (R & ~x & Y)  ->  (R & x) | (R & Y)     (complement)
+      S | (S & Y)             ->  S                     (absorption)
+
+    so (c & b) | (c & ~b) is c again, and a common factor is pulled out:
+    (C & A) | (C & B) -> C & (A | B). Returns None when nothing changed."""
+    ts = [conjuncts(a) for a in args]
+    changed = False
+    again = True
+    while again:
+        again = False
+        # absorption (and duplicates)
+        ts.sort(key=len)
+        keep: List[frozenset] = []
+        for t in ts:
+            if any(k <= t for k in keep):
+                changed = again = True
+                continue
+            keep.append(t)
+        ts = keep
+        if any(not t for t in ts):
+            return ONE
+        # complement: S = R+{x}, T >= R+{~x}  ->  T - {~x}
+        for i, S in enumerate(ts):
+            for x in S:
+                nx = not_(x)
+                R = S - {x}
+                for j, T_ in enumerate(ts):
+                    if j != i and nx in T_ and R <= T_:
+                        ts[j] = T_ - {nx}
+                        changed = again = True
+                if again:
+                    break
+            if again:
+                break
+    if not changed and len(ts) > 1:
+        common = frozenset.intersection(*ts)
+        if not common:
+            return None
+    if len(ts) == 1:
+        return and_(*ts[0]) if ts[0] else ONE
+    common = frozenset.intersection(*ts)
+    if common:
+        rest = [t - common for t in ts]
+        if any(not t for t in rest):
+            return and_(*common)
+        return and_(*common, or_(*[and_(*t) for t in rest]))
+    SIMPLIFY_OR[0] = False          # no recursion into the rebuilt OR
+    try:
+        return or_(*[and_(*t) for t in ts])
+    finally:
+        SIMPLIFY_OR[0] = True
 
 
 def and_(*args: Term) -> Term:

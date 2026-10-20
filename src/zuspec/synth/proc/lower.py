@@ -175,26 +175,36 @@ class CycleExec:
         return self.dead.get(v, self.q[v])
 
     def run(self, start: Node) -> List[Leaf]:
+        return self.run_multi([(start, T.ONE)])
+
+    def run_multi(self, starts: List[Tuple[Node, T.Term]]) -> List[Leaf]:
+        """One cycle from several states at once, each guarded by its state
+        condition. Paths from different states that reach the same program
+        point merge there, so code after a join (the rest of a subroutine
+        called from several states, a common tail) is evaluated once over
+        muxed values instead of once per state."""
         env0 = Env(cur={}, nbw={})
         leaves: List[Leaf] = []
-        # pending contributions per (node, passed): list of (cond, env)
         pending: Dict[tuple, List[Tuple[T.Term, Env]]] = {}
         order: List[tuple] = []
-
-        if start.kind != "await":
-            raise LowerError("a state must be an await")
-        if start.cond is None:
-            first = [((start.next.id, frozenset()), start.next, T.ONE, env0)]
-        else:
-            c = self._eval(start.cond, env0)
-            leaves.append(Leaf(T.not_(c), start, env0))
-            first = [((start.next.id, frozenset([start.id])), start.next, c, env0)]
-        # topological processing of the (node, passed) DAG
         graph_nodes: Dict[tuple, Node] = {}
-        for key, node, c, env in first:
-            self._add(pending, order, graph_nodes, key, node, c, env)
-        topo = self._toposort(first, start)
-        for key in topo:
+        first = []
+        for start, at in starts:
+            if start.kind != "await":
+                raise LowerError("a state must be an await")
+            if start.cond is None:
+                first.append((start.next, frozenset(), at))
+            else:
+                c = self._eval(start.cond, env0)
+                leaves.append(Leaf(T.and_(at, T.not_(c)), start, env0))
+                first.append((start.next, frozenset([start.id]), T.and_(at, c)))
+        keys = []
+        for node, passed, c in first:
+            key = self._key(node, passed)
+            keys.append((key, node))
+            self._add(pending, order, graph_nodes, key, node, c, env0)
+        # topological processing of the (node, passed) DAG
+        for key in self._toposort(keys):
             contribs = pending.get(key)
             if not contribs:
                 continue
@@ -202,41 +212,76 @@ class CycleExec:
             c, env = self._merge(contribs)
             if c.is_const and not c.val:
                 continue
-            passed = key[1]
-            self._step(node, passed, c, env, start, leaves, pending, order, graph_nodes)
+            self._step(node, key[1], c, env, leaves, pending, order, graph_nodes)
         return leaves
 
+    def _key(self, node: Node, passed: frozenset) -> tuple:
+        """The DAG key of a program point. Of the waits already passed this
+        cycle only those that can still be reached matter (reaching one again
+        ends the cycle); dropping the others lets paths from different states
+        merge."""
+        if passed:
+            passed = passed & self._reach()[node.id]
+        return (node.id, passed)
+
+    def _reach(self) -> Dict[int, frozenset]:
+        """Per node: the conditional waits reachable from it within a cycle
+        (not through a clock edge, which always ends the cycle)."""
+        r = self.cfg.__dict__.get("_cond_reach")
+        if r is not None:
+            return r
+        nodes = self.cfg.nodes
+        reach: Dict[int, Set[int]] = {n.id: set() for n in nodes}
+        changed = True
+        while changed:
+            changed = False
+            for n in reversed(nodes):
+                if n.kind == "end" or (n.kind == "await" and n.cond is None):
+                    continue
+                cur = reach[n.id]
+                new = set(cur)
+                if n.kind == "await":
+                    new.add(n.id)
+                for x in (n.next, n.alt):
+                    if x is not None:
+                        new |= reach[x.id]
+                if len(new) != len(cur):
+                    reach[n.id] = new
+                    changed = True
+        r = {k: frozenset(v) for k, v in reach.items()}
+        self.cfg.__dict__["_cond_reach"] = r
+        return r
+
     # -- DAG order -------------------------------------------------------
-    def _succ(self, node: Node, passed: frozenset, start: Node):
+    def _succ(self, node: Node, passed: frozenset):
         """Successor (node, passed) keys within the cycle."""
         k = node.kind
         if k == "assign" or k == "nop":
-            return [(node.next, passed)]
+            return [self._key(node.next, passed)]
         if k == "branch":
-            return [(node.next, passed), (node.alt, passed)]
+            return [self._key(node.next, passed), self._key(node.alt, passed)]
         if k == "await":
-            if node.cond is None or node is start or node.id in passed:
+            if node.cond is None or node.id in passed:
                 return []
-            return [(node.next, passed | {node.id})]
+            return [self._key(node.next, passed | {node.id})]
         return []
 
-    def _toposort(self, first, start: Node) -> List[tuple]:
+    def _toposort(self, first: List[Tuple[tuple, Node]]) -> List[tuple]:
         order: List[tuple] = []
         state: Dict[tuple, int] = {}       # 1 = on stack, 2 = done
-        nodes: Dict[tuple, Node] = {}
+        byid = {n.id: n for n in self.cfg.nodes}
 
-        def visit(node: Node, passed: frozenset):
-            key = (node.id, passed)
+        def visit(key):
             st = state.get(key)
             if st == 2:
                 return
             if st == 1:
+                node = byid[key[0]]
                 raise LowerError(f"process {self.proc_name}: a loop that never waits "
                                  f"for the clock (through node {node.id} {node.label})")
             state[key] = 1
-            nodes[key] = node
-            for nn, pp in self._succ(node, passed, start):
-                visit(nn, pp)
+            for kk in self._succ(byid[key[0]], key[1]):
+                visit(kk)
             state[key] = 2
             order.append(key)
 
@@ -244,8 +289,8 @@ class CycleExec:
         old = sys.getrecursionlimit()
         sys.setrecursionlimit(max(old, 100000))
         try:
-            for (key, node, _c, _e) in first:
-                visit(node, key[1])
+            for key, _node in first:
+                visit(key)
         finally:
             sys.setrecursionlimit(old)
         order.reverse()
@@ -258,11 +303,14 @@ class CycleExec:
         pending.setdefault(key, []).append((c, env))
 
     # -- one node --------------------------------------------------------
-    def _step(self, node: Node, passed, c, env: Env, start, leaves, pending, order,
+    def _step(self, node: Node, passed, c, env: Env, leaves, pending, order,
               graph_nodes) -> None:
         k = node.kind
+
+        def go(nx: Node, cond: T.Term, e: Env, p=passed):
+            self._add(pending, order, graph_nodes, self._key(nx, p), nx, cond, e)
         if k == "nop":
-            self._add(pending, order, graph_nodes, (node.next.id, passed), node.next, c, env)
+            go(node.next, c, env)
         elif k == "assign":
             val = self._eval(node.value, env)
             if node.nb:
@@ -273,21 +321,18 @@ class CycleExec:
                 cur = dict(env.cur)
                 cur[node.var] = val
                 env2 = Env(cur=cur, nbw=env.nbw)
-            self._add(pending, order, graph_nodes, (node.next.id, passed), node.next, c, env2)
+            go(node.next, c, env2)
         elif k == "branch":
             b = T.bool_(self._eval(node.cond, env))
-            self._add(pending, order, graph_nodes, (node.next.id, passed), node.next,
-                      T.and_(c, b), env)
-            self._add(pending, order, graph_nodes, (node.alt.id, passed), node.alt,
-                      T.and_(c, T.not_(b)), env)
+            go(node.next, T.and_(c, b), env)
+            go(node.alt, T.and_(c, T.not_(b)), env)
         elif k == "await":
-            if node.cond is None or node is start or node.id in passed:
+            if node.cond is None or node.id in passed:
                 leaves.append(Leaf(c, node, env))
                 return
             w = T.bool_(self._eval(node.cond, env))
             leaves.append(Leaf(T.and_(c, T.not_(w)), node, env))
-            nxt = (node.next.id, passed | {node.id})
-            self._add(pending, order, graph_nodes, nxt, node.next, T.and_(c, w), env)
+            go(node.next, T.and_(c, w), env, passed | {node.id})
         elif k == "end":
             leaves.append(Leaf(c, node, env))
         else:
@@ -329,10 +374,60 @@ class CycleExec:
 
 
 def _select(vals: List[Tuple[T.Term, T.Term]]) -> T.Term:
-    """ite chain over disjoint conditions; the last value is the default."""
+    """ite chain over disjoint conditions; the last value is the default.
+
+    The select is only used where one of the conditions holds, so conjuncts
+    common to all of them (the condition of the code around the branch that
+    split them) are dropped from each."""
+    if _DROP_COMMON[0] and len(vals) > 1:
+        live = [c for c, _ in vals if not (c.is_const and not c.val)]
+        if len(live) > 1:
+            common = frozenset.intersection(*[T.conjuncts(c) for c in live])
+            if common:
+                vals = [(c if c.is_const else T.and_(*(T.conjuncts(c) - common)), v)
+                        for c, v in vals]
+    if _GROUP[0]:
+        return _select_grouped(vals)
     out = vals[-1][1]
     for c, v in reversed(vals[:-1]):
         out = T.ite(c, v, out)
+    return out
+
+
+_GROUP = [True]
+_DROP_COMMON = [True]
+
+
+def _select_grouped(vals: List[Tuple[T.Term, T.Term]]) -> T.Term:
+    """The same select with the arms grouped by value: one OR of conditions
+    per distinct value, and the value with the most arms (usually "keeps its
+    value") is the default, so it needs no condition at all. Correct because
+    the conditions are disjoint and the select is only used where one of them
+    holds."""
+    conds: Dict[T.Term, List[T.Term]] = {}
+    for c, v in vals:
+        if c.is_const and not c.val:
+            continue
+        conds.setdefault(v, []).append(c)
+    if not conds:
+        return vals[-1][1]
+    if len(conds) == 1:
+        return next(iter(conds))
+    groups = list(conds.items())
+    # default: the group with the most arms; ties go to the later one (the
+    # old default)
+    di = max(range(len(groups)), key=lambda i: (len(groups[i][1]), i))
+    dv = groups[di][0]
+    out = dv
+    if _GROUP[0] == "or":
+        for i in reversed(range(len(groups))):
+            if i != di:
+                out = T.ite(T.or_(*groups[i][1]), groups[i][0], out)
+        return out
+    # the other arms stay as they were, in order (no OR of conditions)
+    for c, v in reversed(vals):
+        if v is not dv and not (c.is_const and not c.val):
+            out = T.ite(c, v, out)
     return out
 
 
@@ -362,11 +457,26 @@ class Netlist:
 
 @dc.dataclass
 class LowerOptions:
-    encoding: str = "binary"         # 'binary' | 'onehot'
+    encoding: str = "binary"         # 'binary' | 'onehot' | 'factored'
+    # execute all states of a process in one pass, merging paths from
+    # different states where they join (see CycleExec.run_multi)
+    share_joins: bool = True
+    # selects grouped by value (see _select_grouped)
+    group_selects: object = False    # False | True (drop default arms) | "or"
+    # selects drop conjuncts common to all their conditions (see _select)
+    drop_common: bool = False
+    # 1-bit ORs of conjunctions simplified where paths rejoin (term.or_)
+    simplify_or: bool = False
+    # netlist optimizer: register correspondence (see _reg_corr)
+    reg_corr: bool = True
 
 
 def lower(d: P.Design, opts: Optional[LowerOptions] = None) -> Netlist:
     opts = opts or LowerOptions()
+    _GROUP[0] = opts.group_selects
+    _DROP_COMMON[0] = opts.drop_common
+    T.SIMPLIFY_OR[0] = opts.simplify_or
+    _OPT["reg_corr"] = opts.reg_corr
     qref: Dict[P.Var, T.Term] = {v: T.var(v.name, v.w) for v in d.vars}
     report: List[str] = []
     regs: List[Reg] = []
@@ -393,6 +503,32 @@ def lower(d: P.Design, opts: Optional[LowerOptions] = None) -> Netlist:
             def code(i, sw=sw):
                 return T.const(1 << i, sw)
             sinit = 1 << idx[cfg.initial.id]
+        elif opts.encoding == "factored" and n > 1:
+            # copies of one source wait (a subroutine inlined at several call
+            # sites) share a position code; a site field tells them apart:
+            # code = {position, site}, so logic that is the same for every
+            # copy decodes the position alone
+            groups: Dict[str, List[int]] = {}
+            for i, s in enumerate(states):
+                # the label's source part: '<call path>@<source location>'
+                src = s.label.rpartition("@")[2] if s.label else ""
+                groups.setdefault(src or f"#{s.id}", []).append(i)
+            gl = list(groups.values())
+            pw = max(1, (len(gl) - 1).bit_length())
+            kw = max(0, (max(len(g) for g in gl) - 1).bit_length())
+            sw = pw + kw
+            codes = [0] * n
+            for p_, g in enumerate(gl):
+                for k, i in enumerate(g):
+                    codes[i] = (p_ << kw) | k
+            sq = T.var(sname, sw)
+
+            def at(i, sq=sq, sw=sw, codes=codes):
+                return T.eq(sq, T.const(codes[i], sw))
+
+            def code(i, sw=sw, codes=codes):
+                return T.const(codes[i], sw)
+            sinit = codes[idx[cfg.initial.id]]
         else:
             sw = max(1, (n - 1).bit_length())
             sq = T.var(sname, sw)
@@ -403,17 +539,15 @@ def lower(d: P.Design, opts: Optional[LowerOptions] = None) -> Netlist:
             def code(i, sw=sw):
                 return T.const(i, sw)
             sinit = idx[cfg.initial.id]
-        per_state: List[Tuple[T.Term, Dict[P.Var, T.Term], T.Term]] = []
         written: Set[P.Var] = set()
-        for i, s in enumerate(states):
-            leaves = CycleExec(cfg, qref, proc.name, dead).run(s)
-            final: Dict[P.Var, T.Term] = {}
+
+        def finals(leaves: List[Leaf], stay: T.Term):
             vs: Set[P.Var] = set()
             for lf in leaves:
                 vs.update(lf.env.cur)
                 vs.update(lf.env.nbw)
             vs -= set(dead)
-            written |= vs
+            final: Dict[P.Var, T.Term] = {}
             for v in vs:
                 vals = []
                 for lf in leaves:
@@ -424,7 +558,26 @@ def lower(d: P.Design, opts: Optional[LowerOptions] = None) -> Netlist:
                     vals.append((lf.cond, b))
                 final[v] = _select(vals)
             nxt = _select([(lf.cond, code(idx[lf.next.id]) if lf.next.kind == "await"
-                            else code(i)) for lf in leaves])
+                            else stay) for lf in leaves])
+            return vs, final, nxt
+        if opts.share_joins:
+            leaves = CycleExec(cfg, qref, proc.name, dead).run_multi(
+                [(s, at(i) if n > 1 else T.ONE) for i, s in enumerate(states)])
+            vs, final, nstate = finals(leaves, sq)
+            written |= vs
+            if n > 1:
+                regs.append(Reg(sname, sw, sinit, nstate,
+                                origin=f"state of {proc.name} ({n} states)"))
+            for v in vs:
+                if final[v] is not qref[v]:
+                    writers.setdefault(v, []).append((proc.priority, pi, final[v]))
+            report.append(f"{proc.name}: {n} states")
+            continue
+        per_state: List[Tuple[T.Term, Dict[P.Var, T.Term], T.Term]] = []
+        for i, s in enumerate(states):
+            leaves = CycleExec(cfg, qref, proc.name, dead).run(s)
+            vs, final, nxt = finals(leaves, code(i))
+            written |= vs
             per_state.append((at(i), final, nxt))
         # combine states: the last state's logic is the default
         if n > 1:
@@ -623,10 +776,14 @@ def optimize(nl: Netlist) -> Netlist:
       reset value never changes: it is a constant.
     - A register bit nothing observable depends on (outputs, instance inputs,
       continuous assignments, through any chain of registers) is dead.
-    Both become constants at their reset value, which removes the flop."""
+    Both become constants at their reset value, which removes the flop.
+    - Register bits that are always equal (register correspondence) are
+      replaced by one of them; the others are then dead."""
     before = sum(r.w for r in nl.regs)
     for _ in range(64):
         changed = _seq_const(nl)
+        if _OPT["reg_corr"]:
+            changed |= _reg_corr(nl)
         changed |= _coi(nl)
         if not changed:
             break
@@ -634,6 +791,88 @@ def optimize(nl: Netlist) -> Netlist:
     after_bits = sum(r.w for r in nl.regs)
     nl.report.append(f"optimize: {before} register bits -> {after_bits}")
     return nl
+
+
+_OPT = {"reg_corr": True}
+
+
+def _reg_corr(nl: Netlist) -> bool:
+    """Register correspondence by partition refinement (van Eijk): start from
+    classes of register bits with the same reset value; substitute each class
+    by its representative in every next-state term and split classes whose
+    members' next-state bits differ; repeat until stable. What is left is an
+    inductive invariant (equal after reset, and equal next whenever equal
+    now), so each bit can be replaced by its representative. Next-state terms
+    are compared structurally (hash-consed), which is sound and cheap."""
+    regs = [r for r in nl.regs if not _is_const_reg(r)]
+    outs = {t.name for _, t in nl.outputs if t.op == "var"}
+    # representatives: registers that are outputs first (they stay anyway)
+    regs.sort(key=lambda r: r.name not in outs)
+    # bits already constant (next is the reset value) take no part
+    bits = []
+    for r in regs:
+        for b in range(r.w):
+            nb = T.slice_(r.next, b, 1)
+            if not (nb.is_const and nb.val == (r.init >> b) & 1):
+                bits.append((r, b))
+    cls: Dict[Tuple[str, int], int] = {(r.name, b): (r.init >> b) & 1 for r, b in bits}
+    n_cls = len(set(cls.values()))
+    while True:
+        rep: Dict[int, Tuple[Reg, int]] = {}
+        for r, b in bits:
+            rep.setdefault(cls[(r.name, b)], (r, b))
+        m = _corr_map(regs, cls, rep)
+        memo: Dict[T.Term, T.Term] = {}
+        ids: Dict[tuple, int] = {}
+        new: Dict[Tuple[str, int], int] = {}
+        for r in regs:
+            sn = T.substitute(r.next, m, memo) if m else r.next
+            for b in range(r.w):
+                if (r.name, b) in cls:
+                    key = (cls[(r.name, b)], T.slice_(sn, b, 1))
+                    new[(r.name, b)] = ids.setdefault(key, len(ids))
+        if len(ids) == n_cls:
+            break
+        cls, n_cls = new, len(ids)
+    # merged bits of registers that are not outputs
+    gone = [(r, b) for r, b in bits if rep[cls[(r.name, b)]] != (r, b) and r.name not in outs]
+    if not gone or not m:
+        return False
+    _subst_all(nl, m)
+    # what was merged is referenced nowhere now: tie it to its reset value
+    by = {}
+    for r, b in gone:
+        by.setdefault(r.name, set()).add(b)
+    for r in regs:
+        bs = by.get(r.name)
+        if bs:
+            parts = [T.const((r.init >> b) & 1, 1) if b in bs else T.slice_(r.next, b, 1)
+                     for b in range(r.w)]
+            r.next = T.concat(*reversed(parts))
+    pairs: Dict[Tuple[str, str], List[int]] = {}
+    for r, b in gone:
+        rr, _rb = rep[cls[(r.name, b)]]
+        pairs.setdefault((r.name, rr.name), []).append(b)
+    nl.report.append(f"register correspondence: {len(gone)} register bits equal to others: "
+                     + ", ".join(f"{a}[{_ranges(bs)}] = {b_}" for (a, b_), bs in pairs.items()))
+    return True
+
+
+def _corr_map(regs, cls, rep) -> Dict[T.Term, T.Term]:
+    m: Dict[T.Term, T.Term] = {}
+    for r in regs:
+        q = T.var(r.name, r.w)
+        parts = []
+        moved = False
+        for b in range(r.w):
+            k = cls.get((r.name, b))
+            rr, rb = rep[k] if k is not None else (r, b)
+            if rr is not r or rb != b:
+                moved = True
+            parts.append(T.slice_(T.var(rr.name, rr.w), rb, 1))
+        if moved:
+            m[q] = T.concat(*reversed(parts))
+    return m
 
 
 def _is_const_reg(r: Reg) -> bool:

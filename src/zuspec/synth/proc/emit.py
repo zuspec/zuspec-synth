@@ -131,7 +131,9 @@ def emit_verilog(nl: Netlist) -> str:
     for n, t in nl.outputs:
         out.append(f"    output wire {_rng(t.w)}{_id(n)};")
     for r in nl.regs:
-        out.append(f"    reg {_rng(r.w)}{_id(r.name)};    // {r.origin}")
+        # a process state register keeps the encoding the lowering chose
+        attr = '(* fsm_encoding = "none" *) ' if r.origin.startswith("state of ") else ""
+        out.append(f"    {attr}reg {_rng(r.w)}{_id(r.name)};    // {r.origin}")
     ports_set = {n for n, _ in nl.inputs} | {n for n, _ in nl.outputs}
     regs_set = {r.name for r in nl.regs}
     for n, t in nl.wires:
@@ -151,14 +153,23 @@ def emit_verilog(nl: Netlist) -> str:
         body.append(f"    assign {_id(n)} = {e.ref(t)};")
     rst = _id(nl.reset) if nl.reset else None
     clk = _id(nl.clock)
+    inits: List[str] = []
     for r in nl.regs:
         nxt = e.ref(r.next)
         init = f"{r.w}'h{r.init:x}"
         if rst:
             body.append(f"    always @(posedge {clk}) {_id(r.name)} <= {rst} ? {init} : {nxt};")
+            inits.append(f"    initial {_id(r.name)} = {init};")
         else:
             body.append(f"    always @(posedge {clk}) {_id(r.name)} <= {nxt};")
-        body.append(f"    initial {_id(r.name)} = {init};")
+            body.append(f"    initial {_id(r.name)} = {init};")
+    if inits:
+        # with a reset the initial value only helps simulation before the
+        # first reset; synthesis does not get it, so a state register stays
+        # an FSM candidate (Yosys skips registers with an initial value)
+        body.append("`ifndef SYNTHESIS")
+        body.extend(inits)
+        body.append("`endif")
     for inst in nl.instances:
         params = ""
         if inst.params:
