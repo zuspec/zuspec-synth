@@ -38,6 +38,14 @@ class Term:
     def __eq__(self, other) -> bool:
         return self is other
 
+    # immutable and hash-consed: a copy is the term itself (a deep copy of a
+    # design must not make structurally equal terms distinct objects)
+    def __copy__(self) -> "Term":
+        return self
+
+    def __deepcopy__(self, memo) -> "Term":
+        return self
+
     def __repr__(self) -> str:
         return to_str(self)
 

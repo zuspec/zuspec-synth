@@ -483,6 +483,8 @@ class Netlist:
     # surviving signals (bits it kept are slices of the register itself);
     # see register_values
     subst: Dict[str, T.Term] = dc.field(default_factory=dict)
+    # obsmerge: the register bits merged while live (obsmerge.Merge)
+    merges: list = dc.field(default_factory=list)
 
     def record_subst(self, m: Dict[T.Term, T.Term]) -> None:
         """Note a substitution of register vars (var term -> value)."""
@@ -566,6 +568,9 @@ class LowerOptions:
     # netlist optimizer: sequential redundancy by SAT induction over the
     # whole netlist (seqcorr.optimize): False | "flops" | "all"
     seqcorr: object = "all"
+    # netlist optimizer, the tight view (synthesis-plan §0.8): register bits
+    # merged into what they equal while they are live (obsmerge.optimize)
+    obsmerge: bool = False
 
 
 def lower(d: P.Design, opts: Optional[LowerOptions] = None) -> Netlist:
@@ -575,6 +580,7 @@ def lower(d: P.Design, opts: Optional[LowerOptions] = None) -> Netlist:
     T.SIMPLIFY_OR[0] = opts.simplify_or
     _OPT["reg_corr"] = opts.reg_corr
     _OPT["seqcorr"] = opts.seqcorr
+    _OPT["obsmerge"] = opts.obsmerge
     qref: Dict[P.Var, T.Term] = {v: T.var(v.name, v.w) for v in d.vars}
     report: List[str] = []
     regs: List[Reg] = []
@@ -970,6 +976,16 @@ def optimize(nl: Netlist) -> Netlist:
         nodes = "flops" if _OPT["seqcorr"] == "flops" else "all"
         nl.report.extend(seqcorr.optimize(nl, nodes=nodes))
         fixpoint()
+    if _OPT["obsmerge"]:
+        from . import obsmerge
+        for _ in range(4):
+            nl.regs = [r for r in nl.regs if not _is_const_reg(r)]
+            lines, merges = obsmerge.optimize(nl, log=_progress())
+            nl.report.extend(lines)
+            nl.merges.extend(merges)
+            fixpoint()
+            if not merges:
+                break
     nl.regs = [r for r in nl.regs if not _is_const_reg(r)]
     _check_defined(nl)
     after_bits = sum(r.w for r in nl.regs)
@@ -977,7 +993,18 @@ def optimize(nl: Netlist) -> Netlist:
     return nl
 
 
-_OPT = {"reg_corr": True, "seqcorr": False}
+def _progress():
+    """Progress lines on stderr when ZUSPEC_SYNTH_LOG is set."""
+    import os
+    import sys
+    import time
+    if not os.environ.get("ZUSPEC_SYNTH_LOG"):
+        return None
+    t0 = time.time()
+    return lambda s: print(f"[{time.time() - t0:6.1f}s] {s}", file=sys.stderr, flush=True)
+
+
+_OPT = {"reg_corr": True, "seqcorr": False, "obsmerge": False}
 
 
 def _check_defined(nl: Netlist) -> None:

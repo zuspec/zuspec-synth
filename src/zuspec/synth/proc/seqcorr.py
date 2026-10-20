@@ -366,8 +366,10 @@ def _s(sub, rm, l: int) -> int:
 
 
 def correspond(g: Aig, reset: Sequence[str], *, nodes: str = "all", cycles: int = 1000,
-               width: int = 256, seed: int = 1, forward: int = 20, log=None) -> Result:
+               width: int = 256, seed: int = 1, forward: int = 20, log=None,
+               cand_nodes: Optional[Sequence[int]] = None) -> Result:
     """Signal (``nodes="all"``) or flop (``"flops"``) correspondence.
+    ``cand_nodes``: propose these nodes (and the flops) instead.
 
     ``reset``: the names of the active-high reset inputs. The reachable
     states are those after a cycle with reset asserted, from any state, with
@@ -384,7 +386,12 @@ def correspond(g: Aig, reset: Sequence[str], *, nodes: str = "all", cycles: int 
     if not rst:
         raise SeqCorrError(f"no reset input among {reset}")
     flops = [f.q for f in g.flops]
-    cand = flops + ([n for n in range(1, len(g.fanin)) if g.is_and(n)] if nodes == "all" else [])
+    if cand_nodes is not None:
+        fs = set(flops)
+        cand = flops + sorted(n for n in set(cand_nodes) if n not in fs and g.is_and(n))
+    else:
+        cand = flops + ([n for n in range(1, len(g.fanin)) if g.is_and(n)] if nodes == "all"
+                        else [])
 
     def step(state: Dict[int, int], ins: Dict[int, int], m: int):
         v = g.simulate({**state, **ins}, m)
