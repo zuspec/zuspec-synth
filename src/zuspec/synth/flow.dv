@@ -67,3 +67,61 @@ package:
         doc: "Enable pipeline forwarding (pipeline components only)"
         type: bool
         value: true
+
+  - name: ArchSched
+    desc: Schedule an algorithm's dataflow graph on an architecture spec; emit V3 classes
+    doc: |
+      Resource-constrained list scheduling with binding and loop folding of
+      an XLS IR function (the algorithm, e.g. `aes_pkg::encrypt` from
+      `synth.xls.Codegen`'s `xlsOptIR`) on an architecture spec (YAML: fold,
+      S-box count/kind, target II/latency, delay model; see
+      `zuspec.synth.archsched.spec`). The spec is the `yaml` input whose
+      `arch` matches `arch`.
+
+      For each function `f` (default: the spec's `algorithm`) it writes
+      `<module>.<arch>.sched.txt` (latency, II, S-box count, rounds, per-step
+      S-box use, node -> step / S-box instance map) and `schedule.json`, and
+      emits class `f_stage_tlm` in package `pkg_name`: `op()` computes the
+      result at zero time by calling the SV function, then waits one
+      `@(posedge vif.clk)` per scheduled step. The file also declares
+      interface `clk_if`. Same class shape as `fw.hdl.xls.StageTLM`.
+
+      Outputs: `systemVerilogSource` -- `<pkg_name>.sv`; `text` -- reports.
+    consumes:
+    - filetype: xlsOptIR
+    - filetype: xlsIR
+    - filetype: yaml
+    with:
+      arch:
+        doc: Arch spec to use (its `arch` field, e.g. A1)
+        type: str
+        value: ""
+      functions:
+        doc: Functions (SV paths, `pkg::fn`) to schedule; default the spec's `algorithm`
+        type: list
+        value: []
+      specialize:
+        doc: "Parameters bound to constants before scheduling (e.g. key_width=0 for AES-128)"
+        type: map
+        value: {}
+      data_inputs:
+        doc: "Parameters that arrive with each op (registered in the load step); the rest are held (key)"
+        type: list
+        value: [block_]
+      pkg_name:
+        doc: Generated package name (default `<arch>_stage_tlm_pkg`)
+        type: str
+        value: ""
+      clk_if:
+        doc: Clock interface the file declares (default `<pkg_name>_clk_if`)
+        type: str
+        value: ""
+      imports:
+        doc: Packages the generated package imports
+        type: list
+        value: []
+      arg_types:
+        doc: SV types for `op` arguments, by IR parameter name (default from the IR type)
+        type: map
+        value: {}
+    pytask: zuspec.synth.archsched.task.ArchSched
