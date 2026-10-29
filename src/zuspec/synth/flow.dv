@@ -125,3 +125,51 @@ package:
         type: map
         value: {}
     pytask: zuspec.synth.archsched.task.ArchSched
+  - name: ArchLower
+    desc: Lower an arch schedule (ArchSched) to a synthesizable folded datapath (V5)
+    doc: |
+      Schedules like `ArchSched` (same `arch`, `functions`, `specialize`,
+      `data_inputs`) and emits, per function, `<module>.<arch>.v5.v`: Verilog
+      module `<module>` with the XLS function-pipeline ports (clk, rst,
+      input_valid, the IR params flattened element 0 at the LSB,
+      output_valid, out). Inside: a step counter; one `<module>__sbox`
+      instance per bound S-box with a step-selected input mux; steps with
+      the same structure share one copy of their logic (rerolled rounds)
+      with step-selected leaf muxes; value registers shared by lifetime
+      (left-edge). Values the schedule precomputes from held inputs
+      (`key_expansion: precomputed`) come from a combinational
+      `<module>__keyexp` over a key register. `input_valid` starts an op when
+      idle; `output_valid` is high in the last step. See
+      `zuspec.synth.archsched.emit_v5`.
+
+      Outputs: `systemVerilogSource` -- the modules (plus `passthrough`
+      modules' RTL from the inputs); `text` -- `v5.json` (schedule and fold
+      summary).
+    consumes:
+    - filetype: xlsOptIR
+    - filetype: xlsIR
+    - filetype: yaml
+    - filetype: systemVerilogSource
+    - filetype: verilogSource
+    with:
+      arch:
+        doc: Arch spec to use (its `arch` field, e.g. A1)
+        type: str
+        value: ""
+      functions:
+        doc: Functions (SV paths, `pkg::fn`) to lower; default the spec's `algorithm`
+        type: list
+        value: []
+      specialize:
+        doc: "Parameters bound to constants before scheduling (e.g. key_width=0 for AES-128)"
+        type: map
+        value: {}
+      data_inputs:
+        doc: "Parameters that arrive with each op (registered in the load step); the rest are held (key)"
+        type: list
+        value: [block_]
+      passthrough:
+        doc: "Modules whose RTL (systemVerilogSource/verilogSource inputs named <module>.*) is passed on unchanged"
+        type: list
+        value: []
+    pytask: zuspec.synth.archsched.task.ArchLower
