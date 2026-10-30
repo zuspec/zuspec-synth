@@ -67,3 +67,130 @@ package:
         doc: "Enable pipeline forwarding (pipeline components only)"
         type: bool
         value: true
+
+  - name: ArchSched
+    desc: Schedule an algorithm's dataflow graph on an architecture spec; emit V3 classes
+    doc: |
+      Resource-constrained list scheduling with binding and loop folding of
+      an XLS IR function (the algorithm, e.g. `aes_pkg::encrypt` from
+      `synth.xls.Codegen`'s `xlsOptIR`) on an architecture spec (YAML: fold,
+      S-box count/kind, target II/latency, delay model; see
+      `zuspec.synth.archsched.spec`). The spec is the `yaml` input whose
+      `arch` matches `arch`.
+
+      For each function `f` (default: the spec's `algorithm`) it writes
+      `<module>.<arch>.sched.txt` (latency, II, S-box count, rounds, per-step
+      S-box use, node -> step / S-box instance map), `schedule.json` (summary),
+      `<module>.<arch>.sched.full.json` (the full schedule, `archSchedule`;
+      `zuspec.synth.archsched.sched.to_json`, guarded by the IR's sha256 and a
+      hash of spec/specialize/data_inputs), and
+      emits class `f_stage_tlm` in package `pkg_name`: `op()` computes the
+      result at zero time by calling the SV function, then waits one
+      `@(posedge vif.clk)` per scheduled step. The file also declares
+      interface `clk_if`. Same class shape as `fw.hdl.xls.StageTLM`.
+
+      Outputs: `systemVerilogSource` -- `<pkg_name>.sv`; `text` -- reports;
+      `archSchedule` -- `<module>.<arch>.sched.full.json`.
+    produces:
+    - type: std.FileSet
+      filetype: systemVerilogSource
+    - type: std.FileSet
+      filetype: text
+    - type: std.FileSet
+      filetype: archSchedule
+    consumes:
+    - filetype: xlsOptIR
+    - filetype: xlsIR
+    - filetype: yaml
+    with:
+      arch:
+        doc: Arch spec to use (its `arch` field, e.g. A1)
+        type: str
+        value: ""
+      functions:
+        doc: Functions (SV paths, `pkg::fn`) to schedule; default the spec's `algorithm`
+        type: list
+        value: []
+      specialize:
+        doc: "Parameters bound to constants before scheduling (e.g. key_width=0 for AES-128)"
+        type: map
+        value: {}
+      data_inputs:
+        doc: "Parameters that arrive with each op (registered in the load step); the rest are held (key)"
+        type: list
+        value: [block_]
+      pkg_name:
+        doc: Generated package name (default `<arch>_stage_tlm_pkg`)
+        type: str
+        value: ""
+      clk_if:
+        doc: Clock interface the file declares (default `<pkg_name>_clk_if`)
+        type: str
+        value: ""
+      imports:
+        doc: Packages the generated package imports
+        type: list
+        value: []
+      arg_types:
+        doc: SV types for `op` arguments, by IR parameter name (default from the IR type)
+        type: map
+        value: {}
+    pytask: zuspec.synth.archsched.task.ArchSched
+  - name: ArchLower
+    desc: Lower an arch schedule (ArchSched) to a synthesizable folded datapath (V5)
+    doc: |
+      Takes the schedule from an `archSchedule` input
+      (`<module>.<arch>.sched.full.json` from `ArchSched`) when there is one
+      for the module: it is loaded, not recomputed, and refused (error) if
+      the IR, spec, `specialize` or `data_inputs` differ from the ones it was
+      made with. Otherwise it schedules like `ArchSched` (same `arch`,
+      `functions`, `specialize`, `data_inputs`). Emits, per function, `<module>.<arch>.v5.v`: Verilog
+      module `<module>` with the XLS function-pipeline ports (clk, rst,
+      input_valid, the IR params flattened element 0 at the LSB,
+      output_valid, out). Inside: a step counter; one `<module>__sbox`
+      instance per bound S-box with a step-selected input mux; steps with
+      the same structure share one copy of their logic (rerolled rounds)
+      with step-selected leaf muxes; value registers shared by lifetime
+      (left-edge). Values the schedule precomputes from held inputs
+      (`key_expansion: precomputed`) come from a combinational
+      `<module>__keyexp` over a key register. `input_valid` starts an op when
+      idle; `output_valid` is high in the last step. See
+      `zuspec.synth.archsched.emit_v5`.
+
+      Outputs: `systemVerilogSource` -- the modules (plus `passthrough`
+      modules' RTL from the inputs); `text` -- `v5.json` (schedule and fold
+      summary).
+    consumes:
+    - filetype: xlsOptIR
+    - filetype: xlsIR
+    - filetype: yaml
+    - filetype: archSchedule
+    - filetype: systemVerilogSource
+    - filetype: verilogSource
+    produces:
+    - type: std.FileSet
+      filetype: systemVerilogSource
+    - type: std.FileSet
+      filetype: text
+    with:
+      arch:
+        doc: Arch spec to use (its `arch` field, e.g. A1)
+        type: str
+        value: ""
+      functions:
+        doc: Functions (SV paths, `pkg::fn`) to lower; default the spec's `algorithm`
+        type: list
+        value: []
+      specialize:
+        doc: "Parameters bound to constants before scheduling (e.g. key_width=0 for AES-128)"
+        type: map
+        value: {}
+      data_inputs:
+        doc: "Parameters that arrive with each op (registered in the load step); the rest are held (key)"
+        type: list
+        value: [block_]
+      passthrough:
+        doc: "Modules whose RTL (systemVerilogSource/verilogSource inputs named <module>.*) is passed on unchanged"
+        type: list
+        value: []
+    pytask: zuspec.synth.archsched.task.ArchLower
