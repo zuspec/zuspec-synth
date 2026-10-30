@@ -9,7 +9,7 @@ import yaml
 from dv_flow.mgr import FileSet, TaskDataResult
 from dv_flow.mgr.task_data import SeverityE, TaskMarker
 
-from . import emit_v3, emit_v5, run, sched, spec as spec_mod
+from . import emit_v3, emit_v5, load, run, sched, spec as spec_mod
 
 
 def _error(msg: str) -> TaskDataResult:
@@ -64,7 +64,7 @@ async def ArchSched(ctxt, input) -> TaskDataResult:
     consts = {k: int(v) for k, v in dict(p.specialize or {}).items()}
     rundir = input.rundir
     os.makedirs(rundir, exist_ok=True)
-    items, reports, summ = [], [], []
+    items, reports, summ, fulls = [], [], [], []
     for m in mods:
         with open(irs[m]) as fp:
             text = fp.read()
@@ -76,6 +76,10 @@ async def ArchSched(ctxt, input) -> TaskDataResult:
         with open(os.path.join(rundir, rep), "w") as fp:
             fp.write(sched.report(s))
         reports.append(rep)
+        full = f"{m}.{arch.arch}.sched.full.json"
+        with open(os.path.join(rundir, full), "w") as fp:
+            fp.write(sched.to_json(s))
+        fulls.append(full)
         items.append((orig, s, rep))
         summ.append(sched.summary(s))
     with open(os.path.join(rundir, "schedule.json"), "w") as fp:
@@ -89,7 +93,21 @@ async def ArchSched(ctxt, input) -> TaskDataResult:
     return TaskDataResult(status=0, changed=True, output=[
         FileSet(src=input.name, filetype="systemVerilogSource", basedir=rundir,
                 files=[f"{pkg}.sv"]),
-        FileSet(src=input.name, filetype="text", basedir=rundir, files=reports)])
+        FileSet(src=input.name, filetype="text", basedir=rundir, files=reports),
+        FileSet(src=input.name, filetype="archSchedule", basedir=rundir, files=fulls)])
+
+
+def _schedules(input, arch) -> dict:
+    """{module: file} of ``archSchedule`` inputs for ``arch``
+    (``<module>.<arch>.sched.full.json``)."""
+    out = {}
+    for f in _files(input, ("archSchedule",)):
+        parts = os.path.basename(f).split(".")
+        if len(parts) >= 2 and parts[1].lower() == arch.arch.lower():
+            if parts[0] in out:
+                raise ValueError(f"two archSchedule inputs for {parts[0]}: {out[parts[0]]}, {f}")
+            out[parts[0]] = f
+    return out
 
 
 async def ArchLower(ctxt, input) -> TaskDataResult:
@@ -102,12 +120,21 @@ async def ArchLower(ctxt, input) -> TaskDataResult:
     consts = {k: int(v) for k, v in dict(p.specialize or {}).items()}
     rundir = input.rundir
     os.makedirs(rundir, exist_ok=True)
+    try:
+        scheds = _schedules(input, arch)
+    except ValueError as e:
+        return _error(f"ArchLower: {e}")
     files, summ = [], []
     for m in mods:
         with open(irs[m]) as fp:
             text = fp.read()
         try:
-            orig, s = run(text, arch, consts, list(p.data_inputs))
+            if m in scheds:
+                # Re-entry: the schedule ArchSched made (hash-checked), not a new run.
+                with open(scheds[m]) as fp:
+                    orig, s = load(fp.read(), text, arch, consts, list(p.data_inputs))
+            else:
+                orig, s = run(text, arch, consts, list(p.data_inputs))
             fd = emit_v5.fold(s)
             sv = emit_v5.emit_sv(fd, m, orig)
         except (KeyError, ValueError, RuntimeError, AssertionError) as e:

@@ -80,13 +80,24 @@ package:
 
       For each function `f` (default: the spec's `algorithm`) it writes
       `<module>.<arch>.sched.txt` (latency, II, S-box count, rounds, per-step
-      S-box use, node -> step / S-box instance map) and `schedule.json`, and
+      S-box use, node -> step / S-box instance map), `schedule.json` (summary),
+      `<module>.<arch>.sched.full.json` (the full schedule, `archSchedule`;
+      `zuspec.synth.archsched.sched.to_json`, guarded by the IR's sha256 and a
+      hash of spec/specialize/data_inputs), and
       emits class `f_stage_tlm` in package `pkg_name`: `op()` computes the
       result at zero time by calling the SV function, then waits one
       `@(posedge vif.clk)` per scheduled step. The file also declares
       interface `clk_if`. Same class shape as `fw.hdl.xls.StageTLM`.
 
-      Outputs: `systemVerilogSource` -- `<pkg_name>.sv`; `text` -- reports.
+      Outputs: `systemVerilogSource` -- `<pkg_name>.sv`; `text` -- reports;
+      `archSchedule` -- `<module>.<arch>.sched.full.json`.
+    produces:
+    - type: std.FileSet
+      filetype: systemVerilogSource
+    - type: std.FileSet
+      filetype: text
+    - type: std.FileSet
+      filetype: archSchedule
     consumes:
     - filetype: xlsOptIR
     - filetype: xlsIR
@@ -128,8 +139,12 @@ package:
   - name: ArchLower
     desc: Lower an arch schedule (ArchSched) to a synthesizable folded datapath (V5)
     doc: |
-      Schedules like `ArchSched` (same `arch`, `functions`, `specialize`,
-      `data_inputs`) and emits, per function, `<module>.<arch>.v5.v`: Verilog
+      Takes the schedule from an `archSchedule` input
+      (`<module>.<arch>.sched.full.json` from `ArchSched`) when there is one
+      for the module: it is loaded, not recomputed, and refused (error) if
+      the IR, spec, `specialize` or `data_inputs` differ from the ones it was
+      made with. Otherwise it schedules like `ArchSched` (same `arch`,
+      `functions`, `specialize`, `data_inputs`). Emits, per function, `<module>.<arch>.v5.v`: Verilog
       module `<module>` with the XLS function-pipeline ports (clk, rst,
       input_valid, the IR params flattened element 0 at the LSB,
       output_valid, out). Inside: a step counter; one `<module>__sbox`
@@ -149,8 +164,14 @@ package:
     - filetype: xlsOptIR
     - filetype: xlsIR
     - filetype: yaml
+    - filetype: archSchedule
     - filetype: systemVerilogSource
     - filetype: verilogSource
+    produces:
+    - type: std.FileSet
+      filetype: systemVerilogSource
+    - type: std.FileSet
+      filetype: text
     with:
       arch:
         doc: Arch spec to use (its `arch` field, e.g. A1)

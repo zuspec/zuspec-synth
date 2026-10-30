@@ -30,6 +30,8 @@ Input: an XLS IR function (``xls_ir``), classified, and an ``ArchSpec``.
 from __future__ import annotations
 
 import dataclasses as dc
+import hashlib
+import json
 import math
 import sys
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -60,6 +62,10 @@ class Schedule:
     step_delay_ps: Dict[int, int]
     sbox_ops: int             # S-box lookups scheduled in the op
     precomputed_sbox_ops: int
+    # Set by ``archsched.run``: what the schedule was made from (to_json's guard).
+    ir_sha256: str = ""
+    consts: Dict[str, int] = dc.field(default_factory=dict)
+    data_inputs: List[str] = dc.field(default_factory=list)
 
     @property
     def sbox_count(self) -> int:
@@ -307,3 +313,98 @@ def summary(s: Schedule) -> dict:
             "key_expansion": s.spec.key_expansion, "rounds": len(s.rounds),
             "steps_per_round": s.steps_per_round,
             "worst_step_ps": max(s.step_delay_ps.values(), default=0)}
+
+
+# ---- Serialisation (ArchSched -> ArchLower re-entry) ----------------------
+
+FORMAT = "zuspec.synth.archSchedule"
+VERSION = 1
+
+
+def ir_hash(ir_text: str) -> str:
+    return hashlib.sha256(ir_text.encode()).hexdigest()
+
+
+def _spec_dict(sp: ArchSpec) -> dict:
+    return {f.name: getattr(sp, f.name) for f in dc.fields(ArchSpec)}
+
+
+def inputs_hash(sp: ArchSpec, consts: Dict[str, int], data_inputs: Sequence[str]) -> str:
+    """Hash of everything besides the IR that the schedule depends on: the
+    spec (minus its file path), the specialization constants and the data
+    inputs."""
+    d = _spec_dict(sp)
+    d.pop("path", None)
+    blob = json.dumps({"spec": d, "specialize": {k: int(v) for k, v in consts.items()},
+                       "data_inputs": list(data_inputs)}, sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def to_json(s: Schedule) -> str:
+    """The full schedule (everything the report, emit_v3 and emit_v5 read),
+    deterministic (sorted keys; ordered maps as lists of pairs in the
+    schedule's own order). ``fn`` is not stored: ``from_json`` rebuilds it
+    from the IR text, which must hash to ``ir_sha256``."""
+    if not s.ir_sha256:
+        raise ValueError("to_json: schedule has no IR hash (make it with archsched.run)")
+    d = {
+        "format": FORMAT, "version": VERSION,
+        "function": s.fn.sv_path,
+        "ir_sha256": s.ir_sha256,
+        "inputs_sha256": inputs_hash(s.spec, s.consts, s.data_inputs),
+        "spec": _spec_dict(s.spec),
+        "specialize": dict(s.consts),
+        "data_inputs": list(s.data_inputs),
+        "latency": s.latency, "ii": s.ii, "res_mii": s.res_mii,
+        "pools": [[p, c] for p, c in s.pools.items()],
+        "used": [[p, c] for p, c in s.used.items()],
+        "usage": [[st, p, c] for st, u in s.usage.items() for p, c in u.items()],
+        "rounds": [list(r) for r in s.rounds],
+        "step_delay_ps": [[st, d] for st, d in s.step_delay_ps.items()],
+        "sbox_ops": s.sbox_ops, "precomputed_sbox_ops": s.precomputed_sbox_ops,
+        "placed": [[x, pl.step, pl.pool, pl.inst] for x, pl in s.placed.items()],
+    }
+    return json.dumps(d, indent=1, sort_keys=True) + "\n"
+
+
+def from_json(text: str, ir_text: str, sp: Optional[ArchSpec] = None,
+              consts: Optional[Dict[str, int]] = None,
+              data_inputs: Optional[Sequence[str]] = None):
+    """(original fn, Schedule) from ``to_json`` output and the IR it was
+    made from. Raises ValueError if the IR text, or the spec / constants /
+    data inputs given, are not the ones the schedule was made from."""
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
+    d = json.loads(text)
+    if d.get("format") != FORMAT or d.get("version") != VERSION:
+        raise ValueError(f"from_json: not a {FORMAT} v{VERSION} file "
+                         f"(format={d.get('format')!r}, version={d.get('version')!r})")
+    if ir_hash(ir_text) != d["ir_sha256"]:
+        raise ValueError(f"from_json: schedule of {d['function']} was made from a "
+                         f"different IR (sha256 {d['ir_sha256'][:12]}..., "
+                         f"this IR {ir_hash(ir_text)[:12]}...)")
+    if sp is None:
+        sp = ArchSpec(**d["spec"])
+    consts = dict(d["specialize"]) if consts is None else {k: int(v) for k, v in consts.items()}
+    data_inputs = list(d["data_inputs"]) if data_inputs is None else list(data_inputs)
+    if inputs_hash(sp, consts, data_inputs) != d["inputs_sha256"]:
+        raise ValueError(f"from_json: schedule of {d['function']} was made for a different "
+                         f"arch spec / specialize / data_inputs")
+    orig = xls_ir.parse(ir_text)
+    f = xls_ir.specialize(xls_ir.parse(ir_text), consts)
+    xls_ir.classify(f)
+    if f.sv_path != d["function"]:
+        raise ValueError(f"from_json: IR function {f.sv_path} is not {d['function']}")
+    placed = {x: Placed(st, pool, inst) for x, st, pool, inst in d["placed"]}
+    names = {n.name for n in f.nodes}
+    if set(placed) != names:
+        raise ValueError("from_json: placed nodes do not match the IR's nodes")
+    usage: Dict[int, Dict[str, int]] = {}
+    for st, p, c in d["usage"]:
+        usage.setdefault(st, {})[p] = c
+    s = Schedule(f, sp, placed, d["latency"], d["ii"], d["res_mii"],
+                 {p: c for p, c in d["pools"]}, {p: c for p, c in d["used"]}, usage,
+                 [tuple(r) for r in d["rounds"]],
+                 {st: v for st, v in d["step_delay_ps"]},
+                 d["sbox_ops"], d["precomputed_sbox_ops"],
+                 d["ir_sha256"], consts, data_inputs)
+    return orig, s
